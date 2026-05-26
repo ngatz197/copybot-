@@ -76,7 +76,7 @@ SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 # Polygon RPC endpoint — defaults to public, set your own for reliability
 POLYGON_RPC_URL       = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
 # pUSD = Polymarket's USDC proxy contract on Polygon — 6 decimals
-PUSD_CONTRACT         = os.getenv("PUSD_CONTRACT", "0x4Fabb145d64652a948d72533023f6E7A623C7C53")
+PUSD_CONTRACT         = os.getenv("PUSD_CONTRACT", "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
 
 current_bankroll  = INITIAL_BANKROLL
 peak_bankroll     = INITIAL_BANKROLL
