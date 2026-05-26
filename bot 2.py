@@ -132,46 +132,87 @@ class PendingLimitBuy:
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
     def __init__(self):
-        self.cached_balance = INITIAL_BANKROLL
+        self.cached_balance: Optional[float] = None  # None = not yet fetched
         self.last_update    = 0
-        self.peak_balance   = INITIAL_BANKROLL
+        self.peak_balance   = 0.0
 
     def _fetch_balance(self) -> float:
-        methods = [
-            lambda: requests.get(
-                f"https://data-api.polymarket.com/balance?user={YOUR_WALLET}", timeout=8
-            ),
-            lambda: requests.get(
-                f"https://data-api.polymarket.com/profile?user={YOUR_WALLET}", timeout=8
-            ),
+        """
+        Tries multiple Polymarket endpoints to get real wallet balance.
+        Returns the balance as a float > 0, or 0.0 on total failure.
+        """
+        endpoints = [
+            f"https://data-api.polymarket.com/balance?user={YOUR_WALLET}",
+            f"https://data-api.polymarket.com/profile?user={YOUR_WALLET}",
         ]
-        for method in methods:
+        for url in endpoints:
             try:
-                resp = method()
+                resp = requests.get(url, timeout=8)
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, (int, float)):
-                        return float(data)
+                        val = float(data)
                     elif isinstance(data, dict):
-                        val = data.get("balance") or data.get("portfolioValue") or 0
-                        return float(val)
-            except Exception:
+                        val = float(
+                            data.get("balance")
+                            or data.get("portfolioValue")
+                            or data.get("cashBalance")
+                            or 0
+                        )
+                    else:
+                        continue
+                    if val > 0:
+                        return val
+            except Exception as e:
+                logging.warning(f"Balance fetch failed ({url}): {e}")
                 continue
         return 0.0
 
-    def get_balance(self, force=False) -> float:
-        if force or (time.time() - self.last_update > 30):
+    def get_balance(self, force=False) -> Optional[float]:
+        """
+        Returns real balance from Polymarket, or cached value if fetched recently.
+        Returns None if balance has never been successfully fetched.
+        NEVER returns a simulated or hardcoded value.
+        """
+        if force or self.cached_balance is None or (time.time() - self.last_update > 30):
             real = self._fetch_balance()
             if real > 0:
                 self.cached_balance = real
                 self.last_update    = time.time()
                 if real > self.peak_balance:
                     self.peak_balance = real
-        return self.cached_balance
+                    logging.info(f"New peak balance: ${self.peak_balance:.2f}")
+            else:
+                if self.cached_balance is None:
+                    logging.error(
+                        "Could not fetch real balance from Polymarket — "
+                        "bot will not trade until balance is confirmed"
+                    )
+        return self.cached_balance  # may be None if never fetched successfully
+
+    def fetch_with_retry(self, retries: int = 5, delay: int = 10) -> float:
+        """
+        Called at startup — blocks until a real balance is retrieved or retries exhausted.
+        Raises RuntimeError if balance cannot be confirmed after all retries.
+        """
+        for attempt in range(1, retries + 1):
+            val = self._fetch_balance()
+            if val > 0:
+                self.cached_balance = val
+                self.peak_balance   = val
+                self.last_update    = time.time()
+                logging.info(f"Real balance confirmed: ${val:.2f}")
+                return val
+            logging.warning(f"Balance fetch attempt {attempt}/{retries} returned 0 — retrying in {delay}s")
+            time.sleep(delay)
+        raise RuntimeError(
+            f"Could not fetch real balance from Polymarket after {retries} attempts. "
+            "Check DEPOSIT_WALLET_ADDRESS and API connectivity."
+        )
 
     def check_drawdown(self) -> Tuple[bool, float]:
         current = self.get_balance()
-        if self.peak_balance == 0:
+        if current is None or self.peak_balance == 0:
             return False, 0.0
         dd = (self.peak_balance - current) / self.peak_balance
         return dd >= MAX_DRAWDOWN, dd
@@ -545,6 +586,9 @@ class CopyTrader:
             return
 
         current_bankroll = self.balance.get_balance()
+        if current_bankroll is None:
+            logging.error("Real balance unavailable — skipping this scan cycle")
+            return
         logging.info(
             f"Scanning | bankroll=${current_bankroll:.2f} | "
             f"open={len(self.positions)} | pending={len(self.pending)}"
@@ -694,6 +738,10 @@ async def main():
     health_thread.start()
 
     bot = CopyTrader(dry_run=DRY_RUN)
+
+    # Confirm real balance before doing anything — raises if it can't
+    bot.balance.fetch_with_retry(retries=5, delay=10)
+
     await bot.run()
 
 
