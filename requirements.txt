@@ -1,0 +1,6 @@
+web3
+httpx
+asyncio
+python-dotenv
+aiohttp
+loguru           # optional, nicer logging
