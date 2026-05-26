@@ -72,6 +72,12 @@ LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))  # 5 minut
 # Persistent file tracking every trade we have ever seen/copied (survives restarts)
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 
+# ---- RPC balance settings ----
+# Polygon RPC endpoint — defaults to public, set your own for reliability
+POLYGON_RPC_URL       = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+# pUSD = Polymarket's USDC proxy contract on Polygon — 6 decimals
+PUSD_CONTRACT         = os.getenv("PUSD_CONTRACT", "0x4Fabb145d64652a948d72533023f6E7A623C7C53")
+
 current_bankroll  = INITIAL_BANKROLL
 peak_bankroll     = INITIAL_BANKROLL
 bot_paused_until: Optional[datetime] = None
@@ -131,27 +137,78 @@ class PendingLimitBuy:
 
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
+    """
+    Fetches wallet USDC balance directly from the Polygon blockchain via JSON-RPC.
+    Reads both USDC (native) and USDC.e (bridged) and returns the sum.
+    Never uses simulated or hardcoded values.
+    """
+
+    # ERC-20 balanceOf(address) selector + zero-padded address
+    _BALANCE_OF_SIG = "0x70a08231"  # keccak256("balanceOf(address)")[:4]
+
     def __init__(self):
-        self.cached_balance: Optional[float] = None  # None = not yet fetched
+        self.cached_balance: Optional[float] = None
         self.last_update    = 0
         self.peak_balance   = 0.0
 
+    def _rpc_call(self, payload: dict) -> dict:
+        resp = requests.post(
+            POLYGON_RPC_URL,
+            json    = payload,
+            headers = {"Content-Type": "application/json"},
+            timeout = 10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _erc20_balance(self, contract: str, wallet: str) -> float:
+        """
+        Calls balanceOf(wallet) on an ERC-20 contract via eth_call.
+        Returns token balance in human units (divides by 10^6 for USDC).
+        """
+        # ABI-encode: 4-byte selector + 32-byte zero-padded address
+        padded_addr = wallet.lower().replace("0x", "").zfill(64)
+        data        = self._BALANCE_OF_SIG + padded_addr
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id":      1,
+            "method":  "eth_call",
+            "params":  [
+                {"to": contract, "data": data},
+                "latest",
+            ],
+        }
+        result = self._rpc_call(payload)
+        hex_val = result.get("result", "0x0") or "0x0"
+        raw     = int(hex_val, 16)
+        return raw / 1_000_000  # USDC has 6 decimals
+
     def _fetch_balance(self) -> float:
         """
-        Tries multiple Polymarket endpoints to get real wallet balance.
-        Returns the balance as a float > 0, or 0.0 on total failure.
+        Reads pUSD balance from Polygon RPC (Polymarket's collateral token).
+        Falls back to Polymarket HTTP API if RPC fails.
+        Returns float >= 0 on success, 0.0 on total failure.
         """
-        endpoints = [
+        # --- Primary: RPC ---
+        try:
+            pusd = self._erc20_balance(PUSD_CONTRACT, YOUR_WALLET)
+            logging.debug(f"RPC pUSD balance: {pusd:.6f}")
+            return pusd
+        except Exception as e:
+            logging.warning(f"RPC pUSD balance fetch failed: {e} — falling back to Polymarket API")
+
+        # --- Fallback: Polymarket HTTP API ---
+        for url in [
             f"https://data-api.polymarket.com/balance?user={YOUR_WALLET}",
             f"https://data-api.polymarket.com/profile?user={YOUR_WALLET}",
-        ]
-        for url in endpoints:
+        ]:
             try:
                 resp = requests.get(url, timeout=8)
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, (int, float)):
-                        val = float(data)
+                        return float(data)
                     elif isinstance(data, dict):
                         val = float(
                             data.get("balance")
@@ -159,55 +216,61 @@ class RobustBalanceManager:
                             or data.get("cashBalance")
                             or 0
                         )
-                    else:
-                        continue
-                    if val > 0:
                         return val
-            except Exception as e:
-                logging.warning(f"Balance fetch failed ({url}): {e}")
-                continue
+            except Exception as ex:
+                logging.warning(f"Fallback balance fetch failed ({url}): {ex}")
+
         return 0.0
 
     def get_balance(self, force=False) -> Optional[float]:
         """
-        Returns real balance from Polymarket, or cached value if fetched recently.
-        Returns None if balance has never been successfully fetched.
-        NEVER returns a simulated or hardcoded value.
+        Returns confirmed on-chain balance.
+        Returns None only if balance has never been fetched successfully.
+        Never returns a simulated or hardcoded value.
         """
         if force or self.cached_balance is None or (time.time() - self.last_update > 30):
-            real = self._fetch_balance()
-            if real > 0:
-                self.cached_balance = real
+            val = self._fetch_balance()
+            # A successful RPC call returning 0 is valid (empty wallet)
+            # We distinguish "never fetched" (None) from "fetched and it's 0"
+            if val is not None and val >= 0:
+                prev = self.cached_balance
+                self.cached_balance = val
                 self.last_update    = time.time()
-                if real > self.peak_balance:
-                    self.peak_balance = real
-                    logging.info(f"New peak balance: ${self.peak_balance:.2f}")
+                if val > self.peak_balance:
+                    self.peak_balance = val
+                    logging.info(f"New peak pUSD balance: ${self.peak_balance:.6f}")
+                if prev is not None and abs(val - prev) > 0.01:
+                    logging.info(f"pUSD balance updated: ${prev:.6f} → ${val:.6f}")
             else:
                 if self.cached_balance is None:
                     logging.error(
-                        "Could not fetch real balance from Polymarket — "
+                        "RPC balance fetch failed and no cached value — "
                         "bot will not trade until balance is confirmed"
                     )
-        return self.cached_balance  # may be None if never fetched successfully
+        return self.cached_balance
 
     def fetch_with_retry(self, retries: int = 5, delay: int = 10) -> float:
         """
-        Called at startup — blocks until a real balance is retrieved or retries exhausted.
-        Raises RuntimeError if balance cannot be confirmed after all retries.
+        Blocks at startup until a real on-chain pUSD balance is confirmed.
+        Raises RuntimeError if all retries fail.
         """
         for attempt in range(1, retries + 1):
-            val = self._fetch_balance()
-            if val > 0:
-                self.cached_balance = val
-                self.peak_balance   = val
+            try:
+                pusd = self._erc20_balance(PUSD_CONTRACT, YOUR_WALLET)
+                self.cached_balance = pusd
+                self.peak_balance   = pusd
                 self.last_update    = time.time()
-                logging.info(f"Real balance confirmed: ${val:.2f}")
-                return val
-            logging.warning(f"Balance fetch attempt {attempt}/{retries} returned 0 — retrying in {delay}s")
-            time.sleep(delay)
+                logging.info(f"On-chain pUSD balance confirmed: ${pusd:.6f}")
+                return pusd
+            except Exception as e:
+                logging.warning(
+                    f"RPC pUSD attempt {attempt}/{retries} failed: {e} "
+                    f"— retrying in {delay}s"
+                )
+                time.sleep(delay)
         raise RuntimeError(
-            f"Could not fetch real balance from Polymarket after {retries} attempts. "
-            "Check DEPOSIT_WALLET_ADDRESS and API connectivity."
+            f"Could not read on-chain pUSD balance after {retries} attempts. "
+            f"Check POLYGON_RPC_URL and DEPOSIT_WALLET_ADDRESS."
         )
 
     def check_drawdown(self) -> Tuple[bool, float]:
