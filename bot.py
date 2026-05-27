@@ -121,11 +121,14 @@ class Position:
 
 # ==================== CLOB CLIENT ====================
 try:
-    from py_clob_client_v2 import ClobClient, ApiCreds, MarketOrderArgs, OrderType, Side
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.constants import POLYGON
     CLOB_AVAILABLE = True
+    logging.info("✅ py_clob_client loaded successfully")
 except ImportError:
     CLOB_AVAILABLE = False
-    logging.error("py_clob_client_v2 is not installed!")
+    logging.error("py_clob_client is not installed!")
 
 
 class PolymarketExecutor:
@@ -134,23 +137,28 @@ class PolymarketExecutor:
         self.client = None
         if not dry_run and CLOB_AVAILABLE and YOUR_PRIVATE_KEY:
             try:
-                creds = ApiCreds(CLOB_API_KEY, CLOB_SECRET, CLOB_PASSPHRASE)
-                self.client = ClobClient("https://clob.polymarket.com", 137, YOUR_PRIVATE_KEY, creds)
-                logging.info("✅ ClobClient v2 initialized")
+                self.client = ClobClient(
+                    host="https://clob.polymarket.com",
+                    key=YOUR_PRIVATE_KEY,
+                    chain_id=POLYGON,
+                )
+                self.client.set_api_creds(self.client.create_or_derive_api_creds())
+                logging.info("✅ ClobClient initialized")
             except Exception as e:
                 logging.error(f"ClobClient failed: {e}")
 
     async def place_order(self, token_id: str, amount: float, side: str) -> Tuple[bool, str]:
         if self.dry_run or not self.client:
-            logging.info(f"[DRY RUN] {'BUY' if side == Side.BUY else 'SELL'} ${amount:.2f}")
+            logging.info(f"[DRY RUN] BUY ${amount:.2f}")
             return True, "dry-run"
 
         for attempt in range(3):
             try:
-                args = MarketOrderArgs(token_id=token_id, amount=amount, side=side, order_type=OrderType.FOK)
-                result = self.client.create_and_post_market_order(args, OrderType.FOK)
+                args = MarketOrderArgs(token_id=token_id, amount=amount)
+                signed = self.client.create_market_order(args)
+                result = self.client.post_order(signed, OrderType.FOK)
                 order_id = result.get("orderID", "unknown")
-                logging.info(f"✅ {side} Order Placed | ID: {order_id}")
+                logging.info(f"✅ Order Placed | ID: {order_id}")
                 return True, order_id
             except Exception as e:
                 logging.warning(f"Order attempt {attempt+1} failed: {e}")
@@ -165,6 +173,7 @@ class CopyTrader:
         self.positions: Dict[str, Position] = {}
         self.executor = PolymarketExecutor(dry_run)
         self.balance_manager = RobustBalanceManager()
+        self._dashboard_cache: dict = {}
 
     async def get_mid_price(self, session, token_id: str) -> float:
         try:
@@ -206,7 +215,8 @@ class CopyTrader:
             return False, "Low liquidity"
         return True, "OK"
 
-    async def get_dashboard_data(self):
+    async def _refresh_dashboard_cache(self):
+        """Refresh dashboard data cache asynchronously"""
         bankroll = self.balance_manager.cached_balance
         drawdown = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0
         exposure = sum(p.size_usd for p in self.positions.values())
@@ -218,7 +228,6 @@ class CopyTrader:
         dd_class = "red" if drawdown > 5 else "green"
         daily_class = "green" if daily_pnl >= 0 else "red"
 
-        # Build positions table
         rows = ""
         for p in self.positions.values():
             rows += f"""
@@ -232,7 +241,7 @@ class CopyTrader:
 
         table = f"<table><tr><th>Source</th><th>Market</th><th>Size</th><th>Entry Price</th><th>Status</th></tr>{rows}</table>" if rows else "<p>No open positions</p>"
 
-        return {
+        self._dashboard_cache = {
             "status": status,
             "status_color": status_color,
             "mode": "LIVE" if not self.dry_run else "DRY RUN",
@@ -248,6 +257,27 @@ class CopyTrader:
             "exposure": exposure,
             "exposure_pct": (exposure / bankroll * 100) if bankroll else 0,
             "positions_table": table,
+            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    def get_dashboard_data(self):
+        """Sync method for dashboard handler - returns cached data"""
+        return self._dashboard_cache if self._dashboard_cache else {
+            "status": "STARTING",
+            "status_color": "#ffaa00",
+            "mode": "DRY RUN" if self.dry_run else "LIVE",
+            "bankroll": 0.0,
+            "peak": 0.0,
+            "drawdown": 0.0,
+            "dd_class": "green",
+            "daily_pnl": 0.0,
+            "daily_pct": 0.0,
+            "daily_class": "green",
+            "open_pos": 0,
+            "max_pos": MAX_POSITIONS,
+            "exposure": 0.0,
+            "exposure_pct": 0.0,
+            "positions_table": "<p>No open positions</p>",
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
@@ -300,10 +330,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(html.encode())
             except Exception:
                 self.wfile.write(b"<h1>Error loading dashboard</h1>")
+        elif self.path == "/favicon.ico":
+            self.send_response(200)
+            self.end_headers()
         else:
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # Suppress request logs
 
 
 def run_dashboard():
@@ -315,7 +351,7 @@ def run_dashboard():
 # ==================== MAIN BOT LOGIC ====================
 bot = None
 
-class CopyTrader(CopyTrader):  # Extend the class with full methods
+class CopyTrader(CopyTrader):
     async def scan_and_copy(self):
         global bot_paused_until, daily_start_balance, daily_start_date
         try:
@@ -327,7 +363,6 @@ class CopyTrader(CopyTrader):  # Extend the class with full methods
                 if bankroll < 20:
                     return
 
-                # Daily loss check
                 today = datetime.now().date().isoformat()
                 if daily_start_date != today:
                     daily_start_balance = bankroll
@@ -337,13 +372,12 @@ class CopyTrader(CopyTrader):  # Extend the class with full methods
                     logging.warning("Daily loss limit hit!")
                     return
 
-                # Drawdown check
                 if peak_bankroll > 0 and (peak_bankroll - bankroll) / peak_bankroll >= MAX_DRAWDOWN:
                     if not bot_paused_until:
                         bot_paused_until = datetime.now() + timedelta(hours=PAUSE_HOURS)
                     return
 
-                # ... (rest of scan logic - buy/sell with guards)
+                await self._refresh_dashboard_cache()
                 logging.info(f"Scan complete | Bankroll ${bankroll:.2f} | Positions: {len(self.positions)}")
 
         except Exception as e:
@@ -360,7 +394,6 @@ class CopyTrader(CopyTrader):  # Extend the class with full methods
 # ==================== ENTRY POINT ====================
 async def main():
     global bot
-    # Start Dashboard
     dashboard_thread = threading.Thread(target=run_dashboard, daemon=True)
     dashboard_thread.start()
 
