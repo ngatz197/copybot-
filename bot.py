@@ -111,37 +111,19 @@ def build_dashboard(bot) -> dict:
     status_color = "#ff4444" if status == "PAUSED" else "#00ff88"
     dd_class = "red" if drawdown > 5 else "green"
 
-    pos_rows = "".join(
-        f"<tr><td>{p.source_name}</td><td>{p.question[:50]}</td><td>{p.outcome}</td>"
-        f"<td>${p.size_usd:.2f}</td><td>{p.entry_price:.3f}</td><td>{p.status}</td></tr>"
-        for p in bot.positions.values()
-    )
+    pos_rows = "".join(f"<tr><td>{p.source_name}</td><td>{p.question[:50]}</td><td>{p.outcome}</td><td>${p.size_usd:.2f}</td><td>{p.entry_price:.3f}</td><td>{p.status}</td></tr>" for p in bot.positions.values())
     pos_table = f"<table><tr><th>Source</th><th>Market</th><th>Outcome</th><th>Size</th><th>Entry</th><th>Status</th></tr>{pos_rows}</table>" if pos_rows else "<p>No open positions</p>"
 
-    pend_rows = "".join(
-        f"<tr><td>{p.source_name}</td><td>{p.question[:50]}</td><td>${p.size_usd:.2f}</td>"
-        f"<td>{p.limit_price:.3f}</td><td>{(datetime.now()-p.placed_at).seconds}s</td></tr>"
-        for p in bot.pending.values()
-    )
+    pend_rows = "".join(f"<tr><td>{p.source_name}</td><td>{p.question[:50]}</td><td>${p.size_usd:.2f}</td><td>{p.limit_price:.3f}</td><td>{(datetime.now()-p.placed_at).seconds}s</td></tr>" for p in bot.pending.values())
     pend_table = f"<table><tr><th>Source</th><th>Market</th><th>Size</th><th>Limit</th><th>Age</th></tr>{pend_rows}</table>" if pend_rows else "<p>No pending orders</p>"
 
     return {
-        "status": status,
-        "status_color": status_color,
-        "mode": "LIVE" if not bot.dry_run else "DRY RUN",
-        "bankroll": bankroll,
-        "peak": peak_bankroll,
-        "drawdown": drawdown,
-        "dd_class": dd_class,
-        "open_pos": len(bot.positions),
-        "max_pos": MAX_POSITIONS,
-        "pending_pos": len(bot.pending),
-        "seen_count": len(getattr(bot.seen, '_seen', [])),
-        "positions_table": pos_table,
-        "pending_table": pend_table,
+        "status": status, "status_color": status_color, "mode": "LIVE" if not bot.dry_run else "DRY RUN",
+        "bankroll": bankroll, "peak": peak_bankroll, "drawdown": drawdown, "dd_class": dd_class,
+        "open_pos": len(bot.positions), "max_pos": MAX_POSITIONS, "pending_pos": len(bot.pending),
+        "seen_count": len(getattr(bot.seen, '_seen', [])), "positions_table": pos_table, "pending_table": pend_table,
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
-
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -159,10 +141,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"OK - CopyTrader running")
-
-    def log_message(self, format, *args):
-        pass
-
+    def log_message(self, format, *args): pass
 
 _bot_ref = None
 
@@ -175,44 +154,21 @@ def run_health_server():
 # ==================== DATA CLASSES ====================
 @dataclass
 class Position:
-    market_id:     str
-    question:      str
-    outcome:       str
-    token_id:      str
-    entry_price:   float
-    size_usd:      float
-    shares:        float
-    source_wallet: str
-    source_name:   str
-    status:        str   = "open"
-    exit_price:    float = 0.0
-    pnl:           float = 0.0
-    order_id:      str   = ""
-
+    market_id: str; question: str; outcome: str; token_id: str; entry_price: float
+    size_usd: float; shares: float; source_wallet: str; source_name: str
+    status: str = "open"; exit_price: float = 0.0; pnl: float = 0.0; order_id: str = ""
 
 @dataclass
 class PendingLimitBuy:
-    pos_key:       str
-    token_id:      str
-    market_id:     str
-    question:      str
-    outcome:       str
-    source_wallet: str
-    source_name:   str
-    limit_price:   float
-    size_usd:      float
-    order_id:      str
-    placed_at:     datetime = field(default_factory=datetime.now)
+    pos_key: str; token_id: str; market_id: str; question: str; outcome: str
+    source_wallet: str; source_name: str; limit_price: float; size_usd: float
+    order_id: str; placed_at: datetime = field(default_factory=datetime.now)
 
 
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
     USDC_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
-    POLYGON_RPCS = [
-        "https://polygon-bor-rpc.publicnode.com",
-        "https://polygon.llamarpc.com",
-        "https://polygon.drpc.org",
-    ]
+    POLYGON_RPCS = ["https://polygon-bor-rpc.publicnode.com", "https://polygon.llamarpc.com", "https://polygon.drpc.org"]
 
     def __init__(self):
         self.cached_balance: Optional[float] = None
@@ -220,8 +176,7 @@ class RobustBalanceManager:
         self.peak_balance = 0.0
 
     def _fetch_balance(self) -> float:
-        if not YOUR_WALLET:
-            return 0.0
+        if not YOUR_WALLET: return 0.0
         padded = YOUR_WALLET.lower().replace("0x", "").zfill(64)
         payload = {"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": self.USDC_ADDRESS, "data": "0x70a08231" + padded}, "latest"], "id": 1}
         for rpc in self.POLYGON_RPCS:
@@ -231,10 +186,8 @@ class RobustBalanceManager:
                     result = resp.json().get("result", "0x0")
                     if result not in ("0x", "0x0"):
                         balance = int(result, 16) / 1_000_000
-                        if balance > 0:
-                            return balance
-            except:
-                continue
+                        if balance > 0: return balance
+            except: continue
         return 0.0
 
     def get_balance(self, force=False) -> Optional[float]:
@@ -243,8 +196,7 @@ class RobustBalanceManager:
             if real > 0:
                 self.cached_balance = real
                 self.last_update = time.time()
-                if real > self.peak_balance:
-                    self.peak_balance = real
+                if real > self.peak_balance: self.peak_balance = real
         return self.cached_balance
 
     def fetch_with_retry(self, retries: int = 5, delay: int = 10) -> float:
@@ -261,8 +213,7 @@ class RobustBalanceManager:
 
     def check_drawdown(self) -> Tuple[bool, float]:
         current = self.get_balance()
-        if current is None or self.peak_balance == 0:
-            return False, 0.0
+        if current is None or self.peak_balance == 0: return False, 0.0
         dd = (self.peak_balance - current) / self.peak_balance
         return dd >= MAX_DRAWDOWN, dd
 
@@ -275,13 +226,7 @@ class PolymarketExecutor:
         if not dry_run and CLOB_AVAILABLE and YOUR_PRIVATE_KEY:
             try:
                 creds = ApiCreds(api_key=POLY_API_KEY, api_secret=POLY_SECRET, api_passphrase=POLY_PASSPHRASE) if POLY_API_KEY else None
-                self.client = ClobClient(
-                    host="https://clob.polymarket.com",
-                    chain_id=137,
-                    key=YOUR_PRIVATE_KEY,
-                    creds=creds,
-                    funder=YOUR_WALLET,
-                )
+                self.client = ClobClient(host="https://clob.polymarket.com", chain_id=137, key=YOUR_PRIVATE_KEY, creds=creds, funder=YOUR_WALLET)
                 logging.info("✅ ClobClient v2 initialized successfully")
             except Exception as e:
                 logging.error(f"ClobClient v2 init failed: {e}")
@@ -298,13 +243,9 @@ class PolymarketExecutor:
         for attempt in range(MAX_RETRIES):
             try:
                 order_args = OrderArgs(token_id=token_id, price=limit_price, side=Side.BUY, size=size)
-                result = self.client.create_and_post_order(
-                    order_args=order_args,
-                    options=PartialCreateOrderOptions(tick_size="0.01"),
-                    order_type=OrderType.GTC,
-                )
+                result = self.client.create_and_post_order(order_args=order_args, options=PartialCreateOrderOptions(tick_size="0.01"), order_type=OrderType.GTC)
                 order_id = result.get("orderID") or result.get("id") or "unknown"
-                logging.info(f"LIMIT BUY placed {order_id} | {size:.4f} @ {limit_price:.4f}")
+                logging.info(f"LIMIT BUY placed: {order_id}")
                 return True, order_id, limit_price
             except Exception as e:
                 logging.warning(f"Limit buy attempt {attempt+1} failed: {e}")
@@ -312,39 +253,29 @@ class PolymarketExecutor:
         return False, "", limit_price
 
     def cancel_order(self, order_id: str) -> bool:
-        if self.dry_run or not self.client:
-            return True
+        if self.dry_run or not self.client: return True
         try:
             self.client.cancel_order(order_id)
             return True
-        except Exception as e:
-            logging.warning(f"Cancel failed: {e}")
-            return False
+        except: return False
 
     def is_order_filled(self, order_id: str) -> bool:
-        if self.dry_run or not self.client:
-            return True
+        if self.dry_run or not self.client: return True
         try:
             order = self.client.get_order(order_id)
             return order.get("status", "").lower() in ("matched", "filled", "success")
-        except:
-            return False
+        except: return False
 
     def place_sell(self, token_id: str, shares: float) -> Tuple[bool, str]:
         if self.dry_run or not self.client:
-            logging.info(f"[DRY RUN] MARKET SELL {shares:.4f} shares")
             return True, "dry-run-sell"
         for attempt in range(MAX_RETRIES):
             try:
                 order_args = MarketOrderArgs(token_id=token_id, amount=shares, side=Side.SELL)
-                result = self.client.create_and_post_market_order(
-                    order_args=order_args,
-                    options=PartialCreateOrderOptions(tick_size="0.01"),
-                )
-                order_id = result.get("orderID") or result.get("id") or "unknown"
-                return True, order_id
+                result = self.client.create_and_post_market_order(order_args=order_args, options=PartialCreateOrderOptions(tick_size="0.01"))
+                return True, result.get("orderID") or "unknown"
             except Exception as e:
-                logging.warning(f"Sell attempt {attempt+1} failed: {e}")
+                logging.warning(f"Sell attempt failed: {e}")
                 time.sleep(RETRY_DELAY)
         return False, ""
 
@@ -358,18 +289,15 @@ class SeenTradesStore:
 
     def _load(self) -> Set[str]:
         try:
-            with open(self.filepath, "r") as f:
-                data = json.load(f)
-                return set(data) if isinstance(data, list) else set()
-        except:
-            return set()
+            with open(self.filepath) as f:
+                return set(json.load(f))
+        except: return set()
 
     def _save(self):
         try:
             with open(self.filepath, "w") as f:
                 json.dump(sorted(self._seen), f)
-        except:
-            pass
+        except: pass
 
     def is_seen(self, pos_key: str) -> bool:
         return pos_key in self._seen
@@ -380,12 +308,9 @@ class SeenTradesStore:
             self._save()
 
     def snapshot_existing(self, pos_keys):
-        added = 0
-        for key in pos_keys:
-            if key not in self._seen:
-                self._seen.add(key)
-                added += 1
+        added = sum(1 for k in pos_keys if k not in self._seen)
         if added:
+            self._seen.update(pos_keys)
             self._save()
             logging.info(f"Snapshotted {added} existing trades")
 
@@ -394,7 +319,7 @@ class SeenTradesStore:
         return len(self._seen) == 0
 
 
-# ==================== COPY TRADER ====================
+# ==================== COPY TRADER (Full Methods) ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
@@ -407,9 +332,136 @@ class CopyTrader:
 
         logging.info("CopyTrader initialized")
 
-    # ... [Rest of your scan_and_copy and other methods go here]
-    # Since your previous version had a long scan_and_copy, please paste the rest of your CopyTrader class here.
-    # For now, I recommend you keep your original `scan_and_copy`, `_process_pending_orders`, etc.
+    def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
+        for _ in range(MAX_RETRIES):
+            try:
+                r = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8)
+                if r.status_code == 200:
+                    data = r.json()
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    best_bid = float(bids[0]["price"]) if bids else 0.0
+                    best_ask = float(asks[0]["price"]) if asks else 0.0
+                    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else best_bid or best_ask
+                    return mid, best_ask
+            except: pass
+        return 0.0, 0.0
+
+    def _source_entry_price(self, pos: dict, best_ask: float, mid_price: float) -> float:
+        for key in ("avgPrice", "averagePrice", "avg_price", "average_price"):
+            if val := pos.get(key): return float(val)
+        for key in ("curPrice", "currentPrice", "cur_price", "price"):
+            if val := pos.get(key): return float(val)
+        return best_ask if best_ask > 0 else mid_price
+
+    def get_risk_percent(self, price: float, config: dict) -> float:
+        if config.get("risk_type") == "fixed":
+            return config.get("fixed_risk", 0.025)
+        if price >= 0.70: return 0.03
+        elif price >= 0.30: return 0.01
+        return 0.006
+
+    def check_drawdown(self) -> bool:
+        global peak_bankroll, bot_paused_until
+        current = self.balance.get_balance()
+        if current > peak_bankroll: peak_bankroll = current
+        dd = (peak_bankroll - current) / peak_bankroll if peak_bankroll > 0 else 0
+        if dd >= MAX_DRAWDOWN:
+            if not bot_paused_until or datetime.now() > bot_paused_until:
+                bot_paused_until = datetime.now() + timedelta(hours=PAUSE_HOURS)
+                logging.warning(f"DRAWDOWN PROTECTION TRIGGERED ({dd*100:.1f}%)")
+            return True
+        return False
+
+    def _get_positions(self, wallet_addr: str):
+        for _ in range(MAX_RETRIES):
+            try:
+                resp = requests.get(f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50", timeout=12)
+                if resp.status_code == 200: return resp.json()
+            except: pass
+        return None
+
+    def _process_pending_orders(self, source_token_ids_by_wallet: Dict[str, set]):
+        for pos_key, pending in list(self.pending.items()):
+            if pending.token_id not in source_token_ids_by_wallet.get(pending.source_wallet, set()):
+                self.executor.cancel_order(pending.order_id)
+                del self.pending[pos_key]
+                continue
+
+            if self.executor.is_order_filled(pending.order_id):
+                shares = pending.size_usd / pending.limit_price if pending.limit_price > 0 else 0
+                self.positions[pos_key] = Position(market_id=pending.market_id, question=pending.question, outcome=pending.outcome,
+                    token_id=pending.token_id, entry_price=pending.limit_price, size_usd=pending.size_usd, shares=shares,
+                    source_wallet=pending.source_wallet, source_name=pending.source_name, order_id=pending.order_id)
+                del self.pending[pos_key]
+                logging.info(f"LIMIT BUY FILLED: {pending.question[:40]}")
+                continue
+
+            if (datetime.now() - pending.placed_at).total_seconds() >= LIMIT_EXPIRY_SECONDS:
+                self.executor.cancel_order(pending.order_id)
+                del self.pending[pos_key]
+                # Retry logic can be added later
+
+    async def scan_and_copy(self):
+        global current_bankroll, bot_paused_until, peak_bankroll
+        if bot_paused_until and datetime.now() < bot_paused_until: return
+        if self.check_drawdown(): return
+
+        current_bankroll = self.balance.get_balance()
+        if current_bankroll is None: return
+
+        source_token_ids_by_wallet = {}
+
+        for wallet_addr, config in WALLETS.items():
+            raw = self._get_positions(wallet_addr)
+            if not raw: continue
+
+            source_token_ids = {pos.get("asset") for pos in raw if float(pos.get("value", 0)) >= 1.0}
+
+            # First scan logic
+            if wallet_addr not in self._first_scan:
+                self._first_scan.add(wallet_addr)
+                if self.seen.is_empty:
+                    self.seen.snapshot_existing({f"{wallet_addr}_{tid}" for tid in source_token_ids})
+
+            # BUY LOGIC
+            for pos in raw:
+                token_id = pos.get("asset")
+                if not token_id or float(pos.get("value", 0)) < 1.0: continue
+                pos_key = f"{wallet_addr}_{token_id}"
+                if self.seen.is_seen(pos_key) or pos_key in self.positions or pos_key in self.pending: continue
+                if len(self.positions) + len(self.pending) >= MAX_POSITIONS: break
+
+                mid_price, best_ask = self.get_orderbook_prices(token_id)
+                if mid_price <= 0: continue
+
+                target_price = self._source_entry_price(pos, best_ask, mid_price)
+                price_cap = round(min(target_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
+                if mid_price > price_cap:
+                    self.seen.mark_seen(pos_key)
+                    continue
+
+                risk_pct = self.get_risk_percent(target_price, config)
+                my_size = round(current_bankroll * risk_pct, 2)
+                if my_size < 1.0: continue
+
+                ok, order_id, limit_price = self.executor.place_limit_buy(token_id, my_size, target_price, target_price)
+                if ok:
+                    self.seen.mark_seen(pos_key)
+                    self.pending[pos_key] = PendingLimitBuy(pos_key=pos_key, token_id=token_id, market_id=pos.get("market",""),
+                        question=pos.get("title",""), outcome=pos.get("outcome",""), source_wallet=wallet_addr,
+                        source_name=config["name"], limit_price=limit_price, size_usd=my_size, order_id=order_id)
+
+            source_token_ids_by_wallet[wallet_addr] = source_token_ids
+
+            # SELL LOGIC
+            for pos_key, position in list(self.positions.items()):
+                if position.source_wallet == wallet_addr and position.token_id not in source_token_ids:
+                    ok, _ = self.executor.place_sell(position.token_id, position.shares)
+                    if ok:
+                        del self.positions[pos_key]
+
+        self._process_pending_orders(source_token_ids_by_wallet)
 
     async def run(self):
         logging.info("Bot loop started")
@@ -423,7 +475,7 @@ class CopyTrader:
 
 # ==================== ENTRY POINT ====================
 async def main():
-    global _bot_ref
+    global _bot_ref, peak_bankroll
 
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
@@ -431,12 +483,11 @@ async def main():
     bot = CopyTrader(dry_run=DRY_RUN)
     _bot_ref = bot
 
-    logging.info(f"seen_trades.json contains {len(bot.seen._seen)} entries on startup")
+    logging.info(f"seen_trades.json contains {len(bot.seen._seen)} entries")
 
     try:
         starting_balance = bot.balance.fetch_with_retry()
         peak_bankroll = starting_balance
-        logging.info(f"Starting bankroll: ${starting_balance:.2f}")
     except Exception as e:
         logging.error(f"Balance fetch failed: {e}")
 
