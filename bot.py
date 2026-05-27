@@ -120,92 +120,373 @@ bot_paused_until: Optional[datetime] = None
 
 
 # ==================== DASHBOARD ====================
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
 <head>
-    <title>CopyTrader Live Dashboard</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CopyTrader Dashboard</title>
     <meta http-equiv="refresh" content="15">
     <style>
-        body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #0a0a0a; color: #00cc00; margin: 0; padding: 20px; }}
-        h1 {{ color: #00ff00; text-align: center; }}
-        .container {{ max-width: 1100px; margin: auto; }}
-        .card {{ background: #111111; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 0 10px rgba(0,255,0,0.1); }}
-        table {{ width: 100%; border-collapse: collapse; }}
-        th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #222; }}
-        th {{ background: #1a1a1a; }}
-        .green {{ color: #00ff88; }}
-        .red {{ color: #ff4444; }}
-        .status {{ font-size: 1.2em; font-weight: bold; }}
+        *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+        body {{
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: #0d0d0f;
+            color: #e2e8f0;
+            min-height: 100vh;
+            padding: 24px 16px;
+        }}
+
+        /* ── Layout ── */
+        .page {{ max-width: 1100px; margin: 0 auto; }}
+
+        /* ── Header ── */
+        .header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 28px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }}
+        .header-title {{
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #f8fafc;
+            letter-spacing: -0.3px;
+        }}
+        .header-title span {{ color: #6ee7b7; }}
+        .badge {{
+            font-size: 0.72rem;
+            font-weight: 600;
+            padding: 3px 10px;
+            border-radius: 999px;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+        }}
+        .badge-live  {{ background: #064e3b; color: #6ee7b7; border: 1px solid #065f46; }}
+        .badge-dry   {{ background: #1e1b4b; color: #a5b4fc; border: 1px solid #312e81; }}
+        .badge-paused{{ background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }}
+        .timestamp   {{ font-size: 0.75rem; color: #64748b; }}
+
+        /* ── Stat row ── */
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 14px;
+            margin-bottom: 24px;
+        }}
+        .stat-card {{
+            background: #16181d;
+            border: 1px solid #1e2230;
+            border-radius: 12px;
+            padding: 18px 20px;
+        }}
+        .stat-label {{
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            color: #64748b;
+            margin-bottom: 6px;
+        }}
+        .stat-value {{
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: #f1f5f9;
+            line-height: 1;
+        }}
+        .stat-sub {{
+            font-size: 0.75rem;
+            color: #475569;
+            margin-top: 5px;
+        }}
+
+        /* ── PnL colours ── */
+        .pos  {{ color: #34d399; }}
+        .neg  {{ color: #f87171; }}
+        .neu  {{ color: #94a3b8; }}
+
+        /* ── Section card ── */
+        .section {{
+            background: #16181d;
+            border: 1px solid #1e2230;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }}
+        .section-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 20px;
+            border-bottom: 1px solid #1e2230;
+        }}
+        .section-title {{
+            font-size: 0.85rem;
+            font-weight: 700;
+            color: #cbd5e1;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        .count-pill {{
+            font-size: 0.72rem;
+            font-weight: 700;
+            background: #1e2230;
+            color: #94a3b8;
+            border-radius: 999px;
+            padding: 2px 10px;
+        }}
+
+        /* ── Table ── */
+        .tbl-wrap {{ overflow-x: auto; }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.82rem;
+        }}
+        thead th {{
+            padding: 10px 16px;
+            text-align: left;
+            font-size: 0.70rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #475569;
+            background: #13151a;
+            white-space: nowrap;
+        }}
+        tbody tr {{
+            border-top: 1px solid #1a1d26;
+            transition: background 0.15s;
+        }}
+        tbody tr:hover {{ background: #1c1f28; }}
+        tbody td {{
+            padding: 12px 16px;
+            color: #cbd5e1;
+            vertical-align: middle;
+        }}
+        .market-name {{
+            font-weight: 500;
+            color: #e2e8f0;
+            max-width: 300px;
+        }}
+        .outcome-pill {{
+            display: inline-block;
+            font-size: 0.68rem;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 999px;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }}
+        .outcome-yes {{ background: #064e3b; color: #6ee7b7; }}
+        .outcome-no  {{ background: #450a0a; color: #fca5a5; }}
+        .source-tag {{
+            font-size: 0.70rem;
+            font-weight: 600;
+            color: #818cf8;
+            background: #1e1b4b;
+            padding: 2px 8px;
+            border-radius: 999px;
+        }}
+        .price-mono {{ font-family: 'Courier New', monospace; font-size: 0.80rem; }}
+
+        /* ── Pnl bar ── */
+        .pnl-cell {{
+            font-weight: 700;
+            font-size: 0.83rem;
+            white-space: nowrap;
+        }}
+
+        /* ── Empty state ── */
+        .empty {{
+            padding: 32px 20px;
+            text-align: center;
+            color: #334155;
+            font-size: 0.85rem;
+        }}
+        .empty-icon {{ font-size: 1.8rem; margin-bottom: 8px; }}
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🤖 Polymarket CopyTrader Dashboard (CLOB V2)</h1>
-        <div class="card">
-            <h2>Status: <span class="status" style="color:{status_color};">{status}</span></h2>
-            <p><strong>Mode:</strong> {mode} | <strong>Last Updated:</strong> {last_updated}</p>
-            <p><strong>Bankroll:</strong> ${bankroll:.2f} | <strong>Peak:</strong> ${peak:.2f}</p>
-            <p><strong>Drawdown:</strong> <span class="{dd_class}">{drawdown:.1f}%</span></p>
-            <p><strong>Open Positions:</strong> {open_pos} / {max_pos} | <strong>Pending:</strong> {pending_pos}</p>
-            <p><strong>Seen trades (lifetime):</strong> {seen_count} | <strong>Storage:</strong> {storage_backend}</p>
-            <p><strong>SDK:</strong> py-clob-client-v2 | <strong>Collateral:</strong> pUSD</p>
+<div class="page">
+
+    <!-- Header -->
+    <div class="header">
+        <div>
+            <div class="header-title">🤖 Poly<span>CopyTrader</span></div>
+            <div class="timestamp">Updated {last_updated} &nbsp;·&nbsp; Auto-refresh 15s</div>
         </div>
-        <div class="card">
-            <h2>Open Positions</h2>
-            {positions_table}
-        </div>
-        <div class="card">
-            <h2>Pending Orders</h2>
-            {pending_table}
+        <div style="display:flex;gap:8px;align-items:center;">
+            <span class="badge {mode_badge}">{mode_label}</span>
+            <span class="badge {status_badge}">{status_label}</span>
         </div>
     </div>
+
+    <!-- Stat cards -->
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-label">Total Balance</div>
+            <div class="stat-value">${balance:.2f}</div>
+            <div class="stat-sub">pUSD &nbsp;·&nbsp; Peak ${peak:.2f}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Total PnL</div>
+            <div class="stat-value {total_pnl_cls}">{total_pnl_sign}${total_pnl_abs:.2f}</div>
+            <div class="stat-sub">Realised + Unrealised</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Unrealised</div>
+            <div class="stat-value {unreal_cls}">{unreal_sign}${unreal_abs:.2f}</div>
+            <div class="stat-sub">{open_count} open position(s)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Realised</div>
+            <div class="stat-value {real_cls}">{real_sign}${real_abs:.2f}</div>
+            <div class="stat-sub">{closed_count} closed trade(s)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Drawdown</div>
+            <div class="stat-value {dd_cls}">{drawdown:.1f}%</div>
+            <div class="stat-sub">Max {max_dd:.0f}%</div>
+        </div>
+    </div>
+
+    <!-- Open Positions -->
+    <div class="section">
+        <div class="section-header">
+            <span class="section-title">Open Positions</span>
+            <span class="count-pill">{open_count}</span>
+        </div>
+        {positions_block}
+    </div>
+
+    <!-- Closed Trades -->
+    <div class="section">
+        <div class="section-header">
+            <span class="section-title">Closed Trades</span>
+            <span class="count-pill">{closed_count}</span>
+        </div>
+        {closed_block}
+    </div>
+
+</div>
 </body>
 </html>
 """
 
 def build_dashboard(bot) -> dict:
-    bankroll = bot.balance.cached_balance or 0.0
-    drawdown = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0
-    status = "PAUSED" if bot_paused_until and datetime.now() < bot_paused_until else "RUNNING"
-    status_color = "#ff4444" if status == "PAUSED" else "#00ff88"
-    dd_class = "red" if drawdown > 5 else "green"
+    def _sign(v): return "+" if v >= 0 else ""
+    def _cls(v):  return "pos" if v >= 0 else "neg"
 
-    pos_rows = ""
+    bankroll   = bot.balance.cached_balance or 0.0
+    drawdown   = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0.0
+    is_paused  = bool(bot_paused_until and datetime.now() < bot_paused_until)
+
+    # ── Status / mode badges ──────────────────────────────────────────
+    status_label = "Paused" if is_paused else "Running"
+    status_badge = "badge-paused" if is_paused else "badge-live"
+    mode_label   = "Dry Run" if bot.dry_run else "Live"
+    mode_badge   = "badge-dry" if bot.dry_run else "badge-live"
+
+    # ── Unrealised PnL (open positions) ──────────────────────────────
+    unrealised = 0.0
+    pos_rows   = ""
     for p in bot.positions.values():
-        pos_rows += f"<tr><td>{p.source_name}</td><td>{p.question[:50]}</td><td>{p.outcome}</td><td>${p.size_usd:.2f}</td><td>{p.entry_price:.3f}</td><td>{p.status}</td></tr>"
-    pos_table = (
-        f"<table><tr><th>Source</th><th>Market</th><th>Outcome</th>"
-        f"<th>Size</th><th>Entry</th><th>Status</th></tr>{pos_rows}</table>"
-        if pos_rows else "<p>No open positions</p>"
-    )
+        mid, _ = bot.get_orderbook_prices(p.token_id)
+        unreal  = (mid - p.entry_price) * p.shares if mid > 0 else 0.0
+        unrealised += unreal
 
-    pend_rows = ""
-    for p in bot.pending.values():
-        age = (datetime.now() - p.placed_at).seconds
-        pend_rows += f"<tr><td>{p.source_name}</td><td>{p.question[:50]}</td><td>${p.size_usd:.2f}</td><td>{p.limit_price:.3f}</td><td>{age}s</td></tr>"
-    pend_table = (
-        f"<table><tr><th>Source</th><th>Market</th><th>Size</th>"
-        f"<th>Limit Price</th><th>Age</th></tr>{pend_rows}</table>"
-        if pend_rows else "<p>No pending orders</p>"
-    )
+        outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
+        pnl_cls     = _cls(unreal)
+        pnl_str     = f"{_sign(unreal)}${abs(unreal):.2f}"
+        cur_str     = f"{mid:.3f}" if mid > 0 else "—"
+
+        pos_rows += f"""
+        <tr>
+            <td><span class="source-tag">{p.source_name}</span></td>
+            <td class="market-name">{p.question[:60]}</td>
+            <td><span class="outcome-pill {outcome_cls}">{p.outcome}</span></td>
+            <td>${p.size_usd:.2f}</td>
+            <td class="price-mono">{p.entry_price:.3f}</td>
+            <td class="price-mono">{cur_str}</td>
+            <td class="pnl-cell {pnl_cls}">{pnl_str}</td>
+        </tr>"""
+
+    if pos_rows:
+        positions_block = f"""
+        <div class="tbl-wrap">
+        <table>
+            <thead><tr>
+                <th>Source</th><th>Market</th><th>Side</th>
+                <th>Size</th><th>Entry</th><th>Current</th><th>Unreal PnL</th>
+            </tr></thead>
+            <tbody>{pos_rows}</tbody>
+        </table>
+        </div>"""
+    else:
+        positions_block = '<div class="empty"><div class="empty-icon">📭</div>No open positions</div>'
+
+    # ── Realised PnL (closed trades) ─────────────────────────────────
+    closed_list = getattr(bot, "closed_positions", [])
+    realised    = sum(p.pnl for p in closed_list)
+    closed_rows = ""
+    for p in reversed(closed_list):          # newest first
+        outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
+        pnl_cls     = _cls(p.pnl)
+        pnl_str     = f"{_sign(p.pnl)}${abs(p.pnl):.2f}"
+        closed_rows += f"""
+        <tr>
+            <td><span class="source-tag">{p.source_name}</span></td>
+            <td class="market-name">{p.question[:60]}</td>
+            <td><span class="outcome-pill {outcome_cls}">{p.outcome}</span></td>
+            <td class="price-mono">{p.entry_price:.3f}</td>
+            <td class="price-mono">{p.exit_price:.3f}</td>
+            <td class="pnl-cell {pnl_cls}">{pnl_str}</td>
+        </tr>"""
+
+    if closed_rows:
+        closed_block = f"""
+        <div class="tbl-wrap">
+        <table>
+            <thead><tr>
+                <th>Source</th><th>Market</th><th>Side</th>
+                <th>Entry</th><th>Exit</th><th>Realised PnL</th>
+            </tr></thead>
+            <tbody>{closed_rows}</tbody>
+        </table>
+        </div>"""
+    else:
+        closed_block = '<div class="empty"><div class="empty-icon">📋</div>No closed trades yet</div>'
+
+    total_pnl = realised + unrealised
 
     return {
-        "status": status,
-        "status_color": status_color,
-        "mode": "LIVE" if not bot.dry_run else "DRY RUN",
-        "bankroll": bankroll,
-        "peak": peak_bankroll,
-        "drawdown": drawdown,
-        "dd_class": dd_class,
-        "open_pos": len(bot.positions),
-        "max_pos": MAX_POSITIONS,
-        "pending_pos": len(bot.pending),
-        "seen_count": len(bot.seen._seen),
-        "storage_backend": bot.seen.backend,
-        "positions_table": pos_table,
-        "pending_table": pend_table,
-        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_updated":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode_label":      mode_label,
+        "mode_badge":      mode_badge,
+        "status_label":    status_label,
+        "status_badge":    status_badge,
+        "balance":         bankroll,
+        "peak":            peak_bankroll,
+        "drawdown":        drawdown,
+        "dd_cls":          "neg" if drawdown > 10 else ("neu" if drawdown > 5 else "pos"),
+        "max_dd":          MAX_DRAWDOWN * 100,
+        "total_pnl_cls":   _cls(total_pnl),
+        "total_pnl_sign":  _sign(total_pnl),
+        "total_pnl_abs":   abs(total_pnl),
+        "unreal_cls":      _cls(unrealised),
+        "unreal_sign":     _sign(unrealised),
+        "unreal_abs":      abs(unrealised),
+        "real_cls":        _cls(realised),
+        "real_sign":       _sign(realised),
+        "real_abs":        abs(realised),
+        "open_count":      len(bot.positions),
+        "closed_count":    len(closed_list),
+        "positions_block": positions_block,
+        "closed_block":    closed_block,
     }
 
 
@@ -619,6 +900,9 @@ class CopyTrader:
         # Tracks which wallets have completed their first scan
         self._first_scan_done: Set[str] = set()
 
+        # Closed trades kept in memory for PnL display
+        self.closed_positions: list = []
+
         logging.info(f"Multi-Wallet CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
         logging.info(
             f"Watching {len(WALLETS)} wallets | max positions={MAX_POSITIONS} | "
@@ -922,6 +1206,7 @@ class CopyTrader:
                             f"[{name}] MARKET SELL (V2) | {position.question[:40]} | "
                             f"exit={exit_price:.4f} pnl=${pnl:.2f}"
                         )
+                        self.closed_positions.append(position)
                         del self.positions[pos_key]
 
         self._process_pending_orders(source_token_ids_by_wallet)
