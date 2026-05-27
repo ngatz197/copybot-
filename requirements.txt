@@ -1,6 +1,4 @@
-web3
+aiohttp
 python-dotenv
-requests
 loguru
 py_clob_client
-py_builder_relayer_client
