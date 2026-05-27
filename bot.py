@@ -223,7 +223,7 @@ class PendingLimitBuy:
 
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
-    USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    USDC_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # PUSD
     POLYGON_RPCS = [
         "https://polygon-bor-rpc.publicnode.com",
         "https://polygon.llamarpc.com",
