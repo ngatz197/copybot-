@@ -99,10 +99,8 @@ LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
 LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 
-# V2: pUSD contract address (replaces USDC.e)
-PUSD_CONTRACT_ADDRESS = "0xC7B9A68e5D7B3F5e5c4aAB7bF3Cb3e6C4E8dEb9"  # pUSD on Polygon
-# NOTE: Verify the exact pUSD contract address at https://docs.polymarket.com/resources/contracts
-# The address above is a placeholder — replace with the canonical V2 address from Polymarket docs.
+# V2: pUSD contract address on Polygon (verified on PolygonScan)
+PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
 current_bankroll  = INITIAL_BANKROLL
 peak_bankroll     = INITIAL_BANKROLL
