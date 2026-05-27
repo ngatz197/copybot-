@@ -1195,12 +1195,19 @@ class CopyTrader:
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
 
             # ---- REFRESH current_price on open positions (for dashboard) ----
+            # Use curPrice from the positions API response — accurate, already
+            # fetched this cycle, no extra HTTP call to the orderbook needed.
+            cur_price_map = {
+                pos.get("asset", ""): float(pos.get("curPrice", 0))
+                for pos in raw
+                if pos.get("asset") and float(pos.get("curPrice", 0)) > 0
+            }
             for _pk, _pos in self.positions.items():
                 if _pos.source_wallet != wallet_addr:
                     continue
-                _mid, _ = self.get_orderbook_prices(_pos.token_id)
-                if _mid > 0:
-                    _pos.current_price = _mid
+                _cp = cur_price_map.get(_pos.token_id, 0.0)
+                if _cp > 0:
+                    _pos.current_price = _cp
 
             # ---- SELL LOGIC ----
             for pos_key, position in list(self.positions.items()):
