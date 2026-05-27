@@ -1,4 +1,4 @@
 aiohttp
 python-dotenv
-loguru
+requests
 py_clob_client
