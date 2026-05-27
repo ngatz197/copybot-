@@ -223,6 +223,12 @@ class PendingLimitBuy:
 
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
+    USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    POLYGON_RPCS = [
+        "https://polygon-rpc.com",
+        "https://rpc.ankr.com/polygon",
+    ]
+
     def __init__(self):
         self.cached_balance: Optional[float] = None  # None = not yet fetched
         self.last_update    = 0
@@ -230,33 +236,38 @@ class RobustBalanceManager:
 
     def _fetch_balance(self) -> float:
         """
-        Tries multiple Polymarket endpoints to get real wallet balance.
-        Returns the balance as a float > 0, or 0.0 on total failure.
+        Fetches USDC balance directly from the Polygon blockchain via RPC.
+        Calls balanceOf(address) on the USDC contract.
+        Returns balance as float > 0, or 0.0 on failure.
         """
-        endpoints = [
-            f"https://data-api.polymarket.com/balance?user={YOUR_WALLET}",
-            f"https://data-api.polymarket.com/profile?user={YOUR_WALLET}",
-        ]
-        for url in endpoints:
+        if not YOUR_WALLET:
+            logging.error("DEPOSIT_WALLET_ADDRESS not set — cannot fetch balance")
+            return 0.0
+
+        padded  = YOUR_WALLET.lower().replace("0x", "").zfill(64)
+        payload = {
+            "jsonrpc": "2.0",
+            "method":  "eth_call",
+            "params":  [
+                {"to": self.USDC_ADDRESS, "data": "0x70a08231" + padded},
+                "latest"
+            ],
+            "id": 1,
+        }
+
+        for rpc in self.POLYGON_RPCS:
             try:
-                resp = requests.get(url, timeout=8)
+                resp = requests.post(rpc, json=payload, timeout=8)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, (int, float)):
-                        val = float(data)
-                    elif isinstance(data, dict):
-                        val = float(
-                            data.get("balance")
-                            or data.get("portfolioValue")
-                            or data.get("cashBalance")
-                            or 0
-                        )
-                    else:
-                        continue
-                    if val > 0:
-                        return val
+                    data   = resp.json()
+                    result = data.get("result", "0x0")
+                    if result and result not in ("0x", "0x0"):
+                        balance = int(result, 16) / 1_000_000  # USDC has 6 decimals
+                        if balance > 0:
+                            logging.info(f"Balance fetched via RPC ({rpc}): ${balance:.2f}")
+                            return balance
             except Exception as e:
-                logging.warning(f"Balance fetch failed ({url}): {e}")
+                logging.warning(f"RPC balance fetch failed ({rpc}): {e}")
                 continue
         return 0.0
 
