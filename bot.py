@@ -833,11 +833,27 @@ class CopyTrader:
 
     async def run(self):
         logging.info("Bot loop started")
+        last_heartbeat = time.time()
+        HEARTBEAT_INTERVAL = 300  # 5 minutes
         while True:
             try:
                 await self.scan_and_copy()
             except Exception as e:
                 logging.error(f"Main loop error: {e}")
+
+            # Heartbeat every 5 minutes
+            now = time.time()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                status = "PAUSED" if bot_paused_until and datetime.now() < bot_paused_until else "ACTIVE"
+                logging.info(
+                    f"💓 Heartbeat | Status: {status} | "
+                    f"Bankroll: ${self.balance.cached_balance or 0:.2f} | "
+                    f"Open: {len(self.positions)} | "
+                    f"Pending: {len(self.pending)} | "
+                    f"Watching: {len(WALLETS)} wallets"
+                )
+                last_heartbeat = now
+
             await asyncio.sleep(POLL_INTERVAL)
 
 
