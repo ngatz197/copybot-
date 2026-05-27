@@ -359,10 +359,10 @@ class PolymarketExecutor:
         """
         Places a GTC limit buy.
         target_price  = source wallet's avg entry (or best_ask / mid fallback).
-        Hard cap      = source_price * (1 + LIMIT_BUY_MAX_PREMIUM), also capped at 0.99.
+        Hard cap      = source_price * (1 + LIMIT_BUY_MAX_PREMIUM), also capped at 0.90.
         Returns (success, order_id, limit_price_used)
         """
-        price_cap   = round(min(source_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.99), 4)
+        price_cap   = round(min(source_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
         limit_price = round(min(target_price, price_cap), 4)
         shares      = round(amount_usd / limit_price, 4)
 
@@ -656,7 +656,7 @@ class CopyTrader:
                     continue
                 # On retry, use best_ask as target (no source pos data available here)
                 target_price = best_ask if best_ask > 0 else mid_price
-                price_cap    = round(min(pending.limit_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.99), 4)
+                price_cap    = round(min(pending.limit_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
                 if target_price > price_cap:
                     logging.info(
                         f"Retry skipped — price {target_price:.4f} > 20% cap {price_cap:.4f} "
@@ -767,7 +767,7 @@ class CopyTrader:
                 target_price = self._source_entry_price(pos, best_ask, mid_price)
 
                 # Skip if market has already moved more than 20% above source entry
-                price_cap = round(min(target_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.99), 4)
+                price_cap = round(min(target_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
                 if mid_price > price_cap:
                     logging.info(
                         f"Mid {mid_price:.4f} > 20% cap {price_cap:.4f} "
@@ -834,23 +834,18 @@ class CopyTrader:
     async def run(self):
         logging.info("Bot loop started")
         last_heartbeat = time.time()
-        HEARTBEAT_INTERVAL = 300  # 5 minutes
         while True:
             try:
                 await self.scan_and_copy()
             except Exception as e:
                 logging.error(f"Main loop error: {e}")
 
-            # Heartbeat every 5 minutes
             now = time.time()
-            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+            if now - last_heartbeat >= 300:
                 status = "PAUSED" if bot_paused_until and datetime.now() < bot_paused_until else "ACTIVE"
                 logging.info(
-                    f"💓 Heartbeat | Status: {status} | "
-                    f"Bankroll: ${self.balance.cached_balance or 0:.2f} | "
-                    f"Open: {len(self.positions)} | "
-                    f"Pending: {len(self.pending)} | "
-                    f"Watching: {len(WALLETS)} wallets"
+                    f"Status: {status} | Bankroll: ${self.balance.cached_balance or 0:.2f} | "
+                    f"Open: {len(self.positions)} | Pending: {len(self.pending)} | Watching: {len(WALLETS)} wallets"
                 )
                 last_heartbeat = now
 
