@@ -378,8 +378,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 def build_dashboard(bot) -> dict:
-    def _sign(v): return "+" if v >= 0 else ""
-    def _cls(v):  return "pos" if v >= 0 else "neg"
+    # "+" for profit, "-" for loss, "" for zero
+    def _sign(v): return "+" if v > 0 else ("-" if v < 0 else "")
+    def _cls(v):  return "pos" if v > 0 else ("neg" if v < 0 else "neu")
 
     bankroll   = bot.balance.cached_balance or 0.0
     drawdown   = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0.0
@@ -391,18 +392,20 @@ def build_dashboard(bot) -> dict:
     mode_label   = "Dry Run" if bot.dry_run else "Live"
     mode_badge   = "badge-dry" if bot.dry_run else "badge-live"
 
-    # ── Unrealised PnL (open positions) ──────────────────────────────
+    # ── Unrealised PnL — reads cached current_price set during scan ──
     unrealised = 0.0
     pos_rows   = ""
     for p in bot.positions.values():
-        mid, _ = bot.get_orderbook_prices(p.token_id)
-        unreal  = (mid - p.entry_price) * p.shares if mid > 0 else 0.0
+        # Use price cached by the scan loop; fall back to entry if not yet set
+        mid    = p.current_price if p.current_price > 0 else p.entry_price
+        unreal = (mid - p.entry_price) * p.shares
         unrealised += unreal
 
         outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
         pnl_cls     = _cls(unreal)
+        # Always show explicit sign: +$X.XX for profit, -$X.XX for loss
         pnl_str     = f"{_sign(unreal)}${abs(unreal):.2f}"
-        cur_str     = f"{mid:.3f}" if mid > 0 else "—"
+        cur_str     = f"{mid:.3f}" if p.current_price > 0 else "—"
 
         pos_rows += f"""
         <tr>
@@ -536,6 +539,7 @@ class Position:
     exit_price:    float = 0.0
     pnl:           float = 0.0
     order_id:      str   = ""
+    current_price: float = 0.0   # refreshed each scan cycle
 
 
 @dataclass
@@ -1189,6 +1193,14 @@ class CopyTrader:
                     )
 
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
+
+            # ---- REFRESH current_price on open positions (for dashboard) ----
+            for _pk, _pos in self.positions.items():
+                if _pos.source_wallet != wallet_addr:
+                    continue
+                _mid, _ = self.get_orderbook_prices(_pos.token_id)
+                if _mid > 0:
+                    _pos.current_price = _mid
 
             # ---- SELL LOGIC ----
             for pos_key, position in list(self.positions.items()):
