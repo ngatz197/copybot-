@@ -1,4 +1,4 @@
 aiohttp
 python-dotenv
 requests
-py-clob-client_v2
+py-clob-client-v2
