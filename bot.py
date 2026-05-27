@@ -334,17 +334,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div class="stat-card">
             <div class="stat-label">Total PnL</div>
-            <div class="stat-value {total_pnl_cls}">{total_pnl_sign}${total_pnl_abs:.2f}</div>
+            <div class="stat-value {total_pnl_cls}">{total_pnl_sign}${total_pnl_abs}</div>
             <div class="stat-sub">Realised + Unrealised</div>
         </div>
         <div class="stat-card">
             <div class="stat-label">Unrealised</div>
-            <div class="stat-value {unreal_cls}">{unreal_sign}${unreal_abs:.2f}</div>
+            <div class="stat-value {unreal_cls}">{unreal_sign}${unreal_abs}</div>
             <div class="stat-sub">{open_count} open position(s)</div>
         </div>
         <div class="stat-card">
             <div class="stat-label">Realised</div>
-            <div class="stat-value {real_cls}">{real_sign}${real_abs:.2f}</div>
+            <div class="stat-value {real_cls}">{real_sign}${real_abs}</div>
             <div class="stat-sub">{closed_count} closed trade(s)</div>
         </div>
         <div class="stat-card">
@@ -403,16 +403,19 @@ def build_dashboard(bot) -> dict:
 
         outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
         pnl_cls     = _cls(unreal)
-        # Always show explicit sign: +$X.XX for profit, -$X.XX for loss
-        pnl_str     = f"{_sign(unreal)}${abs(unreal):.2f}"
+        # Use 4dp when value would show as $0.00 at 2dp
+        pnl_fmt     = ".4f" if abs(unreal) < 0.005 else ".2f"
+        pnl_str     = f"{_sign(unreal)}${abs(unreal):{pnl_fmt}}"
         cur_str     = f"{mid:.3f}" if p.current_price > 0 else "—"
+        # Show shares so PnL magnitude makes sense to the user
+        shares_str  = f"{p.shares:.4f}"
 
         pos_rows += f"""
         <tr>
             <td><span class="source-tag">{p.source_name}</span></td>
             <td class="market-name">{p.question[:60]}</td>
             <td><span class="outcome-pill {outcome_cls}">{p.outcome}</span></td>
-            <td>${p.size_usd:.2f}</td>
+            <td>${p.size_usd:.2f}<br><span style="font-size:0.70rem;color:#475569;">{shares_str} shares</span></td>
             <td class="price-mono">{p.entry_price:.3f}</td>
             <td class="price-mono">{cur_str}</td>
             <td class="pnl-cell {pnl_cls}">{pnl_str}</td>
@@ -466,6 +469,10 @@ def build_dashboard(bot) -> dict:
 
     total_pnl = realised + unrealised
 
+    def _fmt(v):
+        """Smart format: 4dp for tiny values that would show as $0.00 at 2dp."""
+        return f"{abs(v):.4f}" if abs(v) < 0.005 else f"{abs(v):.2f}"
+
     return {
         "last_updated":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode_label":      mode_label,
@@ -479,13 +486,13 @@ def build_dashboard(bot) -> dict:
         "max_dd":          MAX_DRAWDOWN * 100,
         "total_pnl_cls":   _cls(total_pnl),
         "total_pnl_sign":  _sign(total_pnl),
-        "total_pnl_abs":   abs(total_pnl),
+        "total_pnl_abs":   _fmt(total_pnl),
         "unreal_cls":      _cls(unrealised),
         "unreal_sign":     _sign(unrealised),
-        "unreal_abs":      abs(unrealised),
+        "unreal_abs":      _fmt(unrealised),
         "real_cls":        _cls(realised),
         "real_sign":       _sign(realised),
-        "real_abs":        abs(realised),
+        "real_abs":        _fmt(realised),
         "open_count":      len(bot.positions),
         "closed_count":    len(closed_list),
         "positions_block": positions_block,
