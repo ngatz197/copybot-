@@ -19,11 +19,12 @@ MULTI-WALLET COPY TRADER - PRODUCTION READY (CLOB V2)
 - Improved Balance Fetching + Robust Error Handling & Retries
 - Pending limit order tracking + auto-cancel on expiry
 - Health endpoint for Render (keeps bot awake)
-- FIX: snapshot only on first-ever run, not on every restart
-- FIX: seen_trades persisted in Postgres (survives Render restarts/spin-downs)
-- FIX: correct API field names (currentValue, conditionId)
-- FIX: price cap based on current ask, not stale source entry price (Option A)
-- FIX: price-cap skips no longer permanently blacklist trades
+
+PER-WALLET COPY RULES:
+  TheSpirit  (0x0c0e...): only copy NEW trades appearing after deployment,
+                          value >= $1, 20% ask cap.
+  WalletA179 (0xa179...): copy existing positions at deployment too,
+                          value >= $1, 20% ask cap.
 """
 
 import os
@@ -73,8 +74,19 @@ except ImportError:
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 WALLETS = {
-    "0x0c0e270cf879583d6a0142fc817e05b768d0434e": {"name": "TheSpirit", "risk_type": "price_based"},
-    "0xa1795199a227f8d68134f30bf26314a9918c9629": {"name": "WalletA179", "risk_type": "fixed", "fixed_risk": 0.025},
+    # NEW-ONLY: only trades that appear after deployment are copied
+    "0x0c0e270cf879583d6a0142fc817e05b768d0434e": {
+        "name": "TheSpirit",
+        "risk_type": "price_based",
+        "copy_mode": "new_only",   # skip anything open at deployment
+    },
+    # COPY-ALL: existing positions at deployment are also copied
+    "0xa1795199a227f8d68134f30bf26314a9918c9629": {
+        "name": "WalletA179",
+        "risk_type": "fixed",
+        "fixed_risk": 0.025,
+        "copy_mode": "copy_all",   # copy positions open at deployment too
+    },
 }
 
 YOUR_PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
@@ -399,8 +411,6 @@ class RobustBalanceManager:
     """
     V2 CHANGE: Polymarket V2 uses pUSD as collateral (replaces USDC.e).
     pUSD is a standard ERC-20 on Polygon backed 1:1 by USDC.
-    Update PUSD_CONTRACT_ADDRESS above with the canonical address from:
-    https://docs.polymarket.com/resources/contracts
     """
     POLYGON_RPCS = [
         "https://polygon-bor-rpc.publicnode.com",
@@ -418,7 +428,6 @@ class RobustBalanceManager:
             logging.error("DEPOSIT_WALLET_ADDRESS not set — cannot fetch balance")
             return 0.0
 
-        # V2: query pUSD balance instead of USDC.e
         padded  = YOUR_WALLET.lower().replace("0x", "").zfill(64)
         payload = {
             "jsonrpc": "2.0",
@@ -439,7 +448,6 @@ class RobustBalanceManager:
                     logging.info(f"RPC response: {data}")
                     result = data.get("result", "0x0")
                     if result and result not in ("0x", "0x0"):
-                        # pUSD is 6 decimals (same as USDC)
                         balance = int(result, 16) / 1_000_000
                         logging.info(f"pUSD balance fetched via RPC ({rpc}): ${balance:.2f}")
                         if balance > 0:
@@ -495,18 +503,6 @@ class RobustBalanceManager:
 
 # ==================== EXECUTOR (V2) ====================
 class PolymarketExecutor:
-    """
-    V2 CHANGES:
-    - Import: py_clob_client_v2 (not py_clob_client)
-    - ClobClient constructor: keyword args only; chain_id= (not positional)
-    - ApiCreds replaces api_key/api_secret/api_passphrase positional args
-    - LimitOrderArgs → OrderArgs(side=Side.BUY)
-    - feeRateBps, nonce, taker removed from order args
-    - create_and_post_order() takes order_args=, options=, order_type= kwargs
-    - Market sell uses create_and_post_market_order() with Side.SELL
-    - POLYGON constant removed; use chain_id=137
-    """
-
     def __init__(self, dry_run: bool):
         self.dry_run = dry_run
         self.client  = None
@@ -518,10 +514,9 @@ class PolymarketExecutor:
                     api_secret     = POLY_SECRET,
                     api_passphrase = POLY_PASSPHRASE,
                 )
-                # V2: keyword-only constructor; chain_id= (was positional + POLYGON constant)
                 self.client = ClobClient(
                     host     = "https://clob.polymarket.com",
-                    chain_id = 137,   # Polygon mainnet (was: chain_id=POLYGON)
+                    chain_id = 137,
                     key      = YOUR_PRIVATE_KEY,
                     creds    = creds,
                 )
@@ -533,13 +528,7 @@ class PolymarketExecutor:
     def place_limit_buy(
         self, token_id: str, amount_usd: float, limit_price: float
     ) -> Tuple[bool, str, float]:
-        """
-        V2: OrderArgs replaces LimitOrderArgs.
-        - side=Side.BUY (was hardcoded "BUY" string)
-        - feeRateBps, nonce, taker fields removed
-        - create_and_post_order() takes named kwargs
-        """
-        shares      = round(amount_usd / limit_price, 4)
+        shares = round(amount_usd / limit_price, 4)
 
         if self.dry_run or self.client is None:
             logging.info(
@@ -550,14 +539,12 @@ class PolymarketExecutor:
 
         for attempt in range(MAX_RETRIES):
             try:
-                # V2: OrderArgs (not LimitOrderArgs); side= uses Side enum
                 result = self.client.create_and_post_order(
                     order_args = OrderArgs(
                         token_id = token_id,
                         price    = limit_price,
                         size     = shares,
                         side     = Side.BUY,
-                        # NOTE: feeRateBps, nonce, taker removed in V2
                     ),
                     options    = PartialCreateOrderOptions(tick_size="0.01"),
                     order_type = OrderType.GTC,
@@ -594,21 +581,16 @@ class PolymarketExecutor:
             return False
 
     def place_sell(self, token_id: str, shares: float) -> Tuple[bool, str]:
-        """
-        V2: Market sell uses create_and_post_market_order() with Side.SELL.
-        Amount for a sell is in shares (not USDC).
-        """
         if self.dry_run or self.client is None:
             logging.info(f"[DRY RUN] MARKET SELL {shares:.4f} shares token {token_id[:12]}…")
             return True, "dry-run-sell"
 
         for attempt in range(MAX_RETRIES):
             try:
-                # V2: create_and_post_market_order() replaces create_and_post_order() for market orders
                 result = self.client.create_and_post_market_order(
                     order_args = MarketOrderArgs(
                         token_id   = token_id,
-                        amount     = shares,   # shares for SELL side
+                        amount     = shares,
                         side       = Side.SELL,
                         order_type = OrderType.FOK,
                     ),
@@ -633,7 +615,9 @@ class CopyTrader:
         self.pending:   Dict[str, PendingLimitBuy] = {}
         self.executor   = PolymarketExecutor(dry_run)
         self.seen       = SeenTradesStore(SEEN_TRADES_FILE, DATABASE_URL)
-        self._first_scan: Set[str] = set()
+
+        # Tracks which wallets have completed their first scan
+        self._first_scan_done: Set[str] = set()
 
         logging.info(f"Multi-Wallet CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
         logging.info(
@@ -641,6 +625,10 @@ class CopyTrader:
             f"ask cap=+{LIMIT_BUY_MAX_PREMIUM*100:.0f}% | expiry={LIMIT_EXPIRY_SECONDS}s | "
             f"storage={self.seen.backend} | sdk=py-clob-client-v2 | collateral=pUSD"
         )
+        for addr, cfg in WALLETS.items():
+            logging.info(
+                f"  {cfg['name']} ({addr[:10]}…) copy_mode={cfg['copy_mode']}"
+            )
 
     def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
         """Returns (mid_price, best_ask). Either may be 0.0 on failure."""
@@ -748,7 +736,6 @@ class CopyTrader:
                     logging.info(f"No orderbook on retry — skipping {pending.question[:40]}")
                     continue
 
-                # Option A: new cap based on fresh ask
                 current_ask = best_ask if best_ask > 0 else mid_price
                 price_cap   = round(current_ask * (1 + LIMIT_BUY_MAX_PREMIUM), 4)
                 limit_price = round(min(current_ask, price_cap), 4)
@@ -799,12 +786,15 @@ class CopyTrader:
         source_token_ids_by_wallet: Dict[str, set] = {}
 
         for wallet_addr, config in WALLETS.items():
+            copy_mode = config.get("copy_mode", "new_only")
+            name      = config["name"]
+
             raw = self._get_positions(wallet_addr)
             if raw is None:
-                logging.warning(f"Skipping {config['name']} — could not fetch positions")
+                logging.warning(f"Skipping {name} — could not fetch positions")
                 continue
 
-            # ---- Build source token set ----
+            # ---- Build source token set (value >= $1 filter) ----
             source_token_ids = set()
             for pos in raw:
                 tid      = pos.get("asset", "")
@@ -812,34 +802,40 @@ class CopyTrader:
                 if tid and size_usd >= 1.0:
                     source_token_ids.add(tid)
 
-            # ---- FIRST SCAN LOGIC (restart-safe) ----
-            if wallet_addr not in self._first_scan:
-                self._first_scan.add(wallet_addr)
+            # ----------------------------------------------------------------
+            # FIRST SCAN LOGIC — runs once per wallet per deployment
+            # ----------------------------------------------------------------
+            if wallet_addr not in self._first_scan_done:
+                self._first_scan_done.add(wallet_addr)
 
-                if self.seen.is_empty:
+                if copy_mode == "new_only":
+                    # TheSpirit: mark every current position as seen so we
+                    # never copy anything that was already open at deployment.
+                    # Then skip the buy loop for this scan — the next poll is
+                    # the first one where new trades can be detected.
                     all_keys = {f"{wallet_addr}_{tid}" for tid in source_token_ids}
                     self.seen.snapshot_existing(all_keys)
                     logging.info(
-                        f"[{config['name']}] First ever run — "
-                        f"{len(all_keys)} pre-existing position(s) snapshotted"
+                        f"[{name}] new_only — {len(all_keys)} existing position(s) "
+                        f"snapshotted at deployment, skipping buy loop this scan"
                     )
+                    source_token_ids_by_wallet[wallet_addr] = source_token_ids
+                    continue   # ← do NOT copy anything on the first scan
+
                 else:
-                    new_keys = [
-                        f"{wallet_addr}_{tid}" for tid in source_token_ids
-                        if not self.seen.is_seen(f"{wallet_addr}_{tid}")
-                    ]
+                    # copy_all (WalletA179): don't snapshot anything — allow
+                    # the buy loop below to copy existing positions right now.
                     logging.info(
-                        f"[{config['name']}] Restart — "
-                        f"{len(new_keys)} new position(s) to copy, "
-                        f"{len(source_token_ids) - len(new_keys)} already seen"
+                        f"[{name}] copy_all — {len(source_token_ids)} position(s) "
+                        f"open at deployment, will copy unseen ones now"
                     )
 
             logging.info(
-                f"[{config['name']}] {len(raw)} position(s) from API, "
+                f"[{name}] {len(raw)} position(s) from API, "
                 f"{len(source_token_ids)} with currentValue >= $1"
             )
 
-            # ---- BUY LOGIC (Option A price cap) ----
+            # ---- BUY LOGIC ----
             for pos in raw:
                 token_id  = pos.get("asset", "")
                 market_id = pos.get("conditionId", "")
@@ -856,7 +852,7 @@ class CopyTrader:
                 in_pending   = pos_key in self.pending
 
                 logging.info(
-                    f"[{config['name']}] {question[:40]} | "
+                    f"[{name}] {question[:40]} | "
                     f"seen={already_seen} open={in_positions} pending={in_pending} "
                     f"val=${size_usd:.2f}"
                 )
@@ -868,24 +864,22 @@ class CopyTrader:
                     logging.info("Max positions reached — skipping new entries")
                     break
 
-                # Use curPrice from positions API — avoids stale/thin orderbook asks
+                # Use curPrice from positions API
                 cur_price = float(pos.get("curPrice", 0))
                 if cur_price <= 0:
-                    logging.info(f"[{config['name']}] SKIP no curPrice | {question[:40]}")
+                    logging.info(f"[{name}] SKIP no curPrice | {question[:40]}")
                     continue
 
-                # Cap at curPrice * 1.20 so we never chase a sudden spike
+                # 20% ask cap (Option A) — applies to both wallets
                 price_cap   = round(cur_price * (1 + LIMIT_BUY_MAX_PREMIUM), 4)
                 limit_price = round(cur_price, 4)
 
                 logging.info(
-                    f"[{config['name']}] curPrice={cur_price:.4f} cap={price_cap:.4f} | {question[:40]}"
+                    f"[{name}] curPrice={cur_price:.4f} cap={price_cap:.4f} | {question[:40]}"
                 )
 
                 risk_pct = self.get_risk_percent(limit_price, config)
                 my_size  = round(current_bankroll * risk_pct, 2)
-
-
 
                 ok, order_id, actual_price = self.executor.place_limit_buy(
                     token_id, my_size, limit_price
@@ -899,13 +893,13 @@ class CopyTrader:
                         question      = question,
                         outcome       = outcome,
                         source_wallet = wallet_addr,
-                        source_name   = config["name"],
+                        source_name   = name,
                         limit_price   = actual_price,
                         size_usd      = my_size,
                         order_id      = order_id,
                     )
                     logging.info(
-                        f"[{config['name']}] LIMIT BUY PLACED (V2) | {question[:40]} | "
+                        f"[{name}] LIMIT BUY PLACED (V2) | {question[:40]} | "
                         f"${my_size:.2f} @ {actual_price:.4f} "
                         f"(curPrice={cur_price:.4f} cap={price_cap:.4f})"
                     )
@@ -925,7 +919,7 @@ class CopyTrader:
                         position.exit_price = exit_price
                         position.pnl        = pnl
                         logging.info(
-                            f"[{config['name']}] MARKET SELL (V2) | {position.question[:40]} | "
+                            f"[{name}] MARKET SELL (V2) | {position.question[:40]} | "
                             f"exit={exit_price:.4f} pnl=${pnl:.2f}"
                         )
                         del self.positions[pos_key]
