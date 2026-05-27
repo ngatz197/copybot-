@@ -851,7 +851,11 @@ async def main():
     _bot_ref = bot
 
     # Confirm real balance before doing anything — raises if it can't
-    bot.balance.fetch_with_retry(retries=5, delay=10)
+    starting_balance = bot.balance.fetch_with_retry(retries=5, delay=10)
+    # Set peak to actual starting balance so drawdown is calculated correctly
+    bot.balance.peak_balance = starting_balance
+    global peak_bankroll
+    peak_bankroll = starting_balance
 
     await bot.run()
 
