@@ -792,7 +792,7 @@ class CopyTrader:
             return
 
         logging.info(
-            f"Scanning | bankroll=${current_bankroll:.2f} (pUSD) | "
+            f"Scanning | bankroll=${current_bankroll:.2f} pUSD | "
             f"open={len(self.positions)} | pending={len(self.pending)} | "
             f"seen={len(self.seen._seen)}"
         )
@@ -890,11 +890,7 @@ class CopyTrader:
                 risk_pct = self.get_risk_percent(limit_price, config)
                 my_size  = round(current_bankroll * risk_pct, 2)
 
-                if my_size < 1.0:
-                    logging.info(
-                        f"[{config['name']}] SKIP size too small (${my_size:.2f}) | {question[:40]}"
-                    )
-                    continue
+
 
                 ok, order_id, actual_price = self.executor.place_limit_buy(
                     token_id, my_size, limit_price
