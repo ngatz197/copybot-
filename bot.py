@@ -19,6 +19,7 @@ MULTI-WALLET COPY TRADER - PRODUCTION READY (CLOB V2)
 - Improved Balance Fetching + Robust Error Handling & Retries
 - Pending limit order tracking + auto-cancel on expiry
 - Health endpoint for Render (keeps bot awake)
+- Compounding bankroll: grows with COMPOUNDING_RATE * profit on each closed trade
 
 PER-WALLET COPY RULES:
   TheSpirit  (0x0c0e...): only copy NEW trades appearing after deployment,
@@ -114,8 +115,10 @@ SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 # V2: pUSD contract address on Polygon (verified on PolygonScan)
 PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
-current_bankroll  = INITIAL_BANKROLL
-peak_bankroll     = INITIAL_BANKROLL
+current_bankroll      = INITIAL_BANKROLL
+peak_bankroll         = INITIAL_BANKROLL
+# Compounding bankroll: seeded from real balance at startup, grows with profits
+compounding_bankroll  = INITIAL_BANKROLL
 bot_paused_until: Optional[datetime] = None
 
 
@@ -333,6 +336,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="stat-sub">pUSD &nbsp;·&nbsp; Peak ${peak:.2f}</div>
         </div>
         <div class="stat-card">
+            <div class="stat-label">Compounding Bankroll</div>
+            <div class="stat-value {comp_cls}">${comp_bankroll:.2f}</div>
+            <div class="stat-sub">Sizing base &nbsp;·&nbsp; Rate {comp_rate:.0f}%</div>
+        </div>
+        <div class="stat-card">
             <div class="stat-label">Total PnL</div>
             <div class="stat-value {total_pnl_cls}">{total_pnl_sign}${total_pnl_abs}</div>
             <div class="stat-sub">Realised + Unrealised</div>
@@ -473,6 +481,9 @@ def build_dashboard(bot) -> dict:
         """Smart format: 4dp for tiny values that would show as $0.00 at 2dp."""
         return f"{abs(v):.4f}" if abs(v) < 0.005 else f"{abs(v):.2f}"
 
+    # Compounding bankroll grows above starting balance when profitable
+    comp_delta = compounding_bankroll - (bot.balance.peak_balance or INITIAL_BANKROLL)
+
     return {
         "last_updated":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode_label":      mode_label,
@@ -484,6 +495,9 @@ def build_dashboard(bot) -> dict:
         "drawdown":        drawdown,
         "dd_cls":          "neg" if drawdown > 10 else ("neu" if drawdown > 5 else "pos"),
         "max_dd":          MAX_DRAWDOWN * 100,
+        "comp_bankroll":   compounding_bankroll,
+        "comp_cls":        _cls(comp_delta),
+        "comp_rate":       COMPOUNDING_RATE * 100,
         "total_pnl_cls":   _cls(total_pnl),
         "total_pnl_sign":  _sign(total_pnl),
         "total_pnl_abs":   _fmt(total_pnl),
@@ -1057,7 +1071,7 @@ class CopyTrader:
                     )
 
     async def scan_and_copy(self):
-        global current_bankroll, bot_paused_until
+        global current_bankroll, compounding_bankroll, bot_paused_until
 
         if bot_paused_until and datetime.now() < bot_paused_until:
             remaining = (bot_paused_until - datetime.now()).seconds // 60
@@ -1074,6 +1088,7 @@ class CopyTrader:
 
         logging.info(
             f"Scanning | bankroll=${current_bankroll:.2f} pUSD | "
+            f"compounding=${compounding_bankroll:.2f} | "
             f"open={len(self.positions)} | pending={len(self.pending)} | "
             f"seen={len(self.seen._seen)}"
         )
@@ -1130,7 +1145,7 @@ class CopyTrader:
                 f"{len(source_token_ids)} with currentValue >= $1"
             )
 
-            # ---- BUY LOGIC ----
+            # ---- BUY LOGIC — uses compounding_bankroll for sizing ----
             for pos in raw:
                 token_id  = pos.get("asset", "")
                 market_id = pos.get("conditionId", "")
@@ -1174,7 +1189,8 @@ class CopyTrader:
                 )
 
                 risk_pct = self.get_risk_percent(limit_price, config)
-                my_size  = round(current_bankroll * risk_pct, 2)
+                # Use compounding_bankroll for position sizing
+                my_size  = round(compounding_bankroll * risk_pct, 2)
 
                 ok, order_id, actual_price = self.executor.place_limit_buy(
                     token_id, my_size, limit_price
@@ -1196,7 +1212,8 @@ class CopyTrader:
                     logging.info(
                         f"[{name}] LIMIT BUY PLACED (V2) | {question[:40]} | "
                         f"${my_size:.2f} @ {actual_price:.4f} "
-                        f"(curPrice={cur_price:.4f} cap={price_cap:.4f})"
+                        f"(comp_bankroll=${compounding_bankroll:.2f} "
+                        f"curPrice={cur_price:.4f} cap={price_cap:.4f})"
                     )
 
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
@@ -1228,6 +1245,17 @@ class CopyTrader:
                         position.status     = "closed"
                         position.exit_price = exit_price
                         position.pnl        = pnl
+
+                        # Compound profits into compounding_bankroll (losses
+                        # reduce the real balance naturally; we only add wins)
+                        if pnl > 0:
+                            compounding_bankroll += pnl * COMPOUNDING_RATE
+                            logging.info(
+                                f"Compounding profit: +${pnl * COMPOUNDING_RATE:.4f} "
+                                f"({COMPOUNDING_RATE*100:.0f}% of ${pnl:.4f}) → "
+                                f"compounding_bankroll=${compounding_bankroll:.2f}"
+                            )
+
                         logging.info(
                             f"[{name}] MARKET SELL (V2) | {position.question[:40]} | "
                             f"exit={exit_price:.4f} pnl=${pnl:.2f}"
@@ -1251,6 +1279,7 @@ class CopyTrader:
                 status = "PAUSED" if bot_paused_until and datetime.now() < bot_paused_until else "ACTIVE"
                 logging.info(
                     f"Heartbeat | {status} | bankroll=${self.balance.cached_balance or 0:.2f} pUSD | "
+                    f"compounding=${compounding_bankroll:.2f} | "
                     f"open={len(self.positions)} | pending={len(self.pending)} | "
                     f"seen={len(self.seen._seen)} | storage={self.seen.backend}"
                 )
@@ -1261,7 +1290,7 @@ class CopyTrader:
 
 # ==================== ENTRY POINT ====================
 async def main():
-    global _bot_ref
+    global _bot_ref, compounding_bankroll, peak_bankroll
 
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
@@ -1272,8 +1301,10 @@ async def main():
     try:
         starting_balance = bot.balance.fetch_with_retry(retries=5, delay=10)
         bot.balance.peak_balance = starting_balance
-        global peak_bankroll
-        peak_bankroll = starting_balance
+        peak_bankroll        = starting_balance
+        # Seed compounding_bankroll from the confirmed real balance
+        compounding_bankroll = starting_balance
+        logging.info(f"Compounding bankroll seeded at ${compounding_bankroll:.2f}")
     except RuntimeError as e:
         logging.error(f"Startup pUSD balance fetch failed: {e} — running in degraded mode")
 
