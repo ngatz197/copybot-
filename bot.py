@@ -258,17 +258,22 @@ class RobustBalanceManager:
         for rpc in self.POLYGON_RPCS:
             try:
                 resp = requests.post(rpc, json=payload, timeout=8)
+                logging.info(f"RPC {rpc} status={resp.status_code}")
                 if resp.status_code == 200:
                     data   = resp.json()
+                    logging.info(f"RPC response: {data}")
                     result = data.get("result", "0x0")
                     if result and result not in ("0x", "0x0"):
                         balance = int(result, 16) / 1_000_000  # USDC has 6 decimals
+                        logging.info(f"Balance fetched via RPC ({rpc}): ${balance:.2f}")
                         if balance > 0:
-                            logging.info(f"Balance fetched via RPC ({rpc}): ${balance:.2f}")
                             return balance
+                        else:
+                            logging.warning(f"Balance is 0 for wallet {YOUR_WALLET[:10]}...")
             except Exception as e:
                 logging.warning(f"RPC balance fetch failed ({rpc}): {e}")
                 continue
+        logging.error(f"All RPC attempts failed for wallet {YOUR_WALLET[:10] if YOUR_WALLET else 'NOT SET'}...")
         return 0.0
 
     def get_balance(self, force=False) -> Optional[float]:
