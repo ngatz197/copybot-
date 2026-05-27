@@ -868,23 +868,19 @@ class CopyTrader:
                     logging.info("Max positions reached — skipping new entries")
                     break
 
-                mid_price, best_ask = self.get_orderbook_prices(token_id)
-                if best_ask <= 0 and mid_price <= 0:
-                    logging.info(f"[{config['name']}] SKIP no orderbook | {question[:40]}")
+                # Use curPrice from positions API — avoids stale/thin orderbook asks
+                cur_price = float(pos.get("curPrice", 0))
+                if cur_price <= 0:
+                    logging.info(f"[{config['name']}] SKIP no curPrice | {question[:40]}")
                     continue
 
-                # ---- Option A: cap relative to current ask ----
-                current_ask = best_ask if best_ask > 0 else mid_price
-                price_cap   = round(current_ask * (1 + LIMIT_BUY_MAX_PREMIUM), 4)
+                # Cap at curPrice * 1.20 so we never chase a sudden spike
+                price_cap   = round(cur_price * (1 + LIMIT_BUY_MAX_PREMIUM), 4)
+                limit_price = round(cur_price, 4)
 
-                if mid_price > price_cap:
-                    logging.info(
-                        f"[{config['name']}] SKIP price-cap | {question[:40]} | "
-                        f"mid={mid_price:.4f} ask={current_ask:.4f} cap={price_cap:.4f}"
-                    )
-                    continue
-
-                limit_price = round(min(current_ask, price_cap), 4)
+                logging.info(
+                    f"[{config['name']}] curPrice={cur_price:.4f} cap={price_cap:.4f} | {question[:40]}"
+                )
 
                 risk_pct = self.get_risk_percent(limit_price, config)
                 my_size  = round(current_bankroll * risk_pct, 2)
@@ -911,7 +907,7 @@ class CopyTrader:
                     logging.info(
                         f"[{config['name']}] LIMIT BUY PLACED (V2) | {question[:40]} | "
                         f"${my_size:.2f} @ {actual_price:.4f} "
-                        f"(ask={current_ask:.4f} cap={price_cap:.4f} mid={mid_price:.4f})"
+                        f"(curPrice={cur_price:.4f} cap={price_cap:.4f})"
                     )
 
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
