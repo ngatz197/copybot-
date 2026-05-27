@@ -9,6 +9,7 @@ MULTI-WALLET COPY TRADER - PRODUCTION READY
 - Improved Balance Fetching + Robust Error Handling & Retries
 - Pending limit order tracking + auto-cancel on expiry
 - Health endpoint for Render (keeps bot awake)
+- FIX: snapshot only on first-ever run, not on every restart
 """
 
 import os
@@ -63,14 +64,8 @@ PAUSE_HOURS       = 48
 MAX_RETRIES       = 3
 RETRY_DELAY       = 5
 
-# ---- Limit order settings ----
-# Max % above the source wallet's entry price we are willing to pay (0.20 = 20%)
 LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
-
-# How many seconds before an unfilled limit buy is cancelled and retried
-LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))  # 5 minutes
-
-# Persistent file tracking every trade we have ever seen/copied (survives restarts)
+LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 
 current_bankroll  = INITIAL_BANKROLL
@@ -86,16 +81,16 @@ HTML_TEMPLATE = """
     <title>CopyTrader Live Dashboard</title>
     <meta http-equiv="refresh" content="15">
     <style>
-        body { font-family: 'Segoe UI', Arial, sans-serif; background: #0a0a0a; color: #00cc00; margin: 0; padding: 20px; }
-        h1 { color: #00ff00; text-align: center; }
-        .container { max-width: 1100px; margin: auto; }
-        .card { background: #111111; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 0 10px rgba(0,255,0,0.1); }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #222; }
-        th { background: #1a1a1a; }
-        .green { color: #00ff88; }
-        .red { color: #ff4444; }
-        .status { font-size: 1.2em; font-weight: bold; }
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #0a0a0a; color: #00cc00; margin: 0; padding: 20px; }}
+        h1 {{ color: #00ff00; text-align: center; }}
+        .container {{ max-width: 1100px; margin: auto; }}
+        .card {{ background: #111111; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 0 10px rgba(0,255,0,0.1); }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #222; }}
+        th {{ background: #1a1a1a; }}
+        .green {{ color: #00ff88; }}
+        .red {{ color: #ff4444; }}
+        .status {{ font-size: 1.2em; font-weight: bold; }}
     </style>
 </head>
 <body>
@@ -107,6 +102,7 @@ HTML_TEMPLATE = """
             <p><strong>Bankroll:</strong> ${bankroll:.2f} | <strong>Peak:</strong> ${peak:.2f}</p>
             <p><strong>Drawdown:</strong> <span class="{dd_class}">{drawdown:.1f}%</span></p>
             <p><strong>Open Positions:</strong> {open_pos} / {max_pos} | <strong>Pending:</strong> {pending_pos}</p>
+            <p><strong>Seen trades (lifetime):</strong> {seen_count}</p>
         </div>
         <div class="card">
             <h2>Open Positions</h2>
@@ -152,6 +148,7 @@ def build_dashboard(bot) -> dict:
         "open_pos": len(bot.positions),
         "max_pos": MAX_POSITIONS,
         "pending_pos": len(bot.pending),
+        "seen_count": len(bot.seen._seen),
         "positions_table": pos_table,
         "pending_table": pend_table,
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -207,7 +204,6 @@ class Position:
 
 @dataclass
 class PendingLimitBuy:
-    """Tracks an open limit buy order that has not yet been confirmed filled."""
     pos_key:       str
     token_id:      str
     market_id:     str
@@ -223,7 +219,7 @@ class PendingLimitBuy:
 
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
-    USDC_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # PUSD
+    USDC_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
     POLYGON_RPCS = [
         "https://polygon-bor-rpc.publicnode.com",
         "https://polygon.llamarpc.com",
@@ -231,16 +227,11 @@ class RobustBalanceManager:
     ]
 
     def __init__(self):
-        self.cached_balance: Optional[float] = None  # None = not yet fetched
+        self.cached_balance: Optional[float] = None
         self.last_update    = 0
         self.peak_balance   = 0.0
 
     def _fetch_balance(self) -> float:
-        """
-        Fetches USDC balance directly from the Polygon blockchain via RPC.
-        Calls balanceOf(address) on the USDC contract.
-        Returns balance as float > 0, or 0.0 on failure.
-        """
         if not YOUR_WALLET:
             logging.error("DEPOSIT_WALLET_ADDRESS not set — cannot fetch balance")
             return 0.0
@@ -265,7 +256,7 @@ class RobustBalanceManager:
                     logging.info(f"RPC response: {data}")
                     result = data.get("result", "0x0")
                     if result and result not in ("0x", "0x0"):
-                        balance = int(result, 16) / 1_000_000  # USDC has 6 decimals
+                        balance = int(result, 16) / 1_000_000
                         logging.info(f"Balance fetched via RPC ({rpc}): ${balance:.2f}")
                         if balance > 0:
                             return balance
@@ -278,11 +269,6 @@ class RobustBalanceManager:
         return 0.0
 
     def get_balance(self, force=False) -> Optional[float]:
-        """
-        Returns real balance from Polymarket, or cached value if fetched recently.
-        Returns None if balance has never been successfully fetched.
-        NEVER returns a simulated or hardcoded value.
-        """
         if force or self.cached_balance is None or (time.time() - self.last_update > 30):
             real = self._fetch_balance()
             if real > 0:
@@ -297,13 +283,9 @@ class RobustBalanceManager:
                         "Could not fetch real balance from Polymarket — "
                         "bot will not trade until balance is confirmed"
                     )
-        return self.cached_balance  # may be None if never fetched successfully
+        return self.cached_balance
 
     def fetch_with_retry(self, retries: int = 5, delay: int = 10) -> float:
-        """
-        Called at startup — blocks until a real balance is retrieved or retries exhausted.
-        Raises RuntimeError if balance cannot be confirmed after all retries.
-        """
         for attempt in range(1, retries + 1):
             val = self._fetch_balance()
             if val > 0:
@@ -329,11 +311,6 @@ class RobustBalanceManager:
 
 # ==================== EXECUTOR ====================
 class PolymarketExecutor:
-    """
-    Buys  → GTC limit orders priced at source wallet's avg entry, capped at LIMIT_BUY_PRICE_CAP (0.80)
-    Sells → market orders for instant exit
-    """
-
     def __init__(self, dry_run: bool):
         self.dry_run = dry_run
         self.client  = None
@@ -352,16 +329,9 @@ class PolymarketExecutor:
                 logging.error(f"ClobClient init failed: {e}")
                 self.client = None
 
-    # ---------- LIMIT BUY ----------
     def place_limit_buy(
         self, token_id: str, amount_usd: float, target_price: float, source_price: float
     ) -> Tuple[bool, str, float]:
-        """
-        Places a GTC limit buy.
-        target_price  = source wallet's avg entry (or best_ask / mid fallback).
-        Hard cap      = source_price * (1 + LIMIT_BUY_MAX_PREMIUM), also capped at 0.90.
-        Returns (success, order_id, limit_price_used)
-        """
         price_cap   = round(min(source_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
         limit_price = round(min(target_price, price_cap), 4)
         shares      = round(amount_usd / limit_price, 4)
@@ -392,7 +362,6 @@ class PolymarketExecutor:
                 time.sleep(RETRY_DELAY)
         return False, "", limit_price
 
-    # ---------- CANCEL ORDER ----------
     def cancel_order(self, order_id: str) -> bool:
         if self.dry_run or self.client is None:
             logging.info(f"[DRY RUN] CANCEL order {order_id}")
@@ -405,11 +374,9 @@ class PolymarketExecutor:
             logging.warning(f"Cancel failed for {order_id}: {e}")
             return False
 
-    # ---------- CHECK ORDER FILLED ----------
     def is_order_filled(self, order_id: str) -> bool:
-        """Returns True if the order is fully filled."""
         if self.dry_run or self.client is None:
-            return True  # simulate instant fill in dry-run
+            return True
         try:
             order = self.client.get_order(order_id)
             status = order.get("status", "").lower()
@@ -418,7 +385,6 @@ class PolymarketExecutor:
             logging.warning(f"Could not check order status for {order_id}: {e}")
             return False
 
-    # ---------- MARKET SELL ----------
     def place_sell(self, token_id: str, shares: float) -> Tuple[bool, str]:
         if self.dry_run or self.client is None:
             logging.info(f"[DRY RUN] MARKET SELL {shares:.4f} shares token {token_id[:12]}…")
@@ -438,12 +404,6 @@ class PolymarketExecutor:
 
 # ==================== SEEN TRADES STORE ====================
 class SeenTradesStore:
-    """
-    Persists every pos_key (wallet_addr_tokenId) we have ever attempted to copy.
-    Loaded from disk on startup — survives bot restarts so we never re-copy
-    a trade that already existed when the bot first saw it.
-    """
-
     def __init__(self, filepath: str):
         self.filepath = filepath
         self._seen: Set[str] = self._load()
@@ -476,11 +436,6 @@ class SeenTradesStore:
             self._save()
 
     def snapshot_existing(self, pos_keys):
-        """
-        Called once on first scan per wallet to bulk-mark all currently open
-        positions as already seen, so the bot skips them and only acts on
-        trades that appear AFTER startup.
-        """
         added = 0
         for key in pos_keys:
             if key not in self._seen:
@@ -489,6 +444,10 @@ class SeenTradesStore:
         if added:
             self._save()
             logging.info(f"Snapshot: marked {added} pre-existing trades as seen (will not copy)")
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self._seen) == 0
 
 
 # ==================== COPY TRADER ====================
@@ -500,7 +459,7 @@ class CopyTrader:
         self.pending:     Dict[str, PendingLimitBuy] = {}
         self.executor     = PolymarketExecutor(dry_run)
         self.seen         = SeenTradesStore(SEEN_TRADES_FILE)
-        self._first_scan: Set[str] = set()  # wallets not yet snapshotted this session
+        self._first_scan: Set[str] = set()
 
         logging.info(f"Multi-Wallet CopyTrader started | mode={'DRY RUN' if dry_run else 'LIVE'}")
         logging.info(
@@ -509,7 +468,6 @@ class CopyTrader:
         )
 
     def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
-        """Returns (mid_price, best_ask). Either may be 0.0 on failure."""
         for attempt in range(MAX_RETRIES):
             try:
                 r = requests.get(
@@ -534,14 +492,6 @@ class CopyTrader:
         return mid
 
     def _source_entry_price(self, pos: dict, best_ask: float, mid_price: float) -> float:
-        """
-        Determine the best limit price to use, in priority order:
-        1. avgPrice / averagePrice from the position data (source wallet's actual avg entry)
-        2. curPrice / currentPrice if present
-        3. best_ask from the live orderbook (closest to what you'd pay right now)
-        4. mid_price as last resort
-        All results are capped at LIMIT_BUY_PRICE_CAP.
-        """
         for key in ("avgPrice", "averagePrice", "avg_price", "average_price"):
             val = pos.get(key)
             if val:
@@ -599,17 +549,10 @@ class CopyTrader:
 
     # ---- PENDING LIMIT ORDER MANAGEMENT ----
     def _process_pending_orders(self, source_token_ids_by_wallet: Dict[str, set]):
-        """
-        For each pending limit buy:
-        - If filled → promote to open position
-        - If source wallet no longer holds token → cancel and discard
-        - If expired → cancel and retry with fresh mid-price
-        """
         global current_bankroll
         for pos_key, pending in list(self.pending.items()):
             wallet_tokens = source_token_ids_by_wallet.get(pending.source_wallet, set())
 
-            # Source wallet exited — cancel our pending order
             if pending.token_id not in wallet_tokens:
                 logging.info(
                     f"Source exited before fill — cancelling pending {pending.question[:40]}"
@@ -618,7 +561,6 @@ class CopyTrader:
                 del self.pending[pos_key]
                 continue
 
-            # Check if filled
             if self.executor.is_order_filled(pending.order_id):
                 shares = pending.size_usd / pending.limit_price if pending.limit_price > 0 else 0
                 self.positions[pos_key] = Position(
@@ -640,7 +582,6 @@ class CopyTrader:
                 )
                 continue
 
-            # Check expiry
             age = (datetime.now() - pending.placed_at).total_seconds()
             if age >= LIMIT_EXPIRY_SECONDS:
                 logging.info(
@@ -650,16 +591,14 @@ class CopyTrader:
                 self.executor.cancel_order(pending.order_id)
                 del self.pending[pos_key]
 
-                # Retry with fresh price
                 mid_price, best_ask = self.get_orderbook_prices(pending.token_id)
                 if mid_price <= 0:
                     continue
-                # On retry, use best_ask as target (no source pos data available here)
                 target_price = best_ask if best_ask > 0 else mid_price
                 price_cap    = round(min(pending.limit_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
                 if target_price > price_cap:
                     logging.info(
-                        f"Retry skipped — price {target_price:.4f} > 20% cap {price_cap:.4f} "
+                        f"Retry skipped — price {target_price:.4f} > cap {price_cap:.4f} "
                         f"for {pending.question[:40]}"
                     )
                     continue
@@ -700,10 +639,10 @@ class CopyTrader:
             return
         logging.info(
             f"Scanning | bankroll=${current_bankroll:.2f} | "
-            f"open={len(self.positions)} | pending={len(self.pending)}"
+            f"open={len(self.positions)} | pending={len(self.pending)} | "
+            f"seen={len(self.seen._seen)}"
         )
 
-        # Collect token IDs per wallet for pending order management
         source_token_ids_by_wallet: Dict[str, set] = {}
 
         for wallet_addr, config in WALLETS.items():
@@ -713,28 +652,50 @@ class CopyTrader:
                 continue
 
             source_token_ids = set()
-
-            # Build source_token_ids first (needed for snapshot)
             for pos in raw:
                 tid      = pos.get("asset", "")
                 size_usd = float(pos.get("value", 0))
                 if tid and size_usd >= 1.0:
                     source_token_ids.add(tid)
 
-            # ---- FIRST SCAN SNAPSHOT ----
-            # On the very first scan for this wallet each session, bulk-mark every
-            # currently visible trade as already seen so we ONLY copy trades that
-            # appear AFTER the bot started — never pre-existing ones.
+            # ---- FIRST SCAN LOGIC (restart-safe) ----
+            # Only snapshot on the very first ever run (empty seen_trades.json).
+            # On restarts, trust the file — any position NOT in it is genuinely new.
             if wallet_addr not in self._first_scan:
-                all_keys = {f"{wallet_addr}_{tid}" for tid in source_token_ids}
-                self.seen.snapshot_existing(all_keys)
                 self._first_scan.add(wallet_addr)
-                logging.info(
-                    f"First scan {config['name']} — "
-                    f"{len(all_keys)} pre-existing trade(s) marked seen, will not copy"
-                )
 
-            # ---- BUY LOGIC (limit orders priced at source entry, capped at +20%) ----
+                if self.seen.is_empty:
+                    # First ever boot — snapshot everything to avoid copying stale positions
+                    all_keys = {f"{wallet_addr}_{tid}" for tid in source_token_ids}
+                    self.seen.snapshot_existing(all_keys)
+                    logging.info(
+                        f"[{config['name']}] First ever run — "
+                        f"{len(all_keys)} pre-existing position(s) snapshotted, will not copy"
+                    )
+                else:
+                    # Restart — check for positions that appeared since last run
+                    new_keys = {
+                        f"{wallet_addr}_{tid}" for tid in source_token_ids
+                        if not self.seen.is_seen(f"{wallet_addr}_{tid}")
+                    }
+                    if new_keys:
+                        logging.info(
+                            f"[{config['name']}] Restart detected — "
+                            f"{len(new_keys)} new position(s) found since last run, will attempt to copy"
+                        )
+                    else:
+                        logging.info(
+                            f"[{config['name']}] Restart detected — "
+                            f"no new positions since last run"
+                        )
+
+            # ---- DIAGNOSTIC: log every candidate ----
+            logging.info(
+                f"[{config['name']}] {len(raw)} position(s) from API, "
+                f"{len(source_token_ids)} with value >= $1"
+            )
+
+            # ---- BUY LOGIC ----
             for pos in raw:
                 token_id  = pos.get("asset", "")
                 market_id = pos.get("market", "")
@@ -747,12 +708,19 @@ class CopyTrader:
 
                 pos_key = f"{wallet_addr}_{token_id}"
 
-                # Skip if seen before (pre-existing on startup OR previously copied)
-                if self.seen.is_seen(pos_key):
+                already_seen  = self.seen.is_seen(pos_key)
+                in_positions  = pos_key in self.positions
+                in_pending    = pos_key in self.pending
+
+                logging.info(
+                    f"[{config['name']}] {question[:40]} | "
+                    f"seen={already_seen} open={in_positions} pending={in_pending} val=${size_usd:.2f}"
+                )
+
+                if already_seen:
                     continue
 
-                # Skip if already in-flight or filled this session
-                if pos_key in self.positions or pos_key in self.pending:
+                if in_positions or in_pending:
                     continue
 
                 if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
@@ -761,19 +729,17 @@ class CopyTrader:
 
                 mid_price, best_ask = self.get_orderbook_prices(token_id)
                 if mid_price <= 0:
+                    logging.info(f"[{config['name']}] SKIP no orderbook | {question[:40]}")
                     continue
 
-                # Determine target price: source avg entry → best_ask → mid
                 target_price = self._source_entry_price(pos, best_ask, mid_price)
+                price_cap    = round(min(target_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
 
-                # Skip if market has already moved more than 20% above source entry
-                price_cap = round(min(target_price * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
                 if mid_price > price_cap:
                     logging.info(
-                        f"Mid {mid_price:.4f} > 20% cap {price_cap:.4f} "
-                        f"— skipping {question[:40]}"
+                        f"[{config['name']}] SKIP price-cap | {question[:40]} | "
+                        f"mid={mid_price:.4f} source={target_price:.4f} cap={price_cap:.4f}"
                     )
-                    # Mark seen so we don't recheck every poll
                     self.seen.mark_seen(pos_key)
                     continue
 
@@ -781,14 +747,15 @@ class CopyTrader:
                 my_size  = round(current_bankroll * risk_pct, 2)
 
                 if my_size < 1.0:
-                    logging.info(f"Size too small (${my_size:.2f}) — skipping {question[:40]}")
+                    logging.info(
+                        f"[{config['name']}] SKIP size too small (${my_size:.2f}) | {question[:40]}"
+                    )
                     continue
 
                 ok, order_id, limit_price = self.executor.place_limit_buy(
                     token_id, my_size, target_price, target_price
                 )
                 if ok:
-                    # Persist immediately so restarts don't re-place this order
                     self.seen.mark_seen(pos_key)
                     self.pending[pos_key] = PendingLimitBuy(
                         pos_key       = pos_key,
@@ -803,14 +770,14 @@ class CopyTrader:
                         order_id      = order_id,
                     )
                     logging.info(
-                        f"LIMIT BUY PLACED {config['name']} | {question[:40]} | "
+                        f"[{config['name']}] LIMIT BUY PLACED | {question[:40]} | "
                         f"${my_size:.2f} @ {limit_price:.4f} "
                         f"(source≈{target_price:.4f} cap={price_cap:.4f} mid={mid_price:.4f})"
                     )
 
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
 
-            # ---- SELL LOGIC (market orders — instant exit) ----
+            # ---- SELL LOGIC ----
             for pos_key, position in list(self.positions.items()):
                 if position.source_wallet != wallet_addr:
                     continue
@@ -823,12 +790,11 @@ class CopyTrader:
                         position.exit_price = exit_price
                         position.pnl        = pnl
                         logging.info(
-                            f"MARKET SELL {position.question[:40]} | "
-                            f"exit={exit_price:.4f} | pnl=${pnl:.2f}"
+                            f"[{config['name']}] MARKET SELL | {position.question[:40]} | "
+                            f"exit={exit_price:.4f} pnl=${pnl:.2f}"
                         )
                         del self.positions[pos_key]
 
-        # Process pending limit orders (fill checks, expiry, cancellations)
         self._process_pending_orders(source_token_ids_by_wallet)
 
     async def run(self):
@@ -844,8 +810,9 @@ class CopyTrader:
             if now - last_heartbeat >= 300:
                 status = "PAUSED" if bot_paused_until and datetime.now() < bot_paused_until else "ACTIVE"
                 logging.info(
-                    f"Status: {status} | Bankroll: ${self.balance.cached_balance or 0:.2f} | "
-                    f"Open: {len(self.positions)} | Pending: {len(self.pending)} | Watching: {len(WALLETS)} wallets"
+                    f"Heartbeat | {status} | bankroll=${self.balance.cached_balance or 0:.2f} | "
+                    f"open={len(self.positions)} | pending={len(self.pending)} | "
+                    f"seen={len(self.seen._seen)} | wallets={len(WALLETS)}"
                 )
                 last_heartbeat = now
 
@@ -855,18 +822,28 @@ class CopyTrader:
 # ==================== ENTRY POINT ====================
 async def main():
     global _bot_ref
+
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
     bot = CopyTrader(dry_run=DRY_RUN)
     _bot_ref = bot
 
-    # Confirm real balance before doing anything — raises if it can't
-    starting_balance = bot.balance.fetch_with_retry(retries=5, delay=10)
-    # Set peak to actual starting balance so drawdown is calculated correctly
-    bot.balance.peak_balance = starting_balance
-    global peak_bankroll
-    peak_bankroll = starting_balance
+    # Log seen_trades.json state on startup
+    try:
+        with open(SEEN_TRADES_FILE) as f:
+            seen_data = json.load(f)
+        logging.info(f"seen_trades.json: {len(seen_data)} entries on startup")
+    except FileNotFoundError:
+        logging.info("seen_trades.json not found — this is a first-ever run")
+
+    try:
+        starting_balance = bot.balance.fetch_with_retry(retries=5, delay=10)
+        bot.balance.peak_balance = starting_balance
+        global peak_bankroll
+        peak_bankroll = starting_balance
+    except RuntimeError as e:
+        logging.error(f"Startup balance fetch failed: {e} — running in degraded mode")
 
     await bot.run()
 
