@@ -539,7 +539,6 @@ class PolymarketExecutor:
         - feeRateBps, nonce, taker fields removed
         - create_and_post_order() takes named kwargs
         """
-        limit_price = round(min(limit_price, 0.90), 4)
         shares      = round(amount_usd / limit_price, 4)
 
         if self.dry_run or self.client is None:
@@ -751,7 +750,7 @@ class CopyTrader:
 
                 # Option A: new cap based on fresh ask
                 current_ask = best_ask if best_ask > 0 else mid_price
-                price_cap   = round(min(current_ask * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
+                price_cap   = round(current_ask * (1 + LIMIT_BUY_MAX_PREMIUM), 4)
                 limit_price = round(min(current_ask, price_cap), 4)
 
                 ok, order_id, filled_price = self.executor.place_limit_buy(
@@ -876,7 +875,7 @@ class CopyTrader:
 
                 # ---- Option A: cap relative to current ask ----
                 current_ask = best_ask if best_ask > 0 else mid_price
-                price_cap   = round(min(current_ask * (1 + LIMIT_BUY_MAX_PREMIUM), 0.90), 4)
+                price_cap   = round(current_ask * (1 + LIMIT_BUY_MAX_PREMIUM), 4)
 
                 if mid_price > price_cap:
                     logging.info(
