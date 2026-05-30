@@ -88,6 +88,12 @@ WALLETS = {
         "risk_type": "price_based",
         "copy_mode": "new_only",   # skip anything open at deployment
     },
+    "0xe8ca3f758c93f44f3ec210542ab78afb7c0bcccb": {
+        "name": "WalletE8ca",
+        "risk_type": "price_based",
+        "copy_mode": "new_only",   # skip anything open at deployment
+        "limit_buy_max_premium": 0.10,  # 10% ask cap (overrides global)
+    },
     # COPY-ALL: existing positions at deployment are also copied
     "0xa1795199a227f8d68134f30bf26314a9918c9629": {
         "name": "WalletA179",
@@ -1053,7 +1059,9 @@ class CopyTrader:
                     continue
 
                 current_ask = best_ask if best_ask > 0 else mid_price
-                price_cap   = round(current_ask * (1 + LIMIT_BUY_MAX_PREMIUM), 4)
+                _cfg        = WALLETS.get(pending.source_wallet, {})
+                wallet_premium = _cfg.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                price_cap   = round(current_ask * (1 + wallet_premium), 4)
                 limit_price = round(min(current_ask, price_cap), 4)
 
                 ok, order_id, filled_price = self.executor.place_limit_buy(
@@ -1187,8 +1195,9 @@ class CopyTrader:
                     logging.info(f"[{name}] SKIP no curPrice | {question[:40]}")
                     continue
 
-                # 20% ask cap (Option A) — applies to all wallets
-                price_cap   = round(cur_price * (1 + LIMIT_BUY_MAX_PREMIUM), 4)
+                # Per-wallet ask cap (falls back to global LIMIT_BUY_MAX_PREMIUM)
+                wallet_premium = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                price_cap   = round(cur_price * (1 + wallet_premium), 4)
                 limit_price = round(cur_price, 4)
 
                 logging.info(
