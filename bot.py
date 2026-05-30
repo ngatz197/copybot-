@@ -77,30 +77,32 @@ except ImportError:
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 WALLETS = {
-    # NEW-ONLY: only trades that appear after deployment are copied
+    "0xe8ca3f758c93f44f3ec210542ab78afb7c0bcccb": {
+        "name": "Kruto",
+        "risk_type": "price_based",
+        "copy_mode": "new_only",
+        "limit_buy_max_premium": 0.10,
+        "copy_sub_dollar": True,
+        "max_positions": 8,
+    },
     "0x0c0e270cf879583d6a0142fc817e05b768d0434e": {
         "name": "TheSpirit",
         "risk_type": "price_based",
-        "copy_mode": "new_only",   # skip anything open at deployment
+        "copy_mode": "new_only",
+        "max_positions": 5,
     },
-    "0xf903c4cd098184e67a06a04f9b8fdb36e7bbe028": {
-        "name": "Wallet903",
-        "risk_type": "price_based",
-        "copy_mode": "new_only",   # skip anything open at deployment
-    },
-    "0xe8ca3f758c93f44f3ec210542ab78afb7c0bcccb": {
-        "name": "WalletE8ca",
-        "risk_type": "price_based",
-        "copy_mode": "new_only",   # skip anything open at deployment
-        "limit_buy_max_premium": 0.10,  # 10% ask cap (overrides global)
-        "copy_sub_dollar": True,        # copy trades < $1, sized 1:1 with source
-    },
-    # COPY-ALL: existing positions at deployment are also copied
     "0xa1795199a227f8d68134f30bf26314a9918c9629": {
-        "name": "WalletA179",
+        "name": "Coniyr",
         "risk_type": "fixed",
         "fixed_risk": 0.025,
-        "copy_mode": "copy_all",   # copy positions open at deployment too
+        "copy_mode": "copy_all",
+        "max_positions": 4,
+    },
+    "0xf903c4cd098184e67a06a04f9b8fdb36e7bbe028": {
+        "name": "Viser",
+        "risk_type": "price_based",
+        "copy_mode": "new_only",
+        "max_positions": 3,
     },
 }
 
@@ -112,7 +114,7 @@ POLY_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 DATABASE_URL     = os.getenv("DATABASE_URL", "")
 
 INITIAL_BANKROLL      = 10.0
-MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "8"))
+MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "20"))
 POLL_INTERVAL         = int(os.getenv("POLL_SECONDS", "40"))
 COMPOUNDING_RATE      = float(os.getenv("COMPOUNDING_RATE", "0.70"))
 MAX_DRAWDOWN          = float(os.getenv("MAX_DRAWDOWN", "0.20"))
@@ -1191,8 +1193,26 @@ class CopyTrader:
                 if already_seen or in_positions or in_pending:
                     continue
 
+                # Global cap
                 if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
-                    logging.info("Max positions reached — skipping new entries")
+                    logging.info("Global max positions reached — skipping new entries")
+                    break
+                # Per-wallet cap
+                wallet_open = sum(
+                    1 for p in self.positions.values()
+                    if p.source_wallet == wallet_addr
+                )
+                wallet_pending = sum(
+                    1 for p in self.pending.values()
+                    if p.source_wallet == wallet_addr
+                )
+                wallet_max = config.get("max_positions", MAX_POSITIONS)
+                if wallet_open + wallet_pending >= wallet_max:
+                    logging.info(
+                        f"[{name}] wallet position cap reached "
+                        f"({wallet_open} open + {wallet_pending} pending "
+                        f">= {wallet_max}) — skipping"
+                    )
                     break
 
                 # Use curPrice from positions API
@@ -1303,10 +1323,18 @@ class CopyTrader:
             now = time.time()
             if now - last_heartbeat >= 300:
                 status = "PAUSED" if bot_paused_until and datetime.now() < bot_paused_until else "ACTIVE"
+                wallet_counts = {}
+                for p in self.positions.values():
+                    wallet_counts[p.source_name] = wallet_counts.get(p.source_name, 0) + 1
+                for p in self.pending.values():
+                    wallet_counts[p.source_name] = wallet_counts.get(p.source_name, 0) + 1
+                slot_summary = " | ".join(
+                    f"{n}={c}" for n, c in wallet_counts.items()
+                ) or "none"
                 logging.info(
                     f"Heartbeat | {status} | bankroll=${self.balance.cached_balance or 0:.2f} pUSD | "
                     f"compounding=${compounding_bankroll:.2f} | "
-                    f"open={len(self.positions)} | pending={len(self.pending)} | "
+                    f"slots=[{slot_summary}] total={len(self.positions)+len(self.pending)}/20 | "
                     f"seen={len(self.seen._seen)} | storage={self.seen.backend}"
                 )
                 last_heartbeat = now
