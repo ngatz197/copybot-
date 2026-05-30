@@ -93,6 +93,7 @@ WALLETS = {
         "risk_type": "price_based",
         "copy_mode": "new_only",   # skip anything open at deployment
         "limit_buy_max_premium": 0.10,  # 10% ask cap (overrides global)
+        "copy_sub_dollar": True,        # copy trades < $1, sized 1:1 with source
     },
     # COPY-ALL: existing positions at deployment are also copied
     "0xa1795199a227f8d68134f30bf26314a9918c9629": {
@@ -1119,12 +1120,15 @@ class CopyTrader:
                 logging.warning(f"Skipping {name} — could not fetch positions")
                 continue
 
-            # ---- Build source token set (value >= $1 filter) ----
+            # ---- Build source token set ----
+            # For EXIT detection: include any token the source still holds shares in,
+            # regardless of currentValue (avoids false exits when value dips below $1).
+            # The $1 filter is applied only in the BUY loop below.
             source_token_ids = set()
             for pos in raw:
-                tid      = pos.get("asset", "")
-                size_usd = float(pos.get("currentValue", 0))
-                if tid and size_usd >= 1.0:
+                tid    = pos.get("asset", "")
+                shares = float(pos.get("size", pos.get("shares", 0)))
+                if tid and shares > 0:
                     source_token_ids.add(tid)
 
             # ----------------------------------------------------------------
@@ -1168,7 +1172,9 @@ class CopyTrader:
                 outcome   = pos.get("outcome", "YES")
                 size_usd  = float(pos.get("currentValue", 0))
 
-                if not token_id or size_usd < 1.0:
+                # WalletE8ca copies sub-$1 trades too; all others require >= $1
+                min_value = 0.0 if config.get("copy_sub_dollar") else 1.0
+                if not token_id or size_usd < min_value or size_usd <= 0:
                     continue
 
                 pos_key      = f"{wallet_addr}_{token_id}"
@@ -1204,9 +1210,13 @@ class CopyTrader:
                     f"[{name}] curPrice={cur_price:.4f} cap={price_cap:.4f} | {question[:40]}"
                 )
 
-                risk_pct = self.get_risk_percent(limit_price, config)
-                # Use compounding_bankroll for position sizing
-                my_size  = round(compounding_bankroll * risk_pct, 2)
+                # Sizing: 1:1 mirror for sub-$1 trades on copy_sub_dollar wallets,
+                # otherwise use compounding_bankroll * risk_pct
+                if config.get("copy_sub_dollar") and size_usd < 1.0:
+                    my_size = round(size_usd, 2)
+                else:
+                    risk_pct = self.get_risk_percent(limit_price, config)
+                    my_size  = round(compounding_bankroll * risk_pct, 2)
 
                 ok, order_id, actual_price = self.executor.place_limit_buy(
                     token_id, my_size, limit_price
