@@ -24,6 +24,8 @@ MULTI-WALLET COPY TRADER - PRODUCTION READY (CLOB V2)
 PER-WALLET COPY RULES:
   TheSpirit  (0x0c0e...): only copy NEW trades appearing after deployment,
                           value >= $1, 20% ask cap.
+  Wallet903  (0xf903...): only copy NEW trades appearing after deployment,
+                          value >= $1, 20% ask cap.
   WalletA179 (0xa179...): copy existing positions at deployment too,
                           value >= $1, 20% ask cap.
 """
@@ -78,6 +80,11 @@ WALLETS = {
     # NEW-ONLY: only trades that appear after deployment are copied
     "0x0c0e270cf879583d6a0142fc817e05b768d0434e": {
         "name": "TheSpirit",
+        "risk_type": "price_based",
+        "copy_mode": "new_only",   # skip anything open at deployment
+    },
+    "0xf903c4cd098184e67a06a04f9b8fdb36e7bbe028": {
+        "name": "Wallet903",
         "risk_type": "price_based",
         "copy_mode": "new_only",   # skip anything open at deployment
     },
@@ -1119,7 +1126,7 @@ class CopyTrader:
                 self._first_scan_done.add(wallet_addr)
 
                 if copy_mode == "new_only":
-                    # TheSpirit: mark every current position as seen so we
+                    # new_only wallets: mark every current position as seen so we
                     # never copy anything that was already open at deployment.
                     # Then skip the buy loop for this scan — the next poll is
                     # the first one where new trades can be detected.
@@ -1180,7 +1187,7 @@ class CopyTrader:
                     logging.info(f"[{name}] SKIP no curPrice | {question[:40]}")
                     continue
 
-                # 20% ask cap (Option A) — applies to both wallets
+                # 20% ask cap (Option A) — applies to all wallets
                 price_cap   = round(cur_price * (1 + LIMIT_BUY_MAX_PREMIUM), 4)
                 limit_price = round(cur_price, 4)
 
