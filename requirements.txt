@@ -2,4 +2,5 @@ aiohttp
 python-dotenv
 requests
 py-clob-client-v2
-websocket-client
+websocket-client>=1.6.0
+psycopg2-binary
