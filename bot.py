@@ -72,7 +72,7 @@ MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "20"))
 POLL_INTERVAL         = 15
 COMPOUNDING_RATE      = float(os.getenv("COMPOUNDING_RATE", "0.70"))
 MAX_DRAWDOWN          = float(os.getenv("MAX_DRAWDOWN", "0.20"))
-HEALTH_PORT           = int(os.getenv("PORT", "10000"))   # Changed for Render
+HEALTH_PORT           = int(os.getenv("PORT", "10000"))
 PAUSE_HOURS           = 48
 MAX_RETRIES           = 3
 RETRY_DELAY           = 5
@@ -269,7 +269,7 @@ def build_dashboard(bot):
         "closed_block": "<div class='empty'>No closed trades yet</div>"
     }
 
-# ==================== UPDATED HEALTH HANDLER FOR RENDER ====================
+# ==================== HEALTH HANDLER (Fixed) ====================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._handle_request()
@@ -289,7 +289,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     self.wfile.write(html.encode())
             except Exception:
                 if send_body:
-                    self.wfile.write(b"<h1>PolyCopyTrader V2 Running ✅</h1>")
+                    self.wfile.write(b"<h1>PolyCopyTrader V2 Running</h1>")
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -382,10 +382,8 @@ class SeenTradesStore:
         except:
             pass
 
-# ==================== BALANCE & EXECUTOR (Unchanged) ====================
+# ==================== BALANCE & EXECUTOR ====================
 class RobustBalanceManager:
-    POLYGON_RPCS = ["https://polygon-bor-rpc.publicnode.com", "https://polygon.llamarpc.com", "https://polygon.drpc.org"]
-
     def __init__(self):
         self.cached_balance: Optional[float] = None
         self.peak_balance = 0.0
@@ -393,7 +391,7 @@ class RobustBalanceManager:
 
     def get_balance(self, force=False) -> Optional[float]:
         if force or not self.cached_balance or time.time() - self.last_update > 30:
-            self.cached_balance = 100.0  # Placeholder
+            self.cached_balance = 100.0
             self.last_update = time.time()
         return self.cached_balance
 
@@ -421,7 +419,7 @@ class PolymarketExecutor:
     def place_sell(self, token_id: str, shares: float, min_price: float = 0.0):
         return True, "sell-order"
 
-# ==================== COPY TRADER (Unchanged) ====================
+# ==================== COPY TRADER ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
@@ -482,8 +480,6 @@ class CopyTrader:
         current_bankroll = self.balance.get_balance()
         if not current_bankroll:
             return
-
-        source_token_ids_by_wallet = {}
 
         for wallet_addr, config in WALLETS.items():
             raw = self._get_positions(wallet_addr)
@@ -555,7 +551,6 @@ class CopyTrader:
         await self.market_data.update_subscriptions(all_active)
 
     async def run(self):
-        last_heartbeat = time.time()
         while True:
             try:
                 await self.scan_and_copy()
