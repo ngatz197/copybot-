@@ -2,3 +2,4 @@ aiohttp
 python-dotenv
 requests
 py-clob-client-v2
+websocket-client
