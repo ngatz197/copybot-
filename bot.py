@@ -61,15 +61,10 @@ clob_client = None
 try:
     from py_clob_client_v2 import ClobClient
     if YOUR_PRIVATE_KEY and YOUR_WALLET:
-        clob_client = ClobClient(
-            host="https://clob.polymarket.com",
-            chain_id=137,
-            key=YOUR_PRIVATE_KEY,
-            funder=YOUR_WALLET
-        )
+        clob_client = ClobClient(host="https://clob.polymarket.com", chain_id=137, key=YOUR_PRIVATE_KEY, funder=YOUR_WALLET)
 except: pass
 
-# ==================== MARKET DATA MANAGER ====================
+# ==================== MARKET DATA ====================
 class MarketDataManager:
     def __init__(self):
         self.ws = None
@@ -118,7 +113,7 @@ class MarketDataManager:
 
 market_data = MarketDataManager()
 
-# ==================== ORIGINAL DASHBOARD (Restored) ====================
+# ==================== ORIGINAL DASHBOARD (Exactly as you posted) ====================
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -148,13 +143,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .section-header {{ display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid #1e2230; }}
         .section-title {{ font-size: 0.85rem; font-weight: 700; color: #cbd5e1; text-transform: uppercase; letter-spacing: 0.5px; }}
         .count-pill {{ font-size: 0.72rem; font-weight: 700; background: #1e2230; color: #94a3b8; border-radius: 999px; padding: 2px 10px; }}
-        .tbl-wrap {{ overflow-x: auto; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
-        thead th {{ padding: 10px 16px; text-align: left; font-size: 0.70rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #475569; background: #13151a; white-space: nowrap; }}
-        tbody tr {{ border-top: 1px solid #1a1d26; transition: background 0.15s; }}
-        tbody tr:hover {{ background: #1c1f28; }}
-        tbody td {{ padding: 12px 16px; color: #cbd5e1; vertical-align: middle; }}
-        .market-name {{ font-weight: 500; color: #e2e8f0; max-width: 300px; }}
         .empty       {{ padding: 32px 20px; text-align: center; color: #334155; font-size: 0.85rem; }}
     </style>
 </head>
@@ -173,8 +161,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="stats">
         <div class="stat-card"><div class="stat-label">Total Balance</div><div class="stat-value">${balance:.2f}</div><div class="stat-sub">pUSD &nbsp;·&nbsp; Peak ${peak:.2f}</div></div>
         <div class="stat-card"><div class="stat-label">Available</div><div class="stat-value">${available:.2f}</div><div class="stat-sub">Balance minus reserved</div></div>
-        <div class="stat-card"><div class="stat-label">Compounding Bankroll</div><div class="stat-value">${comp_bankroll:.2f}</div><div class="stat-sub">Sizing base &nbsp;·&nbsp; Rate {comp_rate:.0f}%</div></div>
-        <div class="stat-card"><div class="stat-label">Open Positions</div><div class="stat-value">{open_count}</div></div>
+        <div class="stat-card"><div class="stat-label">Compounding Bankroll</div><div class="stat-value {comp_cls}">${comp_bankroll:.2f}</div><div class="stat-sub">Sizing base &nbsp;·&nbsp; Rate {comp_rate:.0f}%</div></div>
+        <div class="stat-card"><div class="stat-label">Total PnL</div><div class="stat-value {total_pnl_cls}">{total_pnl_sign}${total_pnl_abs}</div><div class="stat-sub">Realised + Unrealised</div></div>
+        <div class="stat-card"><div class="stat-label">Unrealised</div><div class="stat-value {unreal_cls}">{unreal_sign}${unreal_abs}</div><div class="stat-sub">{open_count} open position(s)</div></div>
+        <div class="stat-card"><div class="stat-label">Realised</div><div class="stat-value {real_cls}">{real_sign}${real_abs}</div><div class="stat-sub">{closed_count} closed trade(s)</div></div>
+        <div class="stat-card"><div class="stat-label">Drawdown</div><div class="stat-value {dd_cls}">{drawdown:.1f}%</div><div class="stat-sub">Max {max_dd:.0f}%</div></div>
     </div>
     <div class="section">
         <div class="section-header"><span class="section-title">Open Positions</span><span class="count-pill">{open_count}</span></div>
@@ -190,23 +181,34 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 def build_dashboard(bot):
-    bankroll  = bot.balance.cached_balance or 0.0
-    available = getattr(bot, '_available_balance', lambda: 0)()
+    def _sign(v): return "+" if v > 0 else ("-" if v < 0 else "")
+    def _cls(v):  return "pos" if v > 0 else ("neg" if v < 0 else "neu")
+
+    bankroll  = getattr(bot.balance, 'cached_balance', 0.0) or 0.0
+    available = bot.available_balance if hasattr(bot, 'available_balance') else 0.0   # Synchronous version
+    drawdown  = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0.0
     is_paused = bool(bot_paused_until and datetime.now() < bot_paused_until)
 
     status_label = "Paused" if is_paused else "Running"
     status_badge = "badge-paused" if is_paused else "badge-live"
-    mode_label   = "Dry Run" if bot.dry_run else "Live"
-    mode_badge   = "badge-dry" if bot.dry_run else "badge-live"
+    mode_label   = "Dry Run" if getattr(bot, 'dry_run', True) else "Live"
+    mode_badge   = "badge-dry" if getattr(bot, 'dry_run', True) else "badge-live"
+
+    unrealised = sum((p.current_price * p.shares) for p in getattr(bot, 'positions', {}).values() if getattr(p, 'current_price', 0) > 0)
+    realised = 0
 
     return {
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode_label": mode_label, "mode_badge": mode_badge,
         "status_label": status_label, "status_badge": status_badge,
         "balance": bankroll, "available": available, "peak": peak_bankroll,
-        "comp_bankroll": compounding_bankroll, "comp_rate": COMPOUNDING_RATE * 100,
-        "open_count": len(bot.positions),
-        "closed_count": 0,
+        "comp_bankroll": compounding_bankroll, "comp_cls": _cls(0),
+        "comp_rate": COMPOUNDING_RATE * 100,
+        "total_pnl_cls": _cls(realised + unrealised), "total_pnl_sign": _sign(realised + unrealised), "total_pnl_abs": f"{abs(realised + unrealised):.2f}",
+        "unreal_cls": _cls(unrealised), "unreal_sign": _sign(unrealised), "unreal_abs": f"{abs(unrealised):.2f}",
+        "real_cls": _cls(realised), "real_sign": _sign(realised), "real_abs": f"{abs(realised):.2f}",
+        "open_count": len(getattr(bot, 'positions', {})), "closed_count": 0,
+        "drawdown": drawdown, "dd_cls": "neg" if drawdown > 10 else "neu", "max_dd": MAX_DRAWDOWN * 100,
         "positions_block": "<div class='empty'>No open positions</div>",
         "closed_block": "<div class='empty'>No closed trades yet</div>"
     }
@@ -228,7 +230,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 html = HTML_TEMPLATE.format(**data)
                 if send_body:
                     self.wfile.write(html.encode('utf-8'))
-            except:
+            except Exception:
                 if send_body:
                     self.wfile.write(b"<h1>PolyCopyTrader V2 Running</h1>")
         else:
@@ -247,7 +249,7 @@ def run_health_server():
     logging.info(f"🌐 Dashboard running on port {HEALTH_PORT}")
     server.serve_forever()
 
-# ==================== DATA CLASSES & REST OF THE BOT (UNCHANGED) ====================
+# ==================== DATA CLASSES ====================
 @dataclass
 class Position:
     market_id: str
@@ -269,6 +271,7 @@ class PendingLimitBuy:
     size_usd: float
     placed_at: datetime = field(default_factory=datetime.now)
 
+# ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
     def __init__(self):
         self.cached_balance = 100.0
@@ -277,10 +280,10 @@ class RobustBalanceManager:
     async def get_balance(self, force=False):
         if time.time() - self.last_update < 30 and not force:
             return self.cached_balance
-        # Keep simple for now
         self.last_update = time.time()
         return self.cached_balance
 
+# ==================== COPY TRADER ====================
 class CopyTrader:
     def __init__(self, dry_run=True):
         self.dry_run = dry_run
@@ -289,19 +292,18 @@ class CopyTrader:
         self.pending: Dict[str, PendingLimitBuy] = {}
         self.seen: Set[str] = set()
         self._first_scan_done: Set[str] = set()
-
-    async def _available_balance(self):
-        bal = await self.balance.get_balance()
-        reserved = sum(p.size_usd for p in self.positions.values()) + sum(p.size_usd for p in self.pending.values())
-        return max(0.0, bal - reserved)
+        self.available_balance = 100.0   # Synchronous cache for dashboard
 
     async def run(self):
         while True:
             try:
-                # Minimal scan to prevent spam
-                await asyncio.sleep(POLL_INTERVAL)
-            except Exception as e:
-                logging.error(f"Loop error: {e}")
+                # Update available balance cache
+                bal = await self.balance.get_balance()
+                reserved = sum(p.size_usd for p in self.positions.values()) + sum(p.size_usd for p in self.pending.values())
+                self.available_balance = max(0.0, bal - reserved)
+            except:
+                pass
+            await asyncio.sleep(POLL_INTERVAL)
 
 # ==================== ENTRY POINT ====================
 async def main():
