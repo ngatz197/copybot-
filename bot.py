@@ -718,7 +718,11 @@ class WebSocketManager:
                     )
                     self.market_ws = ws
                     self._market_ws_ref = ws
-                    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+                    ws.run_forever(
+                        sslopt={"cert_reqs": ssl.CERT_NONE},
+                        ping_interval=30,  # library sends protocol PING every 30 s
+                        ping_timeout=10,   # close + reconnect if no PONG in 10 s
+                    )
                 except Exception as e:
                     logger.error(f"Market WebSocket error: {e}")
                 if not self.stop_flag:
@@ -739,6 +743,7 @@ class WebSocketManager:
     def _on_market_open(self, ws):
         logger.info("✅ Market WebSocket connected")
         self.bot.ws_market_connected = True
+        # ping_interval in run_forever handles keepalive; manual thread is belt-and-suspenders
         self._start_heartbeat(ws, "market")
         token_ids = self._get_tracked_token_ids()
         if token_ids:
@@ -829,7 +834,11 @@ class WebSocketManager:
                         on_close=self._on_user_close,
                     )
                     self.user_ws = ws
-                    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+                    ws.run_forever(
+                        sslopt={"cert_reqs": ssl.CERT_NONE},
+                        ping_interval=30,
+                        ping_timeout=10,
+                    )
                 except Exception as e:
                     logger.error(f"User WebSocket error: {e}")
                 if not self.stop_flag:
@@ -916,17 +925,24 @@ class WebSocketManager:
     # ---------- helpers ----------
 
     def _start_heartbeat(self, ws, channel="market"):
-        """Send PING every 10 s as required by Polymarket docs."""
+        """
+        Send a WebSocket protocol-level PING control frame every 30 s.
+        ws.send("PING") sends a *text* frame which Polymarket's server does
+        not recognise and responds to by closing the connection ~10 s later.
+        ws.sock.ping() sends a proper RFC-6455 control frame instead.
+        Note: run_forever(ping_interval=30) also handles this automatically;
+        this manual thread is a belt-and-suspenders fallback.
+        """
         def heartbeat():
             self._heartbeat_running = True
             while self._heartbeat_running and not self.stop_flag:
-                time.sleep(10)
+                time.sleep(30)
                 if ws and ws.sock and ws.sock.connected:
                     try:
-                        ws.send("PING")
-                        logger.debug(f"Heartbeat sent to {channel} channel")
-                    except:
-                        pass
+                        ws.sock.ping()
+                        logger.debug(f"Protocol PING sent to {channel} channel")
+                    except Exception as e:
+                        logger.debug(f"Heartbeat ping failed ({channel}): {e}")
         threading.Thread(target=heartbeat, daemon=True).start()
 
     def _get_tracked_token_ids(self) -> List[str]:
