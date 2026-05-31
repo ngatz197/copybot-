@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 MULTI-WALLET COPY TRADER - PRODUCTION READY (CLOB V2)
-
-Original fixes (v1):
+Fixes applied:
   1. is_order_filled: distinguishes API errors (returns None) from confirmed
      unfilled (returns False); pending orders with repeated errors are not
      silently dropped — they stay pending and an error counter triggers
@@ -19,31 +18,6 @@ Original fixes (v1):
   4. Max slippage 20% (sell side only): market sells use a CLOB IOC with a
      min_price floor at best_bid * 0.80; buy prices are governed solely by
      the per-wallet limit_buy_max_premium cap.
-
-Additional fixes (v2):
-  5. Race condition in _execute_sell: pending_costs_before snapshot is now
-     taken inside _trade_lock so concurrent threads cannot mutate self.pending
-     between snapshot and balance read.
-  6. compounding_bankroll reconciliation: after every sell (win or loss) and
-     on every heartbeat, compounding_bankroll is clamped to the real balance
-     so it can never drift above actual capital. On losses the bankroll is
-     reduced proportionally.
-  7. seen.mark_seen called only after pending entry is confirmed inserted,
-     preventing silent trade loss on crash between mark and dict write.
-  8. Partial fill handling: is_order_filled returns the filled size (0–shares)
-     so partially-filled GTC orders update size_usd correctly rather than
-     treating them as fully open or fully filled.
-  9. Python 3.9-compatible type hints throughout (Optional[X] instead of X|Y).
-
-WebSocket (v3):
-  - Polymarket CLOB WebSocket feed subscribed per token when a pending/open
-    position is established. Receives real-time price ticks and order fill
-    events, updating position.current_price and resolving pending fills without
-    waiting for the REST poll cycle.
-  - REST poll at POLL_INTERVAL (default 15 s) is retained as the authoritative
-    fallback for wallet scanning (new positions), price updates for tokens not
-    yet in the WS subscription, and recovery when the WS connection drops.
-  - WS reconnects automatically with exponential back-off (cap 60 s).
 """
 
 import os
@@ -54,7 +28,7 @@ import logging
 import time
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, Set, Tuple, Optional
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -63,18 +37,16 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ── optional heavy deps ──────────────────────────────────────────────────────
+# ==================== CLOB V2 CLIENT ====================
 try:
-    import websockets                          # type: ignore
-    WS_AVAILABLE = True
-except ImportError:
-    WS_AVAILABLE = False
-    logging.warning("websockets not installed — WebSocket feed disabled; pip install websockets")
-
-try:
-    from py_clob_client_v2 import (            # type: ignore
-        ClobClient, OrderArgs, MarketOrderArgs,
-        OrderType, Side, ApiCreds, PartialCreateOrderOptions,
+    from py_clob_client_v2 import (
+        ClobClient,
+        OrderArgs,
+        MarketOrderArgs,
+        OrderType,
+        Side,
+        ApiCreds,
+        PartialCreateOrderOptions,
     )
     CLOB_AVAILABLE = True
     logging.info("✅ py_clob_client_v2 loaded successfully")
@@ -83,8 +55,8 @@ except ImportError:
     logging.warning("py_clob_client_v2 not installed — running in simulation mode.")
 
 try:
-    import psycopg2                            # type: ignore
-    import psycopg2.extras                     # type: ignore
+    import psycopg2
+    import psycopg2.extras
     PSYCOPG2_AVAILABLE = True
 except ImportError:
     PSYCOPG2_AVAILABLE = False
@@ -93,7 +65,7 @@ except ImportError:
 # ==================== CONFIG ====================
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
-WALLETS: Dict[str, dict] = {
+WALLETS = {
     "0xe8ca3f758c93f44f3ec210542ab78afb7c0bcccb": {
         "name": "Kruto",
         "risk_type": "price_based",
@@ -132,7 +104,7 @@ DATABASE_URL     = os.getenv("DATABASE_URL", "")
 
 INITIAL_BANKROLL      = 10.0
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "20"))
-POLL_INTERVAL         = int(os.getenv("POLL_SECONDS", "15"))    # REST fallback cadence
+POLL_INTERVAL         = int(os.getenv("POLL_SECONDS", "25"))
 COMPOUNDING_RATE      = float(os.getenv("COMPOUNDING_RATE", "0.70"))
 MAX_DRAWDOWN          = float(os.getenv("MAX_DRAWDOWN", "0.20"))
 HEALTH_PORT           = int(os.getenv("PORT", "8080"))
@@ -140,31 +112,28 @@ PAUSE_HOURS           = 48
 MAX_RETRIES           = 3
 RETRY_DELAY           = 5
 
-MAX_SLIPPAGE          = float(os.getenv("MAX_SLIPPAGE", "0.20"))
+# Fix 4: max slippage applied to sells only
+MAX_SLIPPAGE          = float(os.getenv("MAX_SLIPPAGE", "0.20"))   # 20 %
+
 LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
 LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
+
+# Fix 1: how many consecutive API errors on is_order_filled before we cancel
 MAX_FILL_CHECK_ERRORS = int(os.getenv("MAX_FILL_CHECK_ERRORS", "5"))
 
-PUSD_CONTRACT_ADDRESS = os.getenv(
-    "PUSD_CONTRACT_ADDRESS",
-    "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",   # USDC.e on Polygon (Polymarket collateral)
-)
+PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
+# Fix 3: balance settle wait after a market sell (seconds)
 SELL_SETTLE_WAIT      = int(os.getenv("SELL_SETTLE_WAIT", "8"))
-
-# WebSocket
-CLOB_WS_URL           = os.getenv("CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
-WS_RECONNECT_DELAY    = 2    # initial back-off seconds
-WS_RECONNECT_MAX      = 60   # cap
 
 current_bankroll      = INITIAL_BANKROLL
 peak_bankroll         = INITIAL_BANKROLL
 compounding_bankroll  = INITIAL_BANKROLL
 bot_paused_until: Optional[datetime] = None
 
-# Fix 5: asyncio lock (replaces threading.Lock — everything runs in one event loop)
-_trade_lock = asyncio.Lock()
+# Fix 3: lock so that sell+balance-read and new buy placement don't overlap
+_trade_lock = threading.Lock()
 
 
 # ==================== DASHBOARD ====================
@@ -290,10 +259,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
-
-def build_dashboard(bot: "CopyTrader") -> dict:
-    def _sign(v: float) -> str: return "+" if v > 0 else ("-" if v < 0 else "")
-    def _cls(v: float)  -> str: return "pos" if v > 0 else ("neg" if v < 0 else "neu")
+def build_dashboard(bot) -> dict:
+    def _sign(v): return "+" if v > 0 else ("-" if v < 0 else "")
+    def _cls(v):  return "pos" if v > 0 else ("neg" if v < 0 else "neu")
 
     bankroll  = bot.balance.cached_balance or 0.0
     available = bot._available_balance()
@@ -371,7 +339,7 @@ def build_dashboard(bot: "CopyTrader") -> dict:
     total_pnl  = realised + unrealised
     comp_delta = compounding_bankroll - (bot.balance.peak_balance or INITIAL_BANKROLL)
 
-    def _fmt(v: float) -> str:
+    def _fmt(v):
         return f"{abs(v):.4f}" if abs(v) < 0.005 else f"{abs(v):.2f}"
 
     return {
@@ -423,12 +391,11 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"OK - CopyTrader V2 running")
 
-    def log_message(self, format, *args):  # type: ignore[override]
+    def log_message(self, format, *args):
         pass
 
 
-_bot_ref: Optional["CopyTrader"] = None
-
+_bot_ref = None
 
 def run_health_server():
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
@@ -470,9 +437,10 @@ class PendingLimitBuy:
     limit_price:   float
     size_usd:      float
     order_id:      str
-    source_shares: float   = 0.0
-    fill_check_errors: int = 0
-    placed_at: datetime    = field(default_factory=datetime.now)
+    source_shares: float    = 0.0
+    # Fix 1: track consecutive API errors when checking fill status
+    fill_check_errors: int  = 0
+    placed_at:     datetime = field(default_factory=datetime.now)
 
 
 # ==================== SEEN TRADES STORE ====================
@@ -481,8 +449,7 @@ class SeenTradesStore:
         self.filepath = filepath
         self.db_url   = db_url
         self._seen: Set[str] = set()
-        self._conn    = None
-        self.backend  = "local-file"
+        self._conn   = None
 
         if db_url and PSYCOPG2_AVAILABLE:
             self._init_postgres()
@@ -556,7 +523,7 @@ class SeenTradesStore:
     def _load_file(self):
         try:
             with open(self.filepath, "r") as f:
-                data      = json.load(f)
+                data = json.load(f)
                 self._seen = set(data) if isinstance(data, list) else set()
         except FileNotFoundError:
             self._seen = set()
@@ -625,7 +592,7 @@ class RobustBalanceManager:
             "method":  "eth_call",
             "params":  [
                 {"to": PUSD_CONTRACT_ADDRESS, "data": "0x70a08231" + padded},
-                "latest",
+                "latest"
             ],
             "id": 1,
         }
@@ -649,7 +616,7 @@ class RobustBalanceManager:
         logging.error(f"All RPC attempts failed for {YOUR_WALLET[:10] if YOUR_WALLET else 'NOT SET'}…")
         return 0.0
 
-    def get_balance(self, force: bool = False) -> Optional[float]:
+    def get_balance(self, force=False) -> Optional[float]:
         if force or self.cached_balance is None or (time.time() - self.last_update > 30):
             real = self._fetch_balance()
             if real > 0:
@@ -675,11 +642,11 @@ class RobustBalanceManager:
                 self.last_update    = time.time()
                 logging.info(f"Real pUSD balance confirmed: ${val:.2f}")
                 return val
-            logging.warning(
-                f"Balance fetch attempt {attempt}/{retries} returned 0 — retrying in {delay}s"
-            )
+            logging.warning(f"Balance fetch attempt {attempt}/{retries} returned 0 — retrying in {delay}s")
             time.sleep(delay)
-        raise RuntimeError(f"Could not fetch real pUSD balance after {retries} attempts.")
+        raise RuntimeError(
+            f"Could not fetch real pUSD balance after {retries} attempts."
+        )
 
     def check_drawdown(self) -> Tuple[bool, float]:
         current = self.get_balance()
@@ -716,6 +683,10 @@ class PolymarketExecutor:
     def place_limit_buy(
         self, token_id: str, amount_usd: float, limit_price: float
     ) -> Tuple[bool, str, float]:
+        """
+        Buy price is governed by the per-wallet limit_buy_max_premium cap set
+        by the caller. MAX_SLIPPAGE applies to sells only.
+        """
         shares = round(amount_usd / limit_price, 4)
 
         if self.dry_run or self.client is None:
@@ -757,43 +728,32 @@ class PolymarketExecutor:
             logging.warning(f"Cancel failed for {order_id}: {e}")
             return False
 
-    def is_order_filled(self, order_id: str) -> Optional[float]:
+    def is_order_filled(self, order_id: str) -> Optional[bool]:
         """
-        Fix 1 + Fix 8 (partial fill):
-          Returns the filled share count (>0) if matched/filled,
-          0.0 if confirmed open/unfilled,
-          None if API error (caller must NOT treat as unfilled).
-
-        Partial fills: if the order is still open but some shares have matched,
-        returns the partial matched size so the caller can adjust size_usd.
+        Fix 1: returns True (filled), False (confirmed open/unfilled), or
+        None (API error — caller must NOT treat this as unfilled).
         """
         if self.dry_run or self.client is None:
-            # In dry run, treat as immediately fully filled; size unknown so
-            # return a sentinel that the caller interprets as "full".
-            return -1.0   # sentinel: full fill
-
+            return True
         try:
             order  = self.client.get_order(order_id)
             status = order.get("status", "").lower()
-            size_matched = float(order.get("size_matched", order.get("matched", 0)) or 0)
-
             if status in ("matched", "filled"):
-                return size_matched if size_matched > 0 else -1.0   # -1 → full fill
-
-            # Partial fill: some shares traded but order still open
-            if size_matched > 0:
-                return size_matched
-
-            # Confirmed unfilled
-            return 0.0
+                return True
+            # Any explicit non-filled status is a confirmed unfilled
+            return False
         except Exception as e:
             logging.warning(f"Fill-check API error for {order_id}: {e} — treating as unknown")
-            return None   # Fix 1: NOT 0.0
+            return None   # <-- Fix 1: NOT False
 
     def place_sell(
         self, token_id: str, shares: float, min_price: float = 0.0
     ) -> Tuple[bool, str]:
-        """Fix 4: IOC with min_price floor at best_bid * (1 - MAX_SLIPPAGE)."""
+        """
+        Fix 4 (sell side): pass a min_price floor so the IOC won't fill below
+        best_bid * (1 - MAX_SLIPPAGE). If the book has moved too far the order
+        simply won't fill and the position stays open for retry.
+        """
         if self.dry_run or self.client is None:
             logging.info(
                 f"[DRY RUN] MARKET SELL {shares:.4f} shares "
@@ -803,27 +763,28 @@ class PolymarketExecutor:
 
         for attempt in range(MAX_RETRIES):
             try:
-                sell_args = MarketOrderArgs(
-                    token_id  = token_id,
-                    amount    = shares,
-                    side      = Side.SELL,
+                kwargs = dict(
+                    order_args = MarketOrderArgs(
+                        token_id = token_id,
+                        amount   = shares,
+                        side     = Side.SELL,
+                    ),
+                    options    = PartialCreateOrderOptions(tick_size="0.01"),
+                    order_type = OrderType.IOC,
                 )
+                # Inject min_price if the SDK supports it; swallow gracefully if not
                 if min_price > 0:
                     try:
-                        sell_args = MarketOrderArgs(
+                        kwargs["order_args"] = MarketOrderArgs(
                             token_id  = token_id,
                             amount    = shares,
                             side      = Side.SELL,
                             min_price = round(min_price, 4),
                         )
                     except TypeError:
-                        pass   # SDK version doesn't support min_price
+                        pass   # SDK version doesn't support min_price — skip silently
 
-                result   = self.client.create_and_post_market_order(
-                    order_args = sell_args,
-                    options    = PartialCreateOrderOptions(tick_size="0.01"),
-                    order_type = OrderType.IOC,
-                )
+                result   = self.client.create_and_post_market_order(**kwargs)
                 order_id = result.get("orderID", result.get("id", "unknown"))
                 logging.info(f"MARKET SELL placed (V2 IOC): {order_id} min_price={min_price:.4f}")
                 return True, order_id
@@ -831,150 +792,6 @@ class PolymarketExecutor:
                 logging.warning(f"SELL attempt {attempt+1} failed: {e}")
                 time.sleep(RETRY_DELAY)
         return False, ""
-
-
-# ==================== WEBSOCKET FEED ====================
-class MarketWebSocketFeed:
-    """
-    Subscribes to the Polymarket CLOB WebSocket for real-time price ticks
-    and order-matched events.
-
-    Primary use:
-      - Update position.current_price without waiting for REST poll.
-      - Detect order fills in real-time and push them to _ws_fill_queue so
-        the main loop can promote pending → position immediately.
-
-    The feed is best-effort: if it drops, the REST poll at POLL_INTERVAL
-    continues as the authoritative fallback. The feed reconnects automatically
-    with exponential back-off.
-    """
-
-    def __init__(self, bot: "CopyTrader"):
-        self.bot              = bot
-        self._subscribed: Set[str] = set()
-        self._task: Optional[asyncio.Task] = None   # type: ignore[type-arg]
-        self._running         = False
-        self._ws_fill_queue: asyncio.Queue = asyncio.Queue()   # type: ignore[type-arg]
-        self._reconnect_delay = WS_RECONNECT_DELAY
-
-    # ── public interface ─────────────────────────────────────────────────────
-
-    def start(self):
-        if not WS_AVAILABLE:
-            logging.warning("WebSocket feed disabled (websockets package not installed)")
-            return
-        self._running = True
-        self._task    = asyncio.create_task(self._run_forever())
-        logging.info("WebSocket feed task started")
-
-    def stop(self):
-        self._running = False
-        if self._task:
-            self._task.cancel()
-
-    def subscribe(self, token_ids: Set[str]):
-        """Called when new tokens need to be added to the subscription."""
-        new = token_ids - self._subscribed
-        if new:
-            self._subscribed.update(new)
-            # Reconnect to pick up new subscriptions
-            if self._task and not self._task.done():
-                self._task.cancel()
-                if self._running:
-                    self._task = asyncio.create_task(self._run_forever())
-
-    def unsubscribe(self, token_ids: Set[str]):
-        self._subscribed -= token_ids
-
-    async def drain_fill_queue(self):
-        """
-        Yield (order_id, filled_size) tuples from the WS fill queue.
-        Non-blocking — returns immediately when queue is empty.
-        """
-        while not self._ws_fill_queue.empty():
-            try:
-                yield await asyncio.wait_for(self._ws_fill_queue.get(), timeout=0.01)
-            except asyncio.TimeoutError:
-                break
-
-    # ── internals ────────────────────────────────────────────────────────────
-
-    async def _run_forever(self):
-        while self._running:
-            if not self._subscribed:
-                await asyncio.sleep(2)
-                continue
-            try:
-                await self._connect_and_listen()
-                self._reconnect_delay = WS_RECONNECT_DELAY   # reset on clean exit
-            except asyncio.CancelledError:
-                logging.info("WebSocket task cancelled — stopping")
-                return
-            except Exception as e:
-                logging.warning(
-                    f"WebSocket disconnected: {e} — reconnecting in {self._reconnect_delay}s"
-                )
-            await asyncio.sleep(self._reconnect_delay)
-            self._reconnect_delay = min(self._reconnect_delay * 2, WS_RECONNECT_MAX)
-
-    async def _connect_and_listen(self):
-        import websockets as ws_lib   # local import so module-level guard still works
-
-        subscribe_msg = json.dumps({
-            "type":    "subscribe",
-            "markets": list(self._subscribed),
-        })
-
-        async with ws_lib.connect(
-            CLOB_WS_URL,
-            ping_interval    = 20,
-            ping_timeout     = 10,
-            close_timeout    = 5,
-        ) as ws:
-            await ws.send(subscribe_msg)
-            logging.info(
-                f"WebSocket connected | subscribed to {len(self._subscribed)} token(s)"
-            )
-            self._reconnect_delay = WS_RECONNECT_DELAY
-
-            async for raw in ws:
-                if not self._running:
-                    break
-                try:
-                    self._handle_message(raw)
-                except Exception as e:
-                    logging.debug(f"WS message handling error: {e}")
-
-    def _handle_message(self, raw: str):
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            return
-
-        event_type = msg.get("type") or msg.get("event_type", "")
-
-        # ── price tick ──────────────────────────────────────────────────────
-        if event_type in ("price_change", "tick", "book"):
-            token_id = msg.get("asset_id") or msg.get("market") or msg.get("token_id", "")
-            mid      = float(msg.get("mid_price") or msg.get("price") or 0)
-            if token_id and mid > 0:
-                # Update open positions
-                for pos in self.bot.positions.values():
-                    if pos.token_id == token_id:
-                        pos.current_price = mid
-                # Update pending order current_price reference (for logging only)
-                for pnd in self.bot.pending.values():
-                    if pnd.token_id == token_id:
-                        pass   # pending doesn't carry current_price; no action needed
-
-        # ── order matched / filled ───────────────────────────────────────────
-        elif event_type in ("order_matched", "order_filled", "match"):
-            order_id     = msg.get("order_id") or msg.get("id", "")
-            size_matched = float(msg.get("size_matched") or msg.get("size") or 0)
-            if order_id:
-                # Put on queue; main loop drains and promotes pending → position
-                self._ws_fill_queue.put_nowait((order_id, size_matched))
-                logging.debug(f"WS fill event: order {order_id} size {size_matched}")
 
 
 # ==================== COPY TRADER ====================
@@ -986,10 +803,9 @@ class CopyTrader:
         self.pending:   Dict[str, PendingLimitBuy] = {}
         self.executor   = PolymarketExecutor(dry_run)
         self.seen       = SeenTradesStore(SEEN_TRADES_FILE, DATABASE_URL)
-        self.ws_feed    = MarketWebSocketFeed(self)
 
-        self._first_scan_done: Set[str]   = set()
-        self.closed_positions: list       = []
+        self._first_scan_done: Set[str] = set()
+        self.closed_positions: list     = []
 
         logging.info(f"Multi-Wallet CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
         logging.info(
@@ -1001,52 +817,24 @@ class CopyTrader:
         for addr, cfg in WALLETS.items():
             logging.info(f"  {cfg['name']} ({addr[:10]}…) copy_mode={cfg['copy_mode']}")
 
-    # ── Fix 6: compounding_bankroll reconciliation ────────────────────────────
-    def _reconcile_compounding_bankroll(self, pnl: float = 0.0):
-        """
-        Called after every sell.
-        - On profit: compound COMPOUNDING_RATE fraction into bankroll.
-        - On loss:   reduce bankroll by the absolute loss.
-        - Always clamp bankroll to real balance so it can never exceed capital.
-        """
-        global compounding_bankroll
-        real_balance = self.balance.cached_balance or 0.0
-
-        if pnl > 0:
-            compounding_bankroll += pnl * COMPOUNDING_RATE
-            logging.info(
-                f"Compounding profit: +${pnl * COMPOUNDING_RATE:.4f} → "
-                f"bankroll=${compounding_bankroll:.2f}"
-            )
-        elif pnl < 0:
-            compounding_bankroll += pnl   # pnl is negative, so this subtracts
-            logging.info(
-                f"Compounding loss: ${pnl:.4f} → bankroll=${compounding_bankroll:.2f}"
-            )
-
-        # Hard clamp: bankroll must never exceed real balance
-        if compounding_bankroll > real_balance and real_balance > 0:
-            logging.info(
-                f"Clamping compounding_bankroll ${compounding_bankroll:.2f} → ${real_balance:.2f}"
-            )
-            compounding_bankroll = real_balance
-
-        # Floor at a small positive value to avoid sizing going to zero
-        compounding_bankroll = max(compounding_bankroll, 0.01)
-
-    # ── capital reservation helpers ──────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Fix 2: capital reservation helpers
+    # ------------------------------------------------------------------
     def _reserved_capital(self) -> float:
+        """Sum of all capital committed to open positions and pending buys."""
         in_positions = sum(p.size_usd for p in self.positions.values())
         in_pending   = sum(p.size_usd for p in self.pending.values())
         return in_positions + in_pending
 
     def _available_balance(self) -> float:
+        """Real balance minus capital already reserved."""
         bal = self.balance.cached_balance or 0.0
         return max(0.0, bal - self._reserved_capital())
 
     def _can_afford(self, amount_usd: float) -> bool:
+        """True if available balance covers the trade with a small safety margin."""
         available = self._available_balance()
-        can       = available >= amount_usd * 1.02
+        can       = available >= amount_usd * 1.02   # 2 % buffer for fees/rounding
         if not can:
             logging.warning(
                 f"Affordability check failed: need ${amount_usd:.2f} but "
@@ -1055,7 +843,8 @@ class CopyTrader:
             )
         return can
 
-    # ── orderbook helpers ─────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+
     def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
         for attempt in range(MAX_RETRIES):
             try:
@@ -1104,8 +893,6 @@ class CopyTrader:
     def check_drawdown(self) -> bool:
         global peak_bankroll, bot_paused_until
         current = self.balance.get_balance()
-        if current is None:
-            return False
         if current > peak_bankroll:
             peak_bankroll = current
         dd = (peak_bankroll - current) / peak_bankroll if peak_bankroll > 0 else 0
@@ -1118,7 +905,7 @@ class CopyTrader:
             return True
         return False
 
-    def _get_positions(self, wallet_addr: str) -> Optional[list]:
+    def _get_positions(self, wallet_addr: str) -> list | None:
         for attempt in range(MAX_RETRIES):
             try:
                 resp = requests.get(
@@ -1137,61 +924,23 @@ class CopyTrader:
                 time.sleep(RETRY_DELAY)
         return None
 
-    # ── WS fill promotion (real-time path) ───────────────────────────────────
-    async def _promote_ws_fills(self):
-        """
-        Drain the WS fill queue and promote pending → position for any
-        order_id that matches a pending buy.
-        """
-        async for order_id, ws_size_matched in self.ws_feed.drain_fill_queue():
-            for pos_key, pending in list(self.pending.items()):
-                if pending.order_id != order_id:
-                    continue
-                # Treat ws_size_matched == 0 as full fill (some WS events omit size)
-                shares = (
-                    ws_size_matched if ws_size_matched > 0
-                    else pending.size_usd / pending.limit_price
-                )
-                actual_usd = shares * pending.limit_price
-                self.positions[pos_key] = Position(
-                    market_id             = pending.market_id,
-                    question              = pending.question,
-                    outcome               = pending.outcome,
-                    token_id              = pending.token_id,
-                    entry_price           = pending.limit_price,
-                    size_usd              = actual_usd,
-                    shares                = shares,
-                    source_wallet         = pending.source_wallet,
-                    source_name           = pending.source_name,
-                    order_id              = pending.order_id,
-                    source_shares         = pending.source_shares,
-                    shares_at_open        = shares,
-                    source_shares_at_open = pending.source_shares,
-                )
-                del self.pending[pos_key]
-                logging.info(
-                    f"WS FILL → position open | {pending.question[:40]} "
-                    f"@ {pending.limit_price:.4f} shares={shares:.4f}"
-                )
-                break   # matched, move to next queue item
-
-    # ── pending order management (REST fallback) ─────────────────────────────
-    def _process_pending_orders(self, source_token_ids_by_wallet: Dict[str, Set[str]]):
+    # ---- PENDING LIMIT ORDER MANAGEMENT ----
+    def _process_pending_orders(self, source_token_ids_by_wallet: Dict[str, set]):
         for pos_key, pending in list(self.pending.items()):
             wallet_tokens = source_token_ids_by_wallet.get(pending.source_wallet, set())
 
-            # Source exited before our order filled
+            # Source exited before our order filled — cancel immediately
             if pending.token_id not in wallet_tokens:
                 logging.info(f"Source exited before fill — cancelling {pending.question[:40]}")
                 self.executor.cancel_order(pending.order_id)
                 del self.pending[pos_key]
                 continue
 
-            # Fix 1 + Fix 8: is_order_filled returns float|None
-            filled_size = self.executor.is_order_filled(pending.order_id)
+            # Fix 1: is_order_filled returns True / False / None
+            filled = self.executor.is_order_filled(pending.order_id)
 
-            if filled_size is None:
-                # API error — do NOT drop; increment error counter
+            if filled is None:
+                # API error — increment error counter, do NOT drop the order
                 pending.fill_check_errors += 1
                 logging.warning(
                     f"Fill check error #{pending.fill_check_errors} for "
@@ -1200,44 +949,22 @@ class CopyTrader:
                 if pending.fill_check_errors >= MAX_FILL_CHECK_ERRORS:
                     logging.error(
                         f"Max fill check errors reached for {pending.question[:40]} — "
-                        f"cancelling to be safe"
+                        f"cancelling to be safe (will not retry)"
                     )
                     self.executor.cancel_order(pending.order_id)
                     del self.pending[pos_key]
-                continue
+                continue  # leave pending, check again next poll
 
-            # Fix 8: partial fill — order still open but some shares matched
-            if 0 < filled_size and filled_size != -1.0:
-                # Update size_usd to reflect only unmatched portion
-                matched_usd       = filled_size * pending.limit_price
-                pending.size_usd  = max(0.0, pending.size_usd - matched_usd)
-                logging.info(
-                    f"Partial fill: {filled_size:.4f} shares matched for "
-                    f"{pending.question[:40]} — remaining usd=${pending.size_usd:.4f}"
-                )
-                pending.fill_check_errors = 0
-                # Don't promote to full position yet; wait for full fill or expiry
-                self._check_pending_expiry(pos_key, pending, wallet_tokens)
-                continue
-
-            # Full fill: filled_size == -1 (sentinel) or filled_size equals expected shares
-            if filled_size == -1.0 or (
-                pending.limit_price > 0
-                and filled_size >= (pending.size_usd / pending.limit_price) * 0.99
-            ):
-                pending.fill_check_errors = 0
-                shares     = (
-                    filled_size if filled_size > 0
-                    else (pending.size_usd / pending.limit_price if pending.limit_price > 0 else 0)
-                )
-                actual_usd = shares * pending.limit_price
+            if filled:
+                pending.fill_check_errors = 0   # reset on success
+                shares = pending.size_usd / pending.limit_price if pending.limit_price > 0 else 0
                 self.positions[pos_key] = Position(
                     market_id             = pending.market_id,
                     question              = pending.question,
                     outcome               = pending.outcome,
                     token_id              = pending.token_id,
                     entry_price           = pending.limit_price,
-                    size_usd              = actual_usd,
+                    size_usd              = pending.size_usd,
                     shares                = shares,
                     source_wallet         = pending.source_wallet,
                     source_name           = pending.source_name,
@@ -1248,72 +975,60 @@ class CopyTrader:
                 )
                 del self.pending[pos_key]
                 logging.info(
-                    f"LIMIT BUY FILLED (REST) → position open | {pending.question[:40]} "
-                    f"@ {pending.limit_price:.4f} | shares={shares:.4f}"
+                    f"LIMIT BUY FILLED → position open | {pending.question[:40]} "
+                    f"@ {pending.limit_price:.4f} | src_shares={pending.source_shares:.4f}"
                 )
                 continue
 
-            # Confirmed unfilled (filled_size == 0.0) — check expiry
-            self._check_pending_expiry(pos_key, pending, wallet_tokens)
+            # Confirmed unfilled — check expiry
+            age = (datetime.now() - pending.placed_at).total_seconds()
+            if age >= LIMIT_EXPIRY_SECONDS:
+                logging.info(f"Order expired ({age:.0f}s) — cancelling and retrying {pending.question[:40]}")
+                self.executor.cancel_order(pending.order_id)
+                del self.pending[pos_key]
 
-    def _check_pending_expiry(
-        self,
-        pos_key:       str,
-        pending:       PendingLimitBuy,
-        wallet_tokens: Set[str],
-    ):
-        age = (datetime.now() - pending.placed_at).total_seconds()
-        if age < LIMIT_EXPIRY_SECONDS:
-            return
+                mid_price, best_ask = self.get_orderbook_prices(pending.token_id)
+                if best_ask <= 0 and mid_price <= 0:
+                    logging.info(f"No orderbook on retry — skipping {pending.question[:40]}")
+                    continue
 
-        logging.info(f"Order expired ({age:.0f}s) — cancelling and retrying {pending.question[:40]}")
-        self.executor.cancel_order(pending.order_id)
-        del self.pending[pos_key]
+                current_ask    = best_ask if best_ask > 0 else mid_price
+                _cfg           = WALLETS.get(pending.source_wallet, {})
+                wallet_premium = _cfg.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                # Fix 4: hard slippage cap on retry too
+                price_cap   = round(current_ask * (1 + wallet_premium), 4)
+                limit_price = round(min(current_ask, price_cap), 4)
 
-        mid_price, best_ask = self.get_orderbook_prices(pending.token_id)
-        if best_ask <= 0 and mid_price <= 0:
-            logging.info(f"No orderbook on retry — skipping {pending.question[:40]}")
-            return
+                # Fix 2: affordability check on retry
+                if not self._can_afford(pending.size_usd):
+                    logging.warning(
+                        f"Cannot afford retry for {pending.question[:40]} "
+                        f"(${pending.size_usd:.2f}) — skipping"
+                    )
+                    continue
 
-        current_ask    = best_ask if best_ask > 0 else mid_price
-        _cfg           = WALLETS.get(pending.source_wallet, {})
-        wallet_premium = _cfg.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-        price_cap      = round(current_ask * (1 + wallet_premium), 4)
-        limit_price    = round(min(current_ask, price_cap), 4)
+                ok, order_id, filled_price = self.executor.place_limit_buy(
+                    pending.token_id, pending.size_usd, limit_price
+                )
+                if ok:
+                    self.pending[pos_key] = PendingLimitBuy(
+                        pos_key       = pos_key,
+                        token_id      = pending.token_id,
+                        market_id     = pending.market_id,
+                        question      = pending.question,
+                        outcome       = pending.outcome,
+                        source_wallet = pending.source_wallet,
+                        source_name   = pending.source_name,
+                        limit_price   = filled_price,
+                        size_usd      = pending.size_usd,
+                        order_id      = order_id,
+                        source_shares = pending.source_shares,
+                    )
+                    logging.info(
+                        f"LIMIT BUY RETRIED | {pending.question[:40]} "
+                        f"@ {filled_price:.4f} (ask={current_ask:.4f})"
+                    )
 
-        if not self._can_afford(pending.size_usd):
-            logging.warning(
-                f"Cannot afford retry for {pending.question[:40]} "
-                f"(${pending.size_usd:.2f}) — skipping"
-            )
-            return
-
-        ok, order_id, actual_price = self.executor.place_limit_buy(
-            pending.token_id, pending.size_usd, limit_price
-        )
-        if ok:
-            # Fix 7: insert pending dict entry BEFORE marking seen
-            # (mark_seen was already called on the original placement, so no re-mark needed)
-            self.pending[pos_key] = PendingLimitBuy(
-                pos_key       = pos_key,
-                token_id      = pending.token_id,
-                market_id     = pending.market_id,
-                question      = pending.question,
-                outcome       = pending.outcome,
-                source_wallet = pending.source_wallet,
-                source_name   = pending.source_name,
-                limit_price   = actual_price,
-                size_usd      = pending.size_usd,
-                order_id      = order_id,
-                source_shares = pending.source_shares,
-            )
-            self.ws_feed.subscribe({pending.token_id})
-            logging.info(
-                f"LIMIT BUY RETRIED | {pending.question[:40]} "
-                f"@ {actual_price:.4f} (ask={current_ask:.4f})"
-            )
-
-    # ── main scan loop ────────────────────────────────────────────────────────
     async def scan_and_copy(self):
         global current_bankroll, compounding_bankroll, bot_paused_until
 
@@ -1330,9 +1045,6 @@ class CopyTrader:
             logging.error("Real pUSD balance unavailable — skipping scan cycle")
             return
 
-        # Fix 6: reconcile on every scan (clamp only, no pnl arg)
-        self._reconcile_compounding_bankroll(pnl=0.0)
-
         logging.info(
             f"Scanning | balance=${current_bankroll:.2f} | "
             f"available=${self._available_balance():.2f} | "
@@ -1341,10 +1053,7 @@ class CopyTrader:
             f"seen={len(self.seen._seen)}"
         )
 
-        # Drain real-time WS fills first (before REST processing)
-        await self._promote_ws_fills()
-
-        source_token_ids_by_wallet: Dict[str, Set[str]] = {}
+        source_token_ids_by_wallet: Dict[str, set] = {}
 
         for wallet_addr, config in WALLETS.items():
             copy_mode = config.get("copy_mode", "new_only")
@@ -1355,8 +1064,8 @@ class CopyTrader:
                 logging.warning(f"Skipping {name} — could not fetch positions")
                 continue
 
-            source_token_ids: Set[str]             = set()
-            source_shares_map: Dict[str, float]    = {}
+            source_token_ids:  set             = set()
+            source_shares_map: Dict[str, float] = {}
             for pos in raw:
                 tid    = pos.get("asset", "")
                 shares = float(pos.get("size", pos.get("shares", 0)))
@@ -1423,21 +1132,25 @@ class CopyTrader:
                     continue
 
                 wallet_premium = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-                price_cap      = round(cur_price * (1 + wallet_premium), 4)
-                limit_price    = round(cur_price, 4)
+                # Buy price capped by per-wallet premium only; MAX_SLIPPAGE is sell-side only
+                price_cap   = round(cur_price * (1 + wallet_premium), 4)
+                limit_price = round(cur_price, 4)
 
                 if config.get("copy_sub_dollar") and size_usd < 1.0:
                     my_size = round(size_usd, 2)
                 else:
                     risk_pct = self.get_risk_percent(limit_price, config)
-                    my_size  = round(
+                    # Fix 2: size against compounding_bankroll but cap at available balance
+                    my_size = round(
                         min(compounding_bankroll * risk_pct, self._available_balance() * 0.95),
                         2,
                     )
 
+                # Fix 2: hard affordability gate before placing the order
                 if my_size <= 0 or not self._can_afford(my_size):
                     logging.warning(
-                        f"[{name}] Skipping {question[:40]} — cannot afford ${my_size:.2f}"
+                        f"[{name}] Skipping {question[:40]} — "
+                        f"cannot afford ${my_size:.2f}"
                     )
                     continue
 
@@ -1445,12 +1158,7 @@ class CopyTrader:
                     token_id, my_size, limit_price
                 )
                 if ok:
-                    # Fix 7: insert into self.pending FIRST, then mark seen.
-                    # If the process dies between these two lines the worst case
-                    # is a duplicate buy attempt on next restart, which is safe
-                    # because the order is already live on the exchange.
-                    # The alternative (mark_seen first) risks silently losing the
-                    # trade if the process dies before pending is written.
+                    self.seen.mark_seen(pos_key)
                     self.pending[pos_key] = PendingLimitBuy(
                         pos_key       = pos_key,
                         token_id      = token_id,
@@ -1464,8 +1172,6 @@ class CopyTrader:
                         order_id      = order_id,
                         source_shares = source_shares_at_copy,
                     )
-                    self.seen.mark_seen(pos_key)   # Fix 7: AFTER pending is registered
-                    self.ws_feed.subscribe({token_id})   # subscribe to WS for real-time fills
                     logging.info(
                         f"[{name}] LIMIT BUY PLACED | {question[:40]} | "
                         f"${my_size:.2f} @ {actual_price:.4f} "
@@ -1476,7 +1182,7 @@ class CopyTrader:
 
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
 
-            # Update current prices from REST for open positions from this wallet
+            # Update current prices for open positions from this wallet
             cur_price_map = {
                 pos.get("asset", ""): float(pos.get("curPrice", 0))
                 for pos in raw
@@ -1489,9 +1195,9 @@ class CopyTrader:
                 if _cp > 0:
                     _pos.current_price = _cp
 
-            # ================================================================
+            # ============================================================
             # SELL LOGIC
-            # ================================================================
+            # ============================================================
             for pos_key, position in list(self.positions.items()):
                 if position.source_wallet != wallet_addr:
                     continue
@@ -1517,9 +1223,7 @@ class CopyTrader:
                         f"[{name}] Source FULL EXIT — selling {position.shares:.4f} shares | "
                         f"{position.question[:40]}"
                     )
-                    await self._execute_sell(
-                        position, pos_key, position.shares, name, full_exit=True
-                    )
+                    self._execute_sell(position, pos_key, position.shares, name, full_exit=True)
 
                 # ── CASE 2: Partial exit ──
                 elif (
@@ -1539,22 +1243,24 @@ class CopyTrader:
                         f"selling {our_shares_to_sell:.4f} of {position.shares:.4f} | "
                         f"{position.question[:40]}"
                     )
-                    await self._execute_sell(
+                    self._execute_sell(
                         position, pos_key, our_shares_to_sell, name,
                         full_exit=False, current_source_shares=current_source_shares,
                     )
 
         self._process_pending_orders(source_token_ids_by_wallet)
 
-    # ── sell execution ────────────────────────────────────────────────────────
-    async def _execute_sell(
+    # ------------------------------------------------------------------
+    # Fix 3: isolated sell execution with contamination correction
+    # ------------------------------------------------------------------
+    def _execute_sell(
         self,
-        position:              Position,
-        pos_key:               str,
-        shares_to_sell:        float,
-        name:                  str,
-        full_exit:             bool,
-        current_source_shares: float = 0.0,
+        position:               "Position",
+        pos_key:                str,
+        shares_to_sell:         float,
+        name:                   str,
+        full_exit:              bool,
+        current_source_shares:  float = 0.0,
     ):
         global compounding_bankroll
 
@@ -1562,37 +1268,42 @@ class CopyTrader:
             exit_price = position.current_price if position.current_price > 0 else position.entry_price
             pnl        = (exit_price - position.entry_price) * shares_to_sell
             ok         = True
-            order_id   = "dry-run-sell"   # noqa: F841
+            order_id   = "dry-run-sell"
         else:
+            # Fix 4: compute min acceptable sell price
             best_bid  = self._get_best_bid(position.token_id)
             min_price = round(best_bid * (1 - MAX_SLIPPAGE), 4) if best_bid > 0 else 0.0
 
-            # Fix 5: snapshot pending costs INSIDE the lock so no concurrent
-            # thread can mutate self.pending between snapshot and balance read.
-            async with _trade_lock:
-                pending_costs_before: Dict[str, float] = {
-                    pk: p.size_usd for pk, p in self.pending.items()
-                }
+            # Fix 3: snapshot buys that are in-flight so we can correct the diff
+            # Record which pending orders are NOT yet filled right now
+            pending_costs_before: Dict[str, float] = {
+                pk: p.size_usd for pk, p in self.pending.items()
+            }
+
+            # Serialise: grab lock so concurrent buy fills don't contaminate our snapshot
+            with _trade_lock:
                 balance_before = self.balance.get_balance(force=True) or 0.0
-                ok, order_id   = self.executor.place_sell(   # noqa: F841
+                ok, order_id   = self.executor.place_sell(
                     position.token_id, shares_to_sell, min_price=min_price
                 )
                 if ok:
-                    await asyncio.sleep(SELL_SETTLE_WAIT)
+                    time.sleep(SELL_SETTLE_WAIT)
                     balance_after = self.balance.get_balance(force=True) or 0.0
 
             if ok:
-                # Fix 3: correct for concurrent buy fills during the settle window
+                # Fix 3: identify any pending buys that filled during our settle window
+                # and add their cost back so the diff reflects sell proceeds only
                 contamination = 0.0
                 for pk, cost in pending_costs_before.items():
-                    if pk in self.positions:
+                    if pk in self.positions:   # it transitioned pending → open = filled
                         contamination += cost
                         logging.info(
                             f"PnL contamination correction: +${cost:.4f} "
-                            f"(buy filled during settle for {pk[:30]})"
+                            f"(buy filled during settle window for {pk[:30]})"
                         )
+
                 raw_diff   = balance_after - balance_before
-                pnl        = raw_diff + contamination
+                pnl        = raw_diff + contamination   # add back cost of concurrent buys
                 exit_price = best_bid if best_bid > 0 else position.current_price
             else:
                 pnl        = 0.0
@@ -1609,64 +1320,56 @@ class CopyTrader:
             position.status     = "closed"
             position.exit_price = exit_price
             position.pnl        = pnl
-            # Fix 6: reconcile bankroll (handles both profit and loss)
-            self._reconcile_compounding_bankroll(pnl=pnl)
+            if pnl > 0:
+                compounding_bankroll += pnl * COMPOUNDING_RATE
+                logging.info(
+                    f"Compounding profit: +${pnl * COMPOUNDING_RATE:.4f} → "
+                    f"compounding_bankroll=${compounding_bankroll:.2f}"
+                )
             logging.info(
                 f"[{name}] FULL SELL ({'DRY RUN' if self.dry_run else 'LIVE'}) | "
                 f"{position.question[:40]} | exit={exit_price:.4f} pnl=${pnl:.4f}"
             )
-            self.ws_feed.unsubscribe({position.token_id})
             self.closed_positions.append(position)
             del self.positions[pos_key]
         else:
             position.shares   -= shares_to_sell
             position.size_usd  = position.shares * position.entry_price
             position.source_shares = current_source_shares
-            # Fix 6: reconcile bankroll on partial sell too
-            self._reconcile_compounding_bankroll(pnl=pnl)
+            if pnl > 0:
+                compounding_bankroll += pnl * COMPOUNDING_RATE
+                logging.info(
+                    f"Compounding profit (partial): +${pnl * COMPOUNDING_RATE:.4f} → "
+                    f"compounding_bankroll=${compounding_bankroll:.2f}"
+                )
             logging.info(
                 f"[{name}] PARTIAL SELL ({'DRY RUN' if self.dry_run else 'LIVE'}) | "
                 f"{position.question[:40]} | sold={shares_to_sell:.4f} "
                 f"pnl=${pnl:.4f} remaining={position.shares:.4f}"
             )
 
-    # ── main run loop ─────────────────────────────────────────────────────────
     async def run(self):
-        logging.info("Bot loop started (CLOB V2 + WebSocket)")
-        self.ws_feed.start()
-
-        # Subscribe WS for any tokens already in positions/pending (restart recovery)
-        existing_tokens = (
-            {p.token_id for p in self.positions.values()} |
-            {p.token_id for p in self.pending.values()}
-        )
-        if existing_tokens:
-            self.ws_feed.subscribe(existing_tokens)
-
+        logging.info("Bot loop started (CLOB V2)")
         last_heartbeat = time.time()
-
         while True:
             try:
                 await self.scan_and_copy()
             except Exception as e:
-                logging.error(f"Main loop error: {e}", exc_info=True)
+                logging.error(f"Main loop error: {e}")
 
             now = time.time()
             if now - last_heartbeat >= 300:
-                status       = "PAUSED" if bot_paused_until and datetime.now() < bot_paused_until else "ACTIVE"
+                status = "PAUSED" if bot_paused_until and datetime.now() < bot_paused_until else "ACTIVE"
                 wallet_counts: Dict[str, int] = {}
                 for p in self.positions.values():
                     wallet_counts[p.source_name] = wallet_counts.get(p.source_name, 0) + 1
                 for p in self.pending.values():
                     wallet_counts[p.source_name] = wallet_counts.get(p.source_name, 0) + 1
                 slot_summary = " | ".join(f"{n}={c}" for n, c in wallet_counts.items()) or "none"
-                # Fix 6: periodic clamp (no pnl event, just sync)
-                self._reconcile_compounding_bankroll(pnl=0.0)
                 logging.info(
                     f"Heartbeat | {status} | balance=${self.balance.cached_balance or 0:.2f} | "
                     f"available=${self._available_balance():.2f} | "
                     f"compounding=${compounding_bankroll:.2f} | "
-                    f"ws_subscribed={len(self.ws_feed._subscribed)} | "
                     f"slots=[{slot_summary}] total={len(self.positions)+len(self.pending)}/{MAX_POSITIONS} | "
                     f"seen={len(self.seen._seen)} | storage={self.seen.backend}"
                 )
@@ -1686,10 +1389,10 @@ async def main():
     _bot_ref = bot
 
     try:
-        starting_balance         = bot.balance.fetch_with_retry(retries=5, delay=10)
+        starting_balance     = bot.balance.fetch_with_retry(retries=5, delay=10)
         bot.balance.peak_balance = starting_balance
-        peak_bankroll            = starting_balance
-        compounding_bankroll     = starting_balance
+        peak_bankroll        = starting_balance
+        compounding_bankroll = starting_balance
         logging.info(f"Compounding bankroll seeded at ${compounding_bankroll:.2f}")
     except RuntimeError as e:
         logging.error(f"Startup balance fetch failed: {e} — running in degraded mode")
