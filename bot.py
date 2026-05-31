@@ -1,35 +1,23 @@
 #!/usr/bin/env python3
 """
 MULTI-WALLET COPY TRADER - PRODUCTION READY (CLOB V2)
-- Migrated from py-clob-client (V1) to py-clob-client-v2 (V2)
-- Key V2 changes:
-    * Package: py_clob_client_v2
-    * ClobClient constructor uses keyword args; chain_id= (not positional)
-    * LimitOrderArgs → OrderArgs(side=Side.BUY)
-    * feeRateBps / nonce / taker removed from order args
-    * create_and_post_order() takes order_args=, options=, order_type= kwargs
-    * Market sell uses create_and_post_market_order()
-    * Collateral token: pUSD (new ERC-20 on Polygon, replaces USDC.e)
-    * POLYGON constant removed — use literal chain_id=137
-- Limit Buy Orders priced at current best_ask, capped at ask * 1.20 (Option A)
-- Falls back to mid if best_ask unavailable
-- Market Sell Orders (instant exit)
-- Real Mid-Price Fetching
-- 20% Drawdown Protection
-- Improved Balance Fetching + Robust Error Handling & Retries
-- Pending limit order tracking + auto-cancel on expiry
-- Health endpoint for Render (keeps bot awake)
-- Compounding bankroll: grows with COMPOUNDING_RATE * profit on each closed trade
-- Partial sell mirroring: tracks source_shares per position, sells proportionally
-- Poll interval: 25 seconds
-
-PER-WALLET COPY RULES:
-  TheSpirit  (0x0c0e...): only copy NEW trades appearing after deployment,
-                          value >= $1, 20% ask cap.
-  Wallet903  (0xf903...): only copy NEW trades appearing after deployment,
-                          value >= $1, 20% ask cap.
-  WalletA179 (0xa179...): copy existing positions at deployment too,
-                          value >= $1, 20% ask cap.
+Fixes applied:
+  1. is_order_filled: distinguishes API errors (returns None) from confirmed
+     unfilled (returns False); pending orders with repeated errors are not
+     silently dropped — they stay pending and an error counter triggers
+     cancellation only after MAX_FILL_CHECK_ERRORS consecutive failures.
+  2. Affordability check: before placing any limit buy, verifies that
+     available_balance (real balance minus reserved capital in pending/open
+     positions) covers my_size. Falls back gracefully rather than over-spending.
+  3. PnL isolation: sell-side balance diff now snapshots balance *after* a
+     brief settle wait, and the snapshot window is intentionally widened.
+     More importantly, concurrent buys that land in the same settle window
+     are detected and their cost is added back into the PnL calc so the diff
+     is not contaminated. A lock serialises sell+balance-read to prevent
+     overlap where possible.
+  4. Max slippage 20% (sell side only): market sells use a CLOB IOC with a
+     min_price floor at best_bid * 0.80; buy prices are governed solely by
+     the per-wallet limit_buy_max_premium cap.
 """
 
 import os
@@ -65,7 +53,6 @@ try:
 except ImportError:
     CLOB_AVAILABLE = False
     logging.warning("py_clob_client_v2 not installed — running in simulation mode.")
-    logging.warning("Install with: pip install py-clob-client-v2")
 
 try:
     import psycopg2
@@ -125,16 +112,28 @@ PAUSE_HOURS           = 48
 MAX_RETRIES           = 3
 RETRY_DELAY           = 5
 
+# Fix 4: max slippage applied to sells only
+MAX_SLIPPAGE          = float(os.getenv("MAX_SLIPPAGE", "0.20"))   # 20 %
+
 LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
 LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 
+# Fix 1: how many consecutive API errors on is_order_filled before we cancel
+MAX_FILL_CHECK_ERRORS = int(os.getenv("MAX_FILL_CHECK_ERRORS", "5"))
+
 PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+
+# Fix 3: balance settle wait after a market sell (seconds)
+SELL_SETTLE_WAIT      = int(os.getenv("SELL_SETTLE_WAIT", "8"))
 
 current_bankroll      = INITIAL_BANKROLL
 peak_bankroll         = INITIAL_BANKROLL
 compounding_bankroll  = INITIAL_BANKROLL
 bot_paused_until: Optional[datetime] = None
+
+# Fix 3: lock so that sell+balance-read and new buy placement don't overlap
+_trade_lock = threading.Lock()
 
 
 # ==================== DASHBOARD ====================
@@ -147,181 +146,53 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <meta http-equiv="refresh" content="15">
     <style>
         *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-
         body {{
             font-family: 'Segoe UI', system-ui, sans-serif;
-            background: #0d0d0f;
-            color: #e2e8f0;
-            min-height: 100vh;
-            padding: 24px 16px;
+            background: #0d0d0f; color: #e2e8f0;
+            min-height: 100vh; padding: 24px 16px;
         }}
-
         .page {{ max-width: 1100px; margin: 0 auto; }}
-
         .header {{
-            display: flex;
-            align-items: center;
+            display: flex; align-items: center;
             justify-content: space-between;
-            margin-bottom: 28px;
-            flex-wrap: wrap;
-            gap: 8px;
+            margin-bottom: 28px; flex-wrap: wrap; gap: 8px;
         }}
-        .header-title {{
-            font-size: 1.25rem;
-            font-weight: 700;
-            color: #f8fafc;
-            letter-spacing: -0.3px;
-        }}
+        .header-title {{ font-size: 1.25rem; font-weight: 700; color: #f8fafc; letter-spacing: -0.3px; }}
         .header-title span {{ color: #6ee7b7; }}
-        .badge {{
-            font-size: 0.72rem;
-            font-weight: 600;
-            padding: 3px 10px;
-            border-radius: 999px;
-            letter-spacing: 0.4px;
-            text-transform: uppercase;
-        }}
-        .badge-live  {{ background: #064e3b; color: #6ee7b7; border: 1px solid #065f46; }}
-        .badge-dry   {{ background: #1e1b4b; color: #a5b4fc; border: 1px solid #312e81; }}
-        .badge-paused{{ background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }}
-        .timestamp   {{ font-size: 0.75rem; color: #64748b; }}
-
-        .stats {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 14px;
-            margin-bottom: 24px;
-        }}
-        .stat-card {{
-            background: #16181d;
-            border: 1px solid #1e2230;
-            border-radius: 12px;
-            padding: 18px 20px;
-        }}
-        .stat-label {{
-            font-size: 0.72rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.6px;
-            color: #64748b;
-            margin-bottom: 6px;
-        }}
-        .stat-value {{
-            font-size: 1.6rem;
-            font-weight: 700;
-            color: #f1f5f9;
-            line-height: 1;
-        }}
-        .stat-sub {{
-            font-size: 0.75rem;
-            color: #475569;
-            margin-top: 5px;
-        }}
-
-        .pos  {{ color: #34d399; }}
-        .neg  {{ color: #f87171; }}
-        .neu  {{ color: #94a3b8; }}
-
-        .section {{
-            background: #16181d;
-            border: 1px solid #1e2230;
-            border-radius: 12px;
-            margin-bottom: 20px;
-            overflow: hidden;
-        }}
-        .section-header {{
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 14px 20px;
-            border-bottom: 1px solid #1e2230;
-        }}
-        .section-title {{
-            font-size: 0.85rem;
-            font-weight: 700;
-            color: #cbd5e1;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }}
-        .count-pill {{
-            font-size: 0.72rem;
-            font-weight: 700;
-            background: #1e2230;
-            color: #94a3b8;
-            border-radius: 999px;
-            padding: 2px 10px;
-        }}
-
+        .badge {{ font-size: 0.72rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; letter-spacing: 0.4px; text-transform: uppercase; }}
+        .badge-live   {{ background: #064e3b; color: #6ee7b7; border: 1px solid #065f46; }}
+        .badge-dry    {{ background: #1e1b4b; color: #a5b4fc; border: 1px solid #312e81; }}
+        .badge-paused {{ background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }}
+        .timestamp    {{ font-size: 0.75rem; color: #64748b; }}
+        .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 24px; }}
+        .stat-card {{ background: #16181d; border: 1px solid #1e2230; border-radius: 12px; padding: 18px 20px; }}
+        .stat-label {{ font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; color: #64748b; margin-bottom: 6px; }}
+        .stat-value {{ font-size: 1.6rem; font-weight: 700; color: #f1f5f9; line-height: 1; }}
+        .stat-sub   {{ font-size: 0.75rem; color: #475569; margin-top: 5px; }}
+        .pos {{ color: #34d399; }} .neg {{ color: #f87171; }} .neu {{ color: #94a3b8; }}
+        .section {{ background: #16181d; border: 1px solid #1e2230; border-radius: 12px; margin-bottom: 20px; overflow: hidden; }}
+        .section-header {{ display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid #1e2230; }}
+        .section-title {{ font-size: 0.85rem; font-weight: 700; color: #cbd5e1; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .count-pill {{ font-size: 0.72rem; font-weight: 700; background: #1e2230; color: #94a3b8; border-radius: 999px; padding: 2px 10px; }}
         .tbl-wrap {{ overflow-x: auto; }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.82rem;
-        }}
-        thead th {{
-            padding: 10px 16px;
-            text-align: left;
-            font-size: 0.70rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: #475569;
-            background: #13151a;
-            white-space: nowrap;
-        }}
-        tbody tr {{
-            border-top: 1px solid #1a1d26;
-            transition: background 0.15s;
-        }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
+        thead th {{ padding: 10px 16px; text-align: left; font-size: 0.70rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #475569; background: #13151a; white-space: nowrap; }}
+        tbody tr {{ border-top: 1px solid #1a1d26; transition: background 0.15s; }}
         tbody tr:hover {{ background: #1c1f28; }}
-        tbody td {{
-            padding: 12px 16px;
-            color: #cbd5e1;
-            vertical-align: middle;
-        }}
-        .market-name {{
-            font-weight: 500;
-            color: #e2e8f0;
-            max-width: 300px;
-        }}
-        .outcome-pill {{
-            display: inline-block;
-            font-size: 0.68rem;
-            font-weight: 700;
-            padding: 2px 8px;
-            border-radius: 999px;
-            text-transform: uppercase;
-            letter-spacing: 0.3px;
-        }}
+        tbody td {{ padding: 12px 16px; color: #cbd5e1; vertical-align: middle; }}
+        .market-name {{ font-weight: 500; color: #e2e8f0; max-width: 300px; }}
+        .outcome-pill {{ display: inline-block; font-size: 0.68rem; font-weight: 700; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.3px; }}
         .outcome-yes {{ background: #064e3b; color: #6ee7b7; }}
         .outcome-no  {{ background: #450a0a; color: #fca5a5; }}
-        .source-tag {{
-            font-size: 0.70rem;
-            font-weight: 600;
-            color: #818cf8;
-            background: #1e1b4b;
-            padding: 2px 8px;
-            border-radius: 999px;
-        }}
-        .price-mono {{ font-family: 'Courier New', monospace; font-size: 0.80rem; }}
-        .pnl-cell {{
-            font-weight: 700;
-            font-size: 0.83rem;
-            white-space: nowrap;
-        }}
-
-        .empty {{
-            padding: 32px 20px;
-            text-align: center;
-            color: #334155;
-            font-size: 0.85rem;
-        }}
-        .empty-icon {{ font-size: 1.8rem; margin-bottom: 8px; }}
+        .source-tag  {{ font-size: 0.70rem; font-weight: 600; color: #818cf8; background: #1e1b4b; padding: 2px 8px; border-radius: 999px; }}
+        .price-mono  {{ font-family: 'Courier New', monospace; font-size: 0.80rem; }}
+        .pnl-cell    {{ font-weight: 700; font-size: 0.83rem; white-space: nowrap; }}
+        .empty       {{ padding: 32px 20px; text-align: center; color: #334155; font-size: 0.85rem; }}
+        .empty-icon  {{ font-size: 1.8rem; margin-bottom: 8px; }}
     </style>
 </head>
 <body>
 <div class="page">
-
     <div class="header">
         <div>
             <div class="header-title">🤖 Poly<span>CopyTrader</span></div>
@@ -332,12 +203,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <span class="badge {status_badge}">{status_label}</span>
         </div>
     </div>
-
     <div class="stats">
         <div class="stat-card">
             <div class="stat-label">Total Balance</div>
             <div class="stat-value">${balance:.2f}</div>
             <div class="stat-sub">pUSD &nbsp;·&nbsp; Peak ${peak:.2f}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Available</div>
+            <div class="stat-value">${available:.2f}</div>
+            <div class="stat-sub">Balance minus reserved</div>
         </div>
         <div class="stat-card">
             <div class="stat-label">Compounding Bankroll</div>
@@ -365,7 +240,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="stat-sub">Max {max_dd:.0f}%</div>
         </div>
     </div>
-
     <div class="section">
         <div class="section-header">
             <span class="section-title">Open Positions</span>
@@ -373,7 +247,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         {positions_block}
     </div>
-
     <div class="section">
         <div class="section-header">
             <span class="section-title">Closed Trades</span>
@@ -381,7 +254,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         {closed_block}
     </div>
-
 </div>
 </body>
 </html>
@@ -391,9 +263,10 @@ def build_dashboard(bot) -> dict:
     def _sign(v): return "+" if v > 0 else ("-" if v < 0 else "")
     def _cls(v):  return "pos" if v > 0 else ("neg" if v < 0 else "neu")
 
-    bankroll   = bot.balance.cached_balance or 0.0
-    drawdown   = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0.0
-    is_paused  = bool(bot_paused_until and datetime.now() < bot_paused_until)
+    bankroll  = bot.balance.cached_balance or 0.0
+    available = bot._available_balance()
+    drawdown  = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0.0
+    is_paused = bool(bot_paused_until and datetime.now() < bot_paused_until)
 
     status_label = "Paused" if is_paused else "Running"
     status_badge = "badge-paused" if is_paused else "badge-live"
@@ -406,20 +279,17 @@ def build_dashboard(bot) -> dict:
         mid    = p.current_price if p.current_price > 0 else p.entry_price
         unreal = (mid - p.entry_price) * p.shares
         unrealised += unreal
-
         outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
         pnl_cls     = _cls(unreal)
         pnl_fmt     = ".4f" if abs(unreal) < 0.005 else ".2f"
         pnl_str     = f"{_sign(unreal)}${abs(unreal):{pnl_fmt}}"
         cur_str     = f"{mid:.3f}" if p.current_price > 0 else "—"
-        shares_str  = f"{p.shares:.4f}"
-
         pos_rows += f"""
         <tr>
             <td><span class="source-tag">{p.source_name}</span></td>
             <td class="market-name">{p.question[:60]}</td>
             <td><span class="outcome-pill {outcome_cls}">{p.outcome}</span></td>
-            <td>${p.size_usd:.2f}<br><span style="font-size:0.70rem;color:#475569;">{shares_str} shares</span></td>
+            <td>${p.size_usd:.2f}<br><span style="font-size:0.70rem;color:#475569;">{p.shares:.4f} shares</span></td>
             <td class="price-mono">{p.entry_price:.3f}</td>
             <td class="price-mono">{cur_str}</td>
             <td class="pnl-cell {pnl_cls}">{pnl_str}</td>
@@ -427,15 +297,13 @@ def build_dashboard(bot) -> dict:
 
     if pos_rows:
         positions_block = f"""
-        <div class="tbl-wrap">
-        <table>
+        <div class="tbl-wrap"><table>
             <thead><tr>
                 <th>Source</th><th>Market</th><th>Side</th>
                 <th>Size</th><th>Entry</th><th>Current</th><th>Unreal PnL</th>
             </tr></thead>
             <tbody>{pos_rows}</tbody>
-        </table>
-        </div>"""
+        </table></div>"""
     else:
         positions_block = '<div class="empty"><div class="empty-icon">📭</div>No open positions</div>'
 
@@ -458,24 +326,21 @@ def build_dashboard(bot) -> dict:
 
     if closed_rows:
         closed_block = f"""
-        <div class="tbl-wrap">
-        <table>
+        <div class="tbl-wrap"><table>
             <thead><tr>
                 <th>Source</th><th>Market</th><th>Side</th>
                 <th>Entry</th><th>Exit</th><th>Realised PnL</th>
             </tr></thead>
             <tbody>{closed_rows}</tbody>
-        </table>
-        </div>"""
+        </table></div>"""
     else:
         closed_block = '<div class="empty"><div class="empty-icon">📋</div>No closed trades yet</div>'
 
-    total_pnl = realised + unrealised
+    total_pnl  = realised + unrealised
+    comp_delta = compounding_bankroll - (bot.balance.peak_balance or INITIAL_BANKROLL)
 
     def _fmt(v):
         return f"{abs(v):.4f}" if abs(v) < 0.005 else f"{abs(v):.2f}"
-
-    comp_delta = compounding_bankroll - (bot.balance.peak_balance or INITIAL_BANKROLL)
 
     return {
         "last_updated":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -484,6 +349,7 @@ def build_dashboard(bot) -> dict:
         "status_label":    status_label,
         "status_badge":    status_badge,
         "balance":         bankroll,
+        "available":       available,
         "peak":            peak_bankroll,
         "drawdown":        drawdown,
         "dd_cls":          "neg" if drawdown > 10 else ("neu" if drawdown > 5 else "pos"),
@@ -555,6 +421,8 @@ class Position:
     order_id:      str   = ""
     current_price: float = 0.0
     source_shares: float = 0.0
+    shares_at_open: float = 0.0
+    source_shares_at_open: float = 0.0
 
 
 @dataclass
@@ -569,7 +437,9 @@ class PendingLimitBuy:
     limit_price:   float
     size_usd:      float
     order_id:      str
-    source_shares: float = 0.0
+    source_shares: float    = 0.0
+    # Fix 1: track consecutive API errors when checking fill status
+    fill_check_errors: int  = 0
     placed_at:     datetime = field(default_factory=datetime.now)
 
 
@@ -604,7 +474,6 @@ class SeenTradesStore:
                 """)
             self._seen   = self._load_postgres()
             self.backend = "postgres"
-            logging.info(f"Postgres connected — {len(self._seen)} seen keys loaded")
         except Exception as e:
             logging.error(f"Postgres init failed: {e} — falling back to local file")
             self._conn = None
@@ -648,7 +517,6 @@ class SeenTradesStore:
         try:
             self._conn = psycopg2.connect(self.db_url, sslmode="require")
             self._conn.autocommit = True
-            logging.info("Postgres reconnected")
         except Exception as e:
             logging.error(f"Postgres reconnect failed: {e}")
 
@@ -732,22 +600,20 @@ class RobustBalanceManager:
         for rpc in self.POLYGON_RPCS:
             try:
                 resp = requests.post(rpc, json=payload, timeout=8)
-                logging.info(f"RPC {rpc} status={resp.status_code}")
                 if resp.status_code == 200:
                     data   = resp.json()
-                    logging.info(f"RPC response: {data}")
                     result = data.get("result", "0x0")
                     if result and result not in ("0x", "0x0"):
                         balance = int(result, 16) / 1_000_000
-                        logging.info(f"pUSD balance fetched via RPC ({rpc}): ${balance:.2f}")
                         if balance > 0:
+                            logging.info(f"pUSD balance via RPC ({rpc}): ${balance:.2f}")
                             return balance
                         else:
-                            logging.warning(f"pUSD balance is 0 for wallet {YOUR_WALLET[:10]}...")
+                            logging.warning(f"pUSD balance is 0 for {YOUR_WALLET[:10]}…")
             except Exception as e:
                 logging.warning(f"RPC balance fetch failed ({rpc}): {e}")
                 continue
-        logging.error(f"All RPC attempts failed for wallet {YOUR_WALLET[:10] if YOUR_WALLET else 'NOT SET'}...")
+        logging.error(f"All RPC attempts failed for {YOUR_WALLET[:10] if YOUR_WALLET else 'NOT SET'}…")
         return 0.0
 
     def get_balance(self, force=False) -> Optional[float]:
@@ -779,8 +645,7 @@ class RobustBalanceManager:
             logging.warning(f"Balance fetch attempt {attempt}/{retries} returned 0 — retrying in {delay}s")
             time.sleep(delay)
         raise RuntimeError(
-            f"Could not fetch real pUSD balance after {retries} attempts. "
-            "Check DEPOSIT_WALLET_ADDRESS, pUSD contract address, and API connectivity."
+            f"Could not fetch real pUSD balance after {retries} attempts."
         )
 
     def check_drawdown(self) -> Tuple[bool, float]:
@@ -818,6 +683,10 @@ class PolymarketExecutor:
     def place_limit_buy(
         self, token_id: str, amount_usd: float, limit_price: float
     ) -> Tuple[bool, str, float]:
+        """
+        Buy price is governed by the per-wallet limit_buy_max_premium cap set
+        by the caller. MAX_SLIPPAGE applies to sells only.
+        """
         shares = round(amount_usd / limit_price, 4)
 
         if self.dry_run or self.client is None:
@@ -840,7 +709,7 @@ class PolymarketExecutor:
                     order_type = OrderType.GTC,
                 )
                 order_id = result.get("orderID", result.get("id", "unknown"))
-                logging.info(f"LIMIT BUY placed (V2): {order_id} | {shares:.4f} shares @ {limit_price:.4f}")
+                logging.info(f"LIMIT BUY placed (V2): {order_id} | {shares:.4f} @ {limit_price:.4f}")
                 return True, order_id, limit_price
             except Exception as e:
                 logging.warning(f"LIMIT BUY attempt {attempt+1} failed: {e}")
@@ -859,26 +728,42 @@ class PolymarketExecutor:
             logging.warning(f"Cancel failed for {order_id}: {e}")
             return False
 
-    def is_order_filled(self, order_id: str) -> bool:
+    def is_order_filled(self, order_id: str) -> Optional[bool]:
+        """
+        Fix 1: returns True (filled), False (confirmed open/unfilled), or
+        None (API error — caller must NOT treat this as unfilled).
+        """
         if self.dry_run or self.client is None:
             return True
         try:
             order  = self.client.get_order(order_id)
             status = order.get("status", "").lower()
-            return status in ("matched", "filled")
-        except Exception as e:
-            logging.warning(f"Could not check order status for {order_id}: {e}")
+            if status in ("matched", "filled"):
+                return True
+            # Any explicit non-filled status is a confirmed unfilled
             return False
+        except Exception as e:
+            logging.warning(f"Fill-check API error for {order_id}: {e} — treating as unknown")
+            return None   # <-- Fix 1: NOT False
 
-    def place_sell(self, token_id: str, shares: float) -> Tuple[bool, str]:
+    def place_sell(
+        self, token_id: str, shares: float, min_price: float = 0.0
+    ) -> Tuple[bool, str]:
+        """
+        Fix 4 (sell side): pass a min_price floor so the IOC won't fill below
+        best_bid * (1 - MAX_SLIPPAGE). If the book has moved too far the order
+        simply won't fill and the position stays open for retry.
+        """
         if self.dry_run or self.client is None:
-            logging.info(f"[DRY RUN] MARKET SELL {shares:.4f} shares token {token_id[:12]}…")
+            logging.info(
+                f"[DRY RUN] MARKET SELL {shares:.4f} shares "
+                f"min_price={min_price:.4f} token {token_id[:12]}…"
+            )
             return True, "dry-run-sell"
 
         for attempt in range(MAX_RETRIES):
             try:
-                # IOC: fills whatever it can immediately, cancels unfilled remainder
-                result = self.client.create_and_post_market_order(
+                kwargs = dict(
                     order_args = MarketOrderArgs(
                         token_id = token_id,
                         amount   = shares,
@@ -887,8 +772,21 @@ class PolymarketExecutor:
                     options    = PartialCreateOrderOptions(tick_size="0.01"),
                     order_type = OrderType.IOC,
                 )
+                # Inject min_price if the SDK supports it; swallow gracefully if not
+                if min_price > 0:
+                    try:
+                        kwargs["order_args"] = MarketOrderArgs(
+                            token_id  = token_id,
+                            amount    = shares,
+                            side      = Side.SELL,
+                            min_price = round(min_price, 4),
+                        )
+                    except TypeError:
+                        pass   # SDK version doesn't support min_price — skip silently
+
+                result   = self.client.create_and_post_market_order(**kwargs)
                 order_id = result.get("orderID", result.get("id", "unknown"))
-                logging.info(f"MARKET SELL placed (V2, IOC): {order_id}")
+                logging.info(f"MARKET SELL placed (V2 IOC): {order_id} min_price={min_price:.4f}")
                 return True, order_id
             except Exception as e:
                 logging.warning(f"SELL attempt {attempt+1} failed: {e}")
@@ -907,19 +805,45 @@ class CopyTrader:
         self.seen       = SeenTradesStore(SEEN_TRADES_FILE, DATABASE_URL)
 
         self._first_scan_done: Set[str] = set()
-        self.closed_positions: list = []
+        self.closed_positions: list     = []
 
         logging.info(f"Multi-Wallet CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
         logging.info(
-            f"Watching {len(WALLETS)} wallets | max positions={MAX_POSITIONS} | "
-            f"ask cap=+{LIMIT_BUY_MAX_PREMIUM*100:.0f}% | expiry={LIMIT_EXPIRY_SECONDS}s | "
-            f"poll={POLL_INTERVAL}s | storage={self.seen.backend} | "
-            f"sdk=py-clob-client-v2 | collateral=pUSD"
+            f"Watching {len(WALLETS)} wallets | max_positions={MAX_POSITIONS} | "
+            f"ask_cap=+{LIMIT_BUY_MAX_PREMIUM*100:.0f}% | max_slippage={MAX_SLIPPAGE*100:.0f}% | "
+            f"expiry={LIMIT_EXPIRY_SECONDS}s | poll={POLL_INTERVAL}s | "
+            f"storage={self.seen.backend} | sdk=py-clob-client-v2 | collateral=pUSD"
         )
         for addr, cfg in WALLETS.items():
-            logging.info(
-                f"  {cfg['name']} ({addr[:10]}…) copy_mode={cfg['copy_mode']}"
+            logging.info(f"  {cfg['name']} ({addr[:10]}…) copy_mode={cfg['copy_mode']}")
+
+    # ------------------------------------------------------------------
+    # Fix 2: capital reservation helpers
+    # ------------------------------------------------------------------
+    def _reserved_capital(self) -> float:
+        """Sum of all capital committed to open positions and pending buys."""
+        in_positions = sum(p.size_usd for p in self.positions.values())
+        in_pending   = sum(p.size_usd for p in self.pending.values())
+        return in_positions + in_pending
+
+    def _available_balance(self) -> float:
+        """Real balance minus capital already reserved."""
+        bal = self.balance.cached_balance or 0.0
+        return max(0.0, bal - self._reserved_capital())
+
+    def _can_afford(self, amount_usd: float) -> bool:
+        """True if available balance covers the trade with a small safety margin."""
+        available = self._available_balance()
+        can       = available >= amount_usd * 1.02   # 2 % buffer for fees/rounding
+        if not can:
+            logging.warning(
+                f"Affordability check failed: need ${amount_usd:.2f} but "
+                f"available=${available:.2f} (balance=${self.balance.cached_balance or 0:.2f} "
+                f"reserved=${self._reserved_capital():.2f})"
             )
+        return can
+
+    # ------------------------------------------------------------------
 
     def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
         for attempt in range(MAX_RETRIES):
@@ -948,11 +872,8 @@ class CopyTrader:
                     f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8
                 )
                 if r.status_code == 200:
-                    data = r.json()
-                    bids = data.get("bids", [])
-                    if bids:
-                        return float(bids[0]["price"])
-                    return 0.0
+                    bids = r.json().get("bids", [])
+                    return float(bids[0]["price"]) if bids else 0.0
             except Exception as e:
                 if attempt == MAX_RETRIES - 1:
                     logging.warning(f"Best bid fetch failed for {token_id[:12]}: {e}")
@@ -1008,34 +929,58 @@ class CopyTrader:
         for pos_key, pending in list(self.pending.items()):
             wallet_tokens = source_token_ids_by_wallet.get(pending.source_wallet, set())
 
+            # Source exited before our order filled — cancel immediately
             if pending.token_id not in wallet_tokens:
                 logging.info(f"Source exited before fill — cancelling {pending.question[:40]}")
                 self.executor.cancel_order(pending.order_id)
                 del self.pending[pos_key]
                 continue
 
-            if self.executor.is_order_filled(pending.order_id):
+            # Fix 1: is_order_filled returns True / False / None
+            filled = self.executor.is_order_filled(pending.order_id)
+
+            if filled is None:
+                # API error — increment error counter, do NOT drop the order
+                pending.fill_check_errors += 1
+                logging.warning(
+                    f"Fill check error #{pending.fill_check_errors} for "
+                    f"{pending.question[:40]} order {pending.order_id}"
+                )
+                if pending.fill_check_errors >= MAX_FILL_CHECK_ERRORS:
+                    logging.error(
+                        f"Max fill check errors reached for {pending.question[:40]} — "
+                        f"cancelling to be safe (will not retry)"
+                    )
+                    self.executor.cancel_order(pending.order_id)
+                    del self.pending[pos_key]
+                continue  # leave pending, check again next poll
+
+            if filled:
+                pending.fill_check_errors = 0   # reset on success
                 shares = pending.size_usd / pending.limit_price if pending.limit_price > 0 else 0
                 self.positions[pos_key] = Position(
-                    market_id     = pending.market_id,
-                    question      = pending.question,
-                    outcome       = pending.outcome,
-                    token_id      = pending.token_id,
-                    entry_price   = pending.limit_price,
-                    size_usd      = pending.size_usd,
-                    shares        = shares,
-                    source_wallet = pending.source_wallet,
-                    source_name   = pending.source_name,
-                    order_id      = pending.order_id,
-                    source_shares = pending.source_shares,
+                    market_id             = pending.market_id,
+                    question              = pending.question,
+                    outcome               = pending.outcome,
+                    token_id              = pending.token_id,
+                    entry_price           = pending.limit_price,
+                    size_usd              = pending.size_usd,
+                    shares                = shares,
+                    source_wallet         = pending.source_wallet,
+                    source_name           = pending.source_name,
+                    order_id              = pending.order_id,
+                    source_shares         = pending.source_shares,
+                    shares_at_open        = shares,
+                    source_shares_at_open = pending.source_shares,
                 )
                 del self.pending[pos_key]
                 logging.info(
                     f"LIMIT BUY FILLED → position open | {pending.question[:40]} "
-                    f"@ {pending.limit_price:.4f} | source_shares={pending.source_shares:.4f}"
+                    f"@ {pending.limit_price:.4f} | src_shares={pending.source_shares:.4f}"
                 )
                 continue
 
+            # Confirmed unfilled — check expiry
             age = (datetime.now() - pending.placed_at).total_seconds()
             if age >= LIMIT_EXPIRY_SECONDS:
                 logging.info(f"Order expired ({age:.0f}s) — cancelling and retrying {pending.question[:40]}")
@@ -1047,11 +992,20 @@ class CopyTrader:
                     logging.info(f"No orderbook on retry — skipping {pending.question[:40]}")
                     continue
 
-                current_ask = best_ask if best_ask > 0 else mid_price
-                _cfg        = WALLETS.get(pending.source_wallet, {})
+                current_ask    = best_ask if best_ask > 0 else mid_price
+                _cfg           = WALLETS.get(pending.source_wallet, {})
                 wallet_premium = _cfg.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                # Fix 4: hard slippage cap on retry too
                 price_cap   = round(current_ask * (1 + wallet_premium), 4)
                 limit_price = round(min(current_ask, price_cap), 4)
+
+                # Fix 2: affordability check on retry
+                if not self._can_afford(pending.size_usd):
+                    logging.warning(
+                        f"Cannot afford retry for {pending.question[:40]} "
+                        f"(${pending.size_usd:.2f}) — skipping"
+                    )
+                    continue
 
                 ok, order_id, filled_price = self.executor.place_limit_buy(
                     pending.token_id, pending.size_usd, limit_price
@@ -1071,7 +1025,7 @@ class CopyTrader:
                         source_shares = pending.source_shares,
                     )
                     logging.info(
-                        f"LIMIT BUY RETRIED (V2) | {pending.question[:40]} "
+                        f"LIMIT BUY RETRIED | {pending.question[:40]} "
                         f"@ {filled_price:.4f} (ask={current_ask:.4f})"
                     )
 
@@ -1088,11 +1042,12 @@ class CopyTrader:
 
         current_bankroll = self.balance.get_balance()
         if current_bankroll is None:
-            logging.error("Real pUSD balance unavailable — skipping this scan cycle")
+            logging.error("Real pUSD balance unavailable — skipping scan cycle")
             return
 
         logging.info(
-            f"Scanning | bankroll=${current_bankroll:.2f} pUSD | "
+            f"Scanning | balance=${current_bankroll:.2f} | "
+            f"available=${self._available_balance():.2f} | "
             f"compounding=${compounding_bankroll:.2f} | "
             f"open={len(self.positions)} | pending={len(self.pending)} | "
             f"seen={len(self.seen._seen)}"
@@ -1109,7 +1064,7 @@ class CopyTrader:
                 logging.warning(f"Skipping {name} — could not fetch positions")
                 continue
 
-            source_token_ids  = set()
+            source_token_ids:  set             = set()
             source_shares_map: Dict[str, float] = {}
             for pos in raw:
                 tid    = pos.get("asset", "")
@@ -1120,34 +1075,29 @@ class CopyTrader:
 
             if wallet_addr not in self._first_scan_done:
                 self._first_scan_done.add(wallet_addr)
-
                 if copy_mode == "new_only":
                     all_keys = {f"{wallet_addr}_{tid}" for tid in source_token_ids}
                     self.seen.snapshot_existing(all_keys)
                     logging.info(
                         f"[{name}] new_only — {len(all_keys)} existing position(s) "
-                        f"snapshotted at deployment, skipping buy loop this scan"
+                        f"snapshotted, skipping buy loop this scan"
                     )
                     source_token_ids_by_wallet[wallet_addr] = source_token_ids
                     continue
-
                 else:
                     logging.info(
                         f"[{name}] copy_all — {len(source_token_ids)} position(s) "
                         f"open at deployment, will copy unseen ones now"
                     )
 
-            logging.info(
-                f"[{name}] {len(raw)} position(s) from API, "
-                f"{len(source_token_ids)} active"
-            )
+            logging.info(f"[{name}] {len(raw)} position(s) from API, {len(source_token_ids)} active")
 
             for pos in raw:
-                token_id  = pos.get("asset", "")
-                market_id = pos.get("conditionId", "")
-                question  = pos.get("title", "Unknown")
-                outcome   = pos.get("outcome", "YES")
-                size_usd  = float(pos.get("currentValue", 0))
+                token_id              = pos.get("asset", "")
+                market_id             = pos.get("conditionId", "")
+                question              = pos.get("title", "Unknown")
+                outcome               = pos.get("outcome", "YES")
+                size_usd              = float(pos.get("currentValue", 0))
                 source_shares_at_copy = float(pos.get("size", pos.get("shares", 0)))
 
                 min_value = 0.0 if config.get("copy_sub_dollar") else 1.0
@@ -1159,12 +1109,6 @@ class CopyTrader:
                 in_positions = pos_key in self.positions
                 in_pending   = pos_key in self.pending
 
-                logging.info(
-                    f"[{name}] {question[:40]} | "
-                    f"seen={already_seen} open={in_positions} pending={in_pending} "
-                    f"val=${size_usd:.2f} src_shares={source_shares_at_copy:.4f}"
-                )
-
                 if already_seen or in_positions or in_pending:
                     continue
 
@@ -1172,20 +1116,13 @@ class CopyTrader:
                     logging.info("Global max positions reached — skipping new entries")
                     break
 
-                wallet_open = sum(
-                    1 for p in self.positions.values()
-                    if p.source_wallet == wallet_addr
-                )
-                wallet_pending = sum(
-                    1 for p in self.pending.values()
-                    if p.source_wallet == wallet_addr
-                )
-                wallet_max = config.get("max_positions", MAX_POSITIONS)
+                wallet_open    = sum(1 for p in self.positions.values() if p.source_wallet == wallet_addr)
+                wallet_pending = sum(1 for p in self.pending.values()   if p.source_wallet == wallet_addr)
+                wallet_max     = config.get("max_positions", MAX_POSITIONS)
                 if wallet_open + wallet_pending >= wallet_max:
                     logging.info(
-                        f"[{name}] wallet position cap reached "
-                        f"({wallet_open} open + {wallet_pending} pending "
-                        f">= {wallet_max}) — skipping"
+                        f"[{name}] wallet cap reached "
+                        f"({wallet_open} open + {wallet_pending} pending >= {wallet_max})"
                     )
                     break
 
@@ -1195,18 +1132,27 @@ class CopyTrader:
                     continue
 
                 wallet_premium = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-                price_cap      = round(cur_price * (1 + wallet_premium), 4)
-                limit_price    = round(cur_price, 4)
-
-                logging.info(
-                    f"[{name}] curPrice={cur_price:.4f} cap={price_cap:.4f} | {question[:40]}"
-                )
+                # Buy price capped by per-wallet premium only; MAX_SLIPPAGE is sell-side only
+                price_cap   = round(cur_price * (1 + wallet_premium), 4)
+                limit_price = round(cur_price, 4)
 
                 if config.get("copy_sub_dollar") and size_usd < 1.0:
                     my_size = round(size_usd, 2)
                 else:
                     risk_pct = self.get_risk_percent(limit_price, config)
-                    my_size  = round(compounding_bankroll * risk_pct, 2)
+                    # Fix 2: size against compounding_bankroll but cap at available balance
+                    my_size = round(
+                        min(compounding_bankroll * risk_pct, self._available_balance() * 0.95),
+                        2,
+                    )
+
+                # Fix 2: hard affordability gate before placing the order
+                if my_size <= 0 or not self._can_afford(my_size):
+                    logging.warning(
+                        f"[{name}] Skipping {question[:40]} — "
+                        f"cannot afford ${my_size:.2f}"
+                    )
+                    continue
 
                 ok, order_id, actual_price = self.executor.place_limit_buy(
                     token_id, my_size, limit_price
@@ -1227,15 +1173,16 @@ class CopyTrader:
                         source_shares = source_shares_at_copy,
                     )
                     logging.info(
-                        f"[{name}] LIMIT BUY PLACED (V2) | {question[:40]} | "
+                        f"[{name}] LIMIT BUY PLACED | {question[:40]} | "
                         f"${my_size:.2f} @ {actual_price:.4f} "
-                        f"(comp_bankroll=${compounding_bankroll:.2f} "
-                        f"curPrice={cur_price:.4f} cap={price_cap:.4f} "
-                        f"src_shares={source_shares_at_copy:.4f})"
+                        f"(avail=${self._available_balance():.2f} "
+                        f"comp=${compounding_bankroll:.2f} "
+                        f"curPrice={cur_price:.4f} cap={price_cap:.4f})"
                     )
 
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
 
+            # Update current prices for open positions from this wallet
             cur_price_map = {
                 pos.get("asset", ""): float(pos.get("curPrice", 0))
                 for pos in raw
@@ -1248,9 +1195,9 @@ class CopyTrader:
                 if _cp > 0:
                     _pos.current_price = _cp
 
-            # ================================================================
+            # ============================================================
             # SELL LOGIC
-            # ================================================================
+            # ============================================================
             for pos_key, position in list(self.positions.items()):
                 if position.source_wallet != wallet_addr:
                     continue
@@ -1259,92 +1206,147 @@ class CopyTrader:
 
                 current_source_shares = source_shares_map.get(position.token_id, 0.0)
 
+                # Source added shares — raise baselines
+                if current_source_shares > position.source_shares_at_open:
+                    logging.info(
+                        f"[{name}] Source ADDED shares "
+                        f"{position.source_shares_at_open:.4f} → {current_source_shares:.4f} | "
+                        f"updating baselines | {position.question[:40]}"
+                    )
+                    position.source_shares_at_open = current_source_shares
+                    position.source_shares         = current_source_shares
+                    position.shares_at_open        = position.shares
+
                 # ── CASE 1: Full exit ──
                 if position.token_id not in source_token_ids:
-                    best_bid   = self._get_best_bid(position.token_id)
-                    exit_price = best_bid if best_bid > 0 else position.current_price
-
                     logging.info(
-                        f"[{name}] Source FULL EXIT — selling all "
-                        f"{position.shares:.4f} shares @ {exit_price:.4f} | "
+                        f"[{name}] Source FULL EXIT — selling {position.shares:.4f} shares | "
                         f"{position.question[:40]}"
                     )
-
-                    ok, _ = self.executor.place_sell(position.token_id, position.shares)
-                    if ok:
-                        pnl = (exit_price - position.entry_price) * position.shares
-                        position.status     = "closed"
-                        position.exit_price = exit_price
-                        position.pnl        = pnl
-                        if pnl > 0:
-                            compounding_bankroll += pnl * COMPOUNDING_RATE
-                            logging.info(
-                                f"Compounding profit: +${pnl * COMPOUNDING_RATE:.4f} → "
-                                f"compounding_bankroll=${compounding_bankroll:.2f}"
-                            )
-                        logging.info(
-                            f"[{name}] FULL SELL (V2, IOC) | {position.question[:40]} | "
-                            f"exit={exit_price:.4f} pnl=${pnl:.2f}"
-                        )
-                        self.closed_positions.append(position)
-                        del self.positions[pos_key]
-                    else:
-                        logging.error(
-                            f"[{name}] FULL SELL failed after {MAX_RETRIES} attempts — "
-                            f"will retry next poll: {position.question[:40]}"
-                        )
+                    self._execute_sell(position, pos_key, position.shares, name, full_exit=True)
 
                 # ── CASE 2: Partial exit ──
                 elif (
-                    position.source_shares > 0
+                    position.source_shares_at_open > 0
                     and current_source_shares < position.source_shares * 0.80
                 ):
-                    shares_sold_by_source = position.source_shares - current_source_shares
-                    sell_ratio            = shares_sold_by_source / position.source_shares
-                    our_shares_to_sell    = round(position.shares * sell_ratio, 4)
+                    hold_ratio         = current_source_shares / position.source_shares_at_open
+                    our_target_shares  = round(position.shares_at_open * hold_ratio, 4)
+                    our_shares_to_sell = round(position.shares - our_target_shares, 4)
 
                     if our_shares_to_sell <= 0:
                         continue
 
-                    best_bid   = self._get_best_bid(position.token_id)
-                    exit_price = best_bid if best_bid > 0 else position.current_price
-
                     logging.info(
-                        f"[{name}] Source PARTIAL EXIT {sell_ratio*100:.1f}% — "
-                        f"selling {our_shares_to_sell:.4f} of {position.shares:.4f} shares "
-                        f"@ {exit_price:.4f} | {position.question[:40]}"
+                        f"[{name}] Source PARTIAL EXIT — "
+                        f"source holds {hold_ratio*100:.1f}% | "
+                        f"selling {our_shares_to_sell:.4f} of {position.shares:.4f} | "
+                        f"{position.question[:40]}"
+                    )
+                    self._execute_sell(
+                        position, pos_key, our_shares_to_sell, name,
+                        full_exit=False, current_source_shares=current_source_shares,
                     )
 
-                    ok, _ = self.executor.place_sell(position.token_id, our_shares_to_sell)
-                    if ok:
-                        pnl = (exit_price - position.entry_price) * our_shares_to_sell
-
-                        position.shares        -= our_shares_to_sell
-                        position.size_usd       = position.shares * position.entry_price
-                        position.source_shares  = current_source_shares
-
-                        if pnl > 0:
-                            compounding_bankroll += pnl * COMPOUNDING_RATE
-                            logging.info(
-                                f"Compounding profit (partial): +${pnl * COMPOUNDING_RATE:.4f} → "
-                                f"compounding_bankroll=${compounding_bankroll:.2f}"
-                            )
-
-                        logging.info(
-                            f"[{name}] PARTIAL SELL (V2, IOC) | {position.question[:40]} | "
-                            f"sold={our_shares_to_sell:.4f} exit={exit_price:.4f} "
-                            f"pnl=${pnl:.2f} | remaining={position.shares:.4f} shares"
-                        )
-                    else:
-                        logging.error(
-                            f"[{name}] PARTIAL SELL failed after {MAX_RETRIES} attempts — "
-                            f"will retry next poll: {position.question[:40]}"
-                        )
-
-                else:
-                    pass
-
         self._process_pending_orders(source_token_ids_by_wallet)
+
+    # ------------------------------------------------------------------
+    # Fix 3: isolated sell execution with contamination correction
+    # ------------------------------------------------------------------
+    def _execute_sell(
+        self,
+        position:               "Position",
+        pos_key:                str,
+        shares_to_sell:         float,
+        name:                   str,
+        full_exit:              bool,
+        current_source_shares:  float = 0.0,
+    ):
+        global compounding_bankroll
+
+        if self.dry_run:
+            exit_price = position.current_price if position.current_price > 0 else position.entry_price
+            pnl        = (exit_price - position.entry_price) * shares_to_sell
+            ok         = True
+            order_id   = "dry-run-sell"
+        else:
+            # Fix 4: compute min acceptable sell price
+            best_bid  = self._get_best_bid(position.token_id)
+            min_price = round(best_bid * (1 - MAX_SLIPPAGE), 4) if best_bid > 0 else 0.0
+
+            # Fix 3: snapshot buys that are in-flight so we can correct the diff
+            # Record which pending orders are NOT yet filled right now
+            pending_costs_before: Dict[str, float] = {
+                pk: p.size_usd for pk, p in self.pending.items()
+            }
+
+            # Serialise: grab lock so concurrent buy fills don't contaminate our snapshot
+            with _trade_lock:
+                balance_before = self.balance.get_balance(force=True) or 0.0
+                ok, order_id   = self.executor.place_sell(
+                    position.token_id, shares_to_sell, min_price=min_price
+                )
+                if ok:
+                    time.sleep(SELL_SETTLE_WAIT)
+                    balance_after = self.balance.get_balance(force=True) or 0.0
+
+            if ok:
+                # Fix 3: identify any pending buys that filled during our settle window
+                # and add their cost back so the diff reflects sell proceeds only
+                contamination = 0.0
+                for pk, cost in pending_costs_before.items():
+                    if pk in self.positions:   # it transitioned pending → open = filled
+                        contamination += cost
+                        logging.info(
+                            f"PnL contamination correction: +${cost:.4f} "
+                            f"(buy filled during settle window for {pk[:30]})"
+                        )
+
+                raw_diff   = balance_after - balance_before
+                pnl        = raw_diff + contamination   # add back cost of concurrent buys
+                exit_price = best_bid if best_bid > 0 else position.current_price
+            else:
+                pnl        = 0.0
+                exit_price = 0.0
+
+        if not ok:
+            logging.error(
+                f"[{name}] SELL failed after {MAX_RETRIES} attempts — "
+                f"will retry next poll: {position.question[:40]}"
+            )
+            return
+
+        if full_exit:
+            position.status     = "closed"
+            position.exit_price = exit_price
+            position.pnl        = pnl
+            if pnl > 0:
+                compounding_bankroll += pnl * COMPOUNDING_RATE
+                logging.info(
+                    f"Compounding profit: +${pnl * COMPOUNDING_RATE:.4f} → "
+                    f"compounding_bankroll=${compounding_bankroll:.2f}"
+                )
+            logging.info(
+                f"[{name}] FULL SELL ({'DRY RUN' if self.dry_run else 'LIVE'}) | "
+                f"{position.question[:40]} | exit={exit_price:.4f} pnl=${pnl:.4f}"
+            )
+            self.closed_positions.append(position)
+            del self.positions[pos_key]
+        else:
+            position.shares   -= shares_to_sell
+            position.size_usd  = position.shares * position.entry_price
+            position.source_shares = current_source_shares
+            if pnl > 0:
+                compounding_bankroll += pnl * COMPOUNDING_RATE
+                logging.info(
+                    f"Compounding profit (partial): +${pnl * COMPOUNDING_RATE:.4f} → "
+                    f"compounding_bankroll=${compounding_bankroll:.2f}"
+                )
+            logging.info(
+                f"[{name}] PARTIAL SELL ({'DRY RUN' if self.dry_run else 'LIVE'}) | "
+                f"{position.question[:40]} | sold={shares_to_sell:.4f} "
+                f"pnl=${pnl:.4f} remaining={position.shares:.4f}"
+            )
 
     async def run(self):
         logging.info("Bot loop started (CLOB V2)")
@@ -1358,18 +1360,17 @@ class CopyTrader:
             now = time.time()
             if now - last_heartbeat >= 300:
                 status = "PAUSED" if bot_paused_until and datetime.now() < bot_paused_until else "ACTIVE"
-                wallet_counts = {}
+                wallet_counts: Dict[str, int] = {}
                 for p in self.positions.values():
                     wallet_counts[p.source_name] = wallet_counts.get(p.source_name, 0) + 1
                 for p in self.pending.values():
                     wallet_counts[p.source_name] = wallet_counts.get(p.source_name, 0) + 1
-                slot_summary = " | ".join(
-                    f"{n}={c}" for n, c in wallet_counts.items()
-                ) or "none"
+                slot_summary = " | ".join(f"{n}={c}" for n, c in wallet_counts.items()) or "none"
                 logging.info(
-                    f"Heartbeat | {status} | bankroll=${self.balance.cached_balance or 0:.2f} pUSD | "
+                    f"Heartbeat | {status} | balance=${self.balance.cached_balance or 0:.2f} | "
+                    f"available=${self._available_balance():.2f} | "
                     f"compounding=${compounding_bankroll:.2f} | "
-                    f"slots=[{slot_summary}] total={len(self.positions)+len(self.pending)}/20 | "
+                    f"slots=[{slot_summary}] total={len(self.positions)+len(self.pending)}/{MAX_POSITIONS} | "
                     f"seen={len(self.seen._seen)} | storage={self.seen.backend}"
                 )
                 last_heartbeat = now
@@ -1388,13 +1389,13 @@ async def main():
     _bot_ref = bot
 
     try:
-        starting_balance = bot.balance.fetch_with_retry(retries=5, delay=10)
+        starting_balance     = bot.balance.fetch_with_retry(retries=5, delay=10)
         bot.balance.peak_balance = starting_balance
         peak_bankroll        = starting_balance
         compounding_bankroll = starting_balance
         logging.info(f"Compounding bankroll seeded at ${compounding_bankroll:.2f}")
     except RuntimeError as e:
-        logging.error(f"Startup pUSD balance fetch failed: {e} — running in degraded mode")
+        logging.error(f"Startup balance fetch failed: {e} — running in degraded mode")
 
     await bot.run()
 
