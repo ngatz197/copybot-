@@ -20,6 +20,8 @@ MULTI-WALLET COPY TRADER - PRODUCTION READY (CLOB V2)
 - Pending limit order tracking + auto-cancel on expiry
 - Health endpoint for Render (keeps bot awake)
 - Compounding bankroll: grows with COMPOUNDING_RATE * profit on each closed trade
+- Partial sell mirroring: tracks source_shares per position, sells proportionally
+- Poll interval: 25 seconds
 
 PER-WALLET COPY RULES:
   TheSpirit  (0x0c0e...): only copy NEW trades appearing after deployment,
@@ -115,7 +117,7 @@ DATABASE_URL     = os.getenv("DATABASE_URL", "")
 
 INITIAL_BANKROLL      = 10.0
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "20"))
-POLL_INTERVAL         = int(os.getenv("POLL_SECONDS", "40"))
+POLL_INTERVAL         = int(os.getenv("POLL_SECONDS", "25"))
 COMPOUNDING_RATE      = float(os.getenv("COMPOUNDING_RATE", "0.70"))
 MAX_DRAWDOWN          = float(os.getenv("MAX_DRAWDOWN", "0.20"))
 HEALTH_PORT           = int(os.getenv("PORT", "8080"))
@@ -123,17 +125,14 @@ PAUSE_HOURS           = 48
 MAX_RETRIES           = 3
 RETRY_DELAY           = 5
 
-# Cap: won't pay more than this % above current best_ask (Option A)
 LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
 LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 
-# V2: pUSD contract address on Polygon (verified on PolygonScan)
 PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
 current_bankroll      = INITIAL_BANKROLL
 peak_bankroll         = INITIAL_BANKROLL
-# Compounding bankroll: seeded from real balance at startup, grows with profits
 compounding_bankroll  = INITIAL_BANKROLL
 bot_paused_until: Optional[datetime] = None
 
@@ -157,10 +156,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             padding: 24px 16px;
         }}
 
-        /* ── Layout ── */
         .page {{ max-width: 1100px; margin: 0 auto; }}
 
-        /* ── Header ── */
         .header {{
             display: flex;
             align-items: center;
@@ -189,7 +186,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .badge-paused{{ background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }}
         .timestamp   {{ font-size: 0.75rem; color: #64748b; }}
 
-        /* ── Stat row ── */
         .stats {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -222,12 +218,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             margin-top: 5px;
         }}
 
-        /* ── PnL colours ── */
         .pos  {{ color: #34d399; }}
         .neg  {{ color: #f87171; }}
         .neu  {{ color: #94a3b8; }}
 
-        /* ── Section card ── */
         .section {{
             background: #16181d;
             border: 1px solid #1e2230;
@@ -258,7 +252,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             padding: 2px 10px;
         }}
 
-        /* ── Table ── */
         .tbl-wrap {{ overflow-x: auto; }}
         table {{
             width: 100%;
@@ -311,15 +304,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             border-radius: 999px;
         }}
         .price-mono {{ font-family: 'Courier New', monospace; font-size: 0.80rem; }}
-
-        /* ── Pnl bar ── */
         .pnl-cell {{
             font-weight: 700;
             font-size: 0.83rem;
             white-space: nowrap;
         }}
 
-        /* ── Empty state ── */
         .empty {{
             padding: 32px 20px;
             text-align: center;
@@ -332,7 +322,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
 <div class="page">
 
-    <!-- Header -->
     <div class="header">
         <div>
             <div class="header-title">🤖 Poly<span>CopyTrader</span></div>
@@ -344,7 +333,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- Stat cards -->
     <div class="stats">
         <div class="stat-card">
             <div class="stat-label">Total Balance</div>
@@ -378,7 +366,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- Open Positions -->
     <div class="section">
         <div class="section-header">
             <span class="section-title">Open Positions</span>
@@ -387,7 +374,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         {positions_block}
     </div>
 
-    <!-- Closed Trades -->
     <div class="section">
         <div class="section-header">
             <span class="section-title">Closed Trades</span>
@@ -402,7 +388,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 def build_dashboard(bot) -> dict:
-    # "+" for profit, "-" for loss, "" for zero
     def _sign(v): return "+" if v > 0 else ("-" if v < 0 else "")
     def _cls(v):  return "pos" if v > 0 else ("neg" if v < 0 else "neu")
 
@@ -410,28 +395,23 @@ def build_dashboard(bot) -> dict:
     drawdown   = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0.0
     is_paused  = bool(bot_paused_until and datetime.now() < bot_paused_until)
 
-    # ── Status / mode badges ──────────────────────────────────────────
     status_label = "Paused" if is_paused else "Running"
     status_badge = "badge-paused" if is_paused else "badge-live"
     mode_label   = "Dry Run" if bot.dry_run else "Live"
     mode_badge   = "badge-dry" if bot.dry_run else "badge-live"
 
-    # ── Unrealised PnL — reads cached current_price set during scan ──
     unrealised = 0.0
     pos_rows   = ""
     for p in bot.positions.values():
-        # Use price cached by the scan loop; fall back to entry if not yet set
         mid    = p.current_price if p.current_price > 0 else p.entry_price
         unreal = (mid - p.entry_price) * p.shares
         unrealised += unreal
 
         outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
         pnl_cls     = _cls(unreal)
-        # Use 4dp when value would show as $0.00 at 2dp
         pnl_fmt     = ".4f" if abs(unreal) < 0.005 else ".2f"
         pnl_str     = f"{_sign(unreal)}${abs(unreal):{pnl_fmt}}"
         cur_str     = f"{mid:.3f}" if p.current_price > 0 else "—"
-        # Show shares so PnL magnitude makes sense to the user
         shares_str  = f"{p.shares:.4f}"
 
         pos_rows += f"""
@@ -459,11 +439,10 @@ def build_dashboard(bot) -> dict:
     else:
         positions_block = '<div class="empty"><div class="empty-icon">📭</div>No open positions</div>'
 
-    # ── Realised PnL (closed trades) ─────────────────────────────────
     closed_list = getattr(bot, "closed_positions", [])
     realised    = sum(p.pnl for p in closed_list)
     closed_rows = ""
-    for p in reversed(closed_list):          # newest first
+    for p in reversed(closed_list):
         outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
         pnl_cls     = _cls(p.pnl)
         pnl_str     = f"{_sign(p.pnl)}${abs(p.pnl):.2f}"
@@ -494,10 +473,8 @@ def build_dashboard(bot) -> dict:
     total_pnl = realised + unrealised
 
     def _fmt(v):
-        """Smart format: 4dp for tiny values that would show as $0.00 at 2dp."""
         return f"{abs(v):.4f}" if abs(v) < 0.005 else f"{abs(v):.2f}"
 
-    # Compounding bankroll grows above starting balance when profitable
     comp_delta = compounding_bankroll - (bot.balance.peak_balance or INITIAL_BANKROLL)
 
     return {
@@ -576,7 +553,8 @@ class Position:
     exit_price:    float = 0.0
     pnl:           float = 0.0
     order_id:      str   = ""
-    current_price: float = 0.0   # refreshed each scan cycle
+    current_price: float = 0.0
+    source_shares: float = 0.0
 
 
 @dataclass
@@ -591,18 +569,12 @@ class PendingLimitBuy:
     limit_price:   float
     size_usd:      float
     order_id:      str
+    source_shares: float = 0.0
     placed_at:     datetime = field(default_factory=datetime.now)
 
 
 # ==================== SEEN TRADES STORE ====================
 class SeenTradesStore:
-    """
-    Persists every pos_key we have ever attempted to copy.
-    Backend priority:
-      1. Postgres  — if DATABASE_URL is set and psycopg2 is installed.
-      2. Local file — fallback for local dev / missing DB config.
-    """
-
     def __init__(self, filepath: str, db_url: str = ""):
         self.filepath = filepath
         self.db_url   = db_url
@@ -730,10 +702,6 @@ class SeenTradesStore:
 
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
-    """
-    V2 CHANGE: Polymarket V2 uses pUSD as collateral (replaces USDC.e).
-    pUSD is a standard ERC-20 on Polygon backed 1:1 by USDC.
-    """
     POLYGON_RPCS = [
         "https://polygon-bor-rpc.publicnode.com",
         "https://polygon.llamarpc.com",
@@ -909,18 +877,18 @@ class PolymarketExecutor:
 
         for attempt in range(MAX_RETRIES):
             try:
+                # IOC: fills whatever it can immediately, cancels unfilled remainder
                 result = self.client.create_and_post_market_order(
                     order_args = MarketOrderArgs(
-                        token_id   = token_id,
-                        amount     = shares,
-                        side       = Side.SELL,
-                        order_type = OrderType.FOK,
+                        token_id = token_id,
+                        amount   = shares,
+                        side     = Side.SELL,
                     ),
                     options    = PartialCreateOrderOptions(tick_size="0.01"),
-                    order_type = OrderType.FOK,
+                    order_type = OrderType.IOC,
                 )
                 order_id = result.get("orderID", result.get("id", "unknown"))
-                logging.info(f"MARKET SELL placed (V2): {order_id}")
+                logging.info(f"MARKET SELL placed (V2, IOC): {order_id}")
                 return True, order_id
             except Exception as e:
                 logging.warning(f"SELL attempt {attempt+1} failed: {e}")
@@ -938,17 +906,15 @@ class CopyTrader:
         self.executor   = PolymarketExecutor(dry_run)
         self.seen       = SeenTradesStore(SEEN_TRADES_FILE, DATABASE_URL)
 
-        # Tracks which wallets have completed their first scan
         self._first_scan_done: Set[str] = set()
-
-        # Closed trades kept in memory for PnL display
         self.closed_positions: list = []
 
         logging.info(f"Multi-Wallet CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
         logging.info(
             f"Watching {len(WALLETS)} wallets | max positions={MAX_POSITIONS} | "
             f"ask cap=+{LIMIT_BUY_MAX_PREMIUM*100:.0f}% | expiry={LIMIT_EXPIRY_SECONDS}s | "
-            f"storage={self.seen.backend} | sdk=py-clob-client-v2 | collateral=pUSD"
+            f"poll={POLL_INTERVAL}s | storage={self.seen.backend} | "
+            f"sdk=py-clob-client-v2 | collateral=pUSD"
         )
         for addr, cfg in WALLETS.items():
             logging.info(
@@ -956,7 +922,6 @@ class CopyTrader:
             )
 
     def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
-        """Returns (mid_price, best_ask). Either may be 0.0 on failure."""
         for attempt in range(MAX_RETRIES):
             try:
                 r = requests.get(
@@ -975,6 +940,24 @@ class CopyTrader:
                     logging.warning(f"Orderbook fetch failed for {token_id[:12]}: {e}")
                 time.sleep(RETRY_DELAY)
         return 0.0, 0.0
+
+    def _get_best_bid(self, token_id: str) -> float:
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = requests.get(
+                    f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    bids = data.get("bids", [])
+                    if bids:
+                        return float(bids[0]["price"])
+                    return 0.0
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:
+                    logging.warning(f"Best bid fetch failed for {token_id[:12]}: {e}")
+                time.sleep(RETRY_DELAY)
+        return 0.0
 
     def get_risk_percent(self, price: float, config: dict) -> float:
         if config.get("risk_type") == "fixed":
@@ -1008,6 +991,11 @@ class CopyTrader:
                     f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50",
                     timeout=12,
                 )
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 30))
+                    logging.warning(f"Rate limited on {wallet_addr[:10]} — sleeping {retry_after}s")
+                    time.sleep(retry_after)
+                    continue
                 if resp.status_code == 200:
                     return resp.json()
             except Exception as e:
@@ -1020,14 +1008,12 @@ class CopyTrader:
         for pos_key, pending in list(self.pending.items()):
             wallet_tokens = source_token_ids_by_wallet.get(pending.source_wallet, set())
 
-            # Source wallet exited before we filled — cancel
             if pending.token_id not in wallet_tokens:
                 logging.info(f"Source exited before fill — cancelling {pending.question[:40]}")
                 self.executor.cancel_order(pending.order_id)
                 del self.pending[pos_key]
                 continue
 
-            # Check if filled
             if self.executor.is_order_filled(pending.order_id):
                 shares = pending.size_usd / pending.limit_price if pending.limit_price > 0 else 0
                 self.positions[pos_key] = Position(
@@ -1041,15 +1027,15 @@ class CopyTrader:
                     source_wallet = pending.source_wallet,
                     source_name   = pending.source_name,
                     order_id      = pending.order_id,
+                    source_shares = pending.source_shares,
                 )
                 del self.pending[pos_key]
                 logging.info(
                     f"LIMIT BUY FILLED → position open | {pending.question[:40]} "
-                    f"@ {pending.limit_price:.4f}"
+                    f"@ {pending.limit_price:.4f} | source_shares={pending.source_shares:.4f}"
                 )
                 continue
 
-            # Expired — cancel and retry with fresh ask price
             age = (datetime.now() - pending.placed_at).total_seconds()
             if age >= LIMIT_EXPIRY_SECONDS:
                 logging.info(f"Order expired ({age:.0f}s) — cancelling and retrying {pending.question[:40]}")
@@ -1082,6 +1068,7 @@ class CopyTrader:
                         limit_price   = filled_price,
                         size_usd      = pending.size_usd,
                         order_id      = order_id,
+                        source_shares = pending.source_shares,
                     )
                     logging.info(
                         f"LIMIT BUY RETRIED (V2) | {pending.question[:40]} "
@@ -1122,28 +1109,19 @@ class CopyTrader:
                 logging.warning(f"Skipping {name} — could not fetch positions")
                 continue
 
-            # ---- Build source token set ----
-            # For EXIT detection: include any token the source still holds shares in,
-            # regardless of currentValue (avoids false exits when value dips below $1).
-            # The $1 filter is applied only in the BUY loop below.
-            source_token_ids = set()
+            source_token_ids  = set()
+            source_shares_map: Dict[str, float] = {}
             for pos in raw:
                 tid    = pos.get("asset", "")
                 shares = float(pos.get("size", pos.get("shares", 0)))
                 if tid and shares > 0:
                     source_token_ids.add(tid)
+                    source_shares_map[tid] = shares
 
-            # ----------------------------------------------------------------
-            # FIRST SCAN LOGIC — runs once per wallet per deployment
-            # ----------------------------------------------------------------
             if wallet_addr not in self._first_scan_done:
                 self._first_scan_done.add(wallet_addr)
 
                 if copy_mode == "new_only":
-                    # new_only wallets: mark every current position as seen so we
-                    # never copy anything that was already open at deployment.
-                    # Then skip the buy loop for this scan — the next poll is
-                    # the first one where new trades can be detected.
                     all_keys = {f"{wallet_addr}_{tid}" for tid in source_token_ids}
                     self.seen.snapshot_existing(all_keys)
                     logging.info(
@@ -1151,11 +1129,9 @@ class CopyTrader:
                         f"snapshotted at deployment, skipping buy loop this scan"
                     )
                     source_token_ids_by_wallet[wallet_addr] = source_token_ids
-                    continue   # ← do NOT copy anything on the first scan
+                    continue
 
                 else:
-                    # copy_all (WalletA179): don't snapshot anything — allow
-                    # the buy loop below to copy existing positions right now.
                     logging.info(
                         f"[{name}] copy_all — {len(source_token_ids)} position(s) "
                         f"open at deployment, will copy unseen ones now"
@@ -1163,18 +1139,17 @@ class CopyTrader:
 
             logging.info(
                 f"[{name}] {len(raw)} position(s) from API, "
-                f"{len(source_token_ids)} with currentValue >= $1"
+                f"{len(source_token_ids)} active"
             )
 
-            # ---- BUY LOGIC — uses compounding_bankroll for sizing ----
             for pos in raw:
                 token_id  = pos.get("asset", "")
                 market_id = pos.get("conditionId", "")
                 question  = pos.get("title", "Unknown")
                 outcome   = pos.get("outcome", "YES")
                 size_usd  = float(pos.get("currentValue", 0))
+                source_shares_at_copy = float(pos.get("size", pos.get("shares", 0)))
 
-                # WalletE8ca copies sub-$1 trades too; all others require >= $1
                 min_value = 0.0 if config.get("copy_sub_dollar") else 1.0
                 if not token_id or size_usd < min_value or size_usd <= 0:
                     continue
@@ -1187,17 +1162,16 @@ class CopyTrader:
                 logging.info(
                     f"[{name}] {question[:40]} | "
                     f"seen={already_seen} open={in_positions} pending={in_pending} "
-                    f"val=${size_usd:.2f}"
+                    f"val=${size_usd:.2f} src_shares={source_shares_at_copy:.4f}"
                 )
 
                 if already_seen or in_positions or in_pending:
                     continue
 
-                # Global cap
                 if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
                     logging.info("Global max positions reached — skipping new entries")
                     break
-                # Per-wallet cap
+
                 wallet_open = sum(
                     1 for p in self.positions.values()
                     if p.source_wallet == wallet_addr
@@ -1215,23 +1189,19 @@ class CopyTrader:
                     )
                     break
 
-                # Use curPrice from positions API
                 cur_price = float(pos.get("curPrice", 0))
                 if cur_price <= 0:
                     logging.info(f"[{name}] SKIP no curPrice | {question[:40]}")
                     continue
 
-                # Per-wallet ask cap (falls back to global LIMIT_BUY_MAX_PREMIUM)
                 wallet_premium = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-                price_cap   = round(cur_price * (1 + wallet_premium), 4)
-                limit_price = round(cur_price, 4)
+                price_cap      = round(cur_price * (1 + wallet_premium), 4)
+                limit_price    = round(cur_price, 4)
 
                 logging.info(
                     f"[{name}] curPrice={cur_price:.4f} cap={price_cap:.4f} | {question[:40]}"
                 )
 
-                # Sizing: 1:1 mirror for sub-$1 trades on copy_sub_dollar wallets,
-                # otherwise use compounding_bankroll * risk_pct
                 if config.get("copy_sub_dollar") and size_usd < 1.0:
                     my_size = round(size_usd, 2)
                 else:
@@ -1254,19 +1224,18 @@ class CopyTrader:
                         limit_price   = actual_price,
                         size_usd      = my_size,
                         order_id      = order_id,
+                        source_shares = source_shares_at_copy,
                     )
                     logging.info(
                         f"[{name}] LIMIT BUY PLACED (V2) | {question[:40]} | "
                         f"${my_size:.2f} @ {actual_price:.4f} "
                         f"(comp_bankroll=${compounding_bankroll:.2f} "
-                        f"curPrice={cur_price:.4f} cap={price_cap:.4f})"
+                        f"curPrice={cur_price:.4f} cap={price_cap:.4f} "
+                        f"src_shares={source_shares_at_copy:.4f})"
                     )
 
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
 
-            # ---- REFRESH current_price on open positions (for dashboard) ----
-            # Use curPrice from the positions API response — accurate, already
-            # fetched this cycle, no extra HTTP call to the orderbook needed.
             cur_price_map = {
                 pos.get("asset", ""): float(pos.get("curPrice", 0))
                 for pos in raw
@@ -1279,35 +1248,101 @@ class CopyTrader:
                 if _cp > 0:
                     _pos.current_price = _cp
 
-            # ---- SELL LOGIC ----
+            # ================================================================
+            # SELL LOGIC
+            # ================================================================
             for pos_key, position in list(self.positions.items()):
                 if position.source_wallet != wallet_addr:
                     continue
-                if position.token_id not in source_token_ids and position.status == "open":
-                    exit_price, _ = self.get_orderbook_prices(position.token_id)
+                if position.status != "open":
+                    continue
+
+                current_source_shares = source_shares_map.get(position.token_id, 0.0)
+
+                # ── CASE 1: Full exit ──
+                if position.token_id not in source_token_ids:
+                    best_bid   = self._get_best_bid(position.token_id)
+                    exit_price = best_bid if best_bid > 0 else position.current_price
+
+                    logging.info(
+                        f"[{name}] Source FULL EXIT — selling all "
+                        f"{position.shares:.4f} shares @ {exit_price:.4f} | "
+                        f"{position.question[:40]}"
+                    )
+
                     ok, _ = self.executor.place_sell(position.token_id, position.shares)
                     if ok:
                         pnl = (exit_price - position.entry_price) * position.shares
                         position.status     = "closed"
                         position.exit_price = exit_price
                         position.pnl        = pnl
-
-                        # Compound profits into compounding_bankroll (losses
-                        # reduce the real balance naturally; we only add wins)
                         if pnl > 0:
                             compounding_bankroll += pnl * COMPOUNDING_RATE
                             logging.info(
-                                f"Compounding profit: +${pnl * COMPOUNDING_RATE:.4f} "
-                                f"({COMPOUNDING_RATE*100:.0f}% of ${pnl:.4f}) → "
+                                f"Compounding profit: +${pnl * COMPOUNDING_RATE:.4f} → "
                                 f"compounding_bankroll=${compounding_bankroll:.2f}"
                             )
-
                         logging.info(
-                            f"[{name}] MARKET SELL (V2) | {position.question[:40]} | "
+                            f"[{name}] FULL SELL (V2, IOC) | {position.question[:40]} | "
                             f"exit={exit_price:.4f} pnl=${pnl:.2f}"
                         )
                         self.closed_positions.append(position)
                         del self.positions[pos_key]
+                    else:
+                        logging.error(
+                            f"[{name}] FULL SELL failed after {MAX_RETRIES} attempts — "
+                            f"will retry next poll: {position.question[:40]}"
+                        )
+
+                # ── CASE 2: Partial exit ──
+                elif (
+                    position.source_shares > 0
+                    and current_source_shares < position.source_shares * 0.80
+                ):
+                    shares_sold_by_source = position.source_shares - current_source_shares
+                    sell_ratio            = shares_sold_by_source / position.source_shares
+                    our_shares_to_sell    = round(position.shares * sell_ratio, 4)
+
+                    if our_shares_to_sell <= 0:
+                        continue
+
+                    best_bid   = self._get_best_bid(position.token_id)
+                    exit_price = best_bid if best_bid > 0 else position.current_price
+
+                    logging.info(
+                        f"[{name}] Source PARTIAL EXIT {sell_ratio*100:.1f}% — "
+                        f"selling {our_shares_to_sell:.4f} of {position.shares:.4f} shares "
+                        f"@ {exit_price:.4f} | {position.question[:40]}"
+                    )
+
+                    ok, _ = self.executor.place_sell(position.token_id, our_shares_to_sell)
+                    if ok:
+                        pnl = (exit_price - position.entry_price) * our_shares_to_sell
+
+                        position.shares        -= our_shares_to_sell
+                        position.size_usd       = position.shares * position.entry_price
+                        position.source_shares  = current_source_shares
+
+                        if pnl > 0:
+                            compounding_bankroll += pnl * COMPOUNDING_RATE
+                            logging.info(
+                                f"Compounding profit (partial): +${pnl * COMPOUNDING_RATE:.4f} → "
+                                f"compounding_bankroll=${compounding_bankroll:.2f}"
+                            )
+
+                        logging.info(
+                            f"[{name}] PARTIAL SELL (V2, IOC) | {position.question[:40]} | "
+                            f"sold={our_shares_to_sell:.4f} exit={exit_price:.4f} "
+                            f"pnl=${pnl:.2f} | remaining={position.shares:.4f} shares"
+                        )
+                    else:
+                        logging.error(
+                            f"[{name}] PARTIAL SELL failed after {MAX_RETRIES} attempts — "
+                            f"will retry next poll: {position.question[:40]}"
+                        )
+
+                else:
+                    pass
 
         self._process_pending_orders(source_token_ids_by_wallet)
 
@@ -1356,7 +1391,6 @@ async def main():
         starting_balance = bot.balance.fetch_with_retry(retries=5, delay=10)
         bot.balance.peak_balance = starting_balance
         peak_bankroll        = starting_balance
-        # Seed compounding_bankroll from the confirmed real balance
         compounding_bankroll = starting_balance
         logging.info(f"Compounding bankroll seeded at ${compounding_bankroll:.2f}")
     except RuntimeError as e:
