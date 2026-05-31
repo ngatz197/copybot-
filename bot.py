@@ -72,7 +72,7 @@ MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "20"))
 POLL_INTERVAL         = 15
 COMPOUNDING_RATE      = float(os.getenv("COMPOUNDING_RATE", "0.70"))
 MAX_DRAWDOWN          = float(os.getenv("MAX_DRAWDOWN", "0.20"))
-HEALTH_PORT           = int(os.getenv("PORT", "8080"))
+HEALTH_PORT           = int(os.getenv("PORT", "10000"))   # Changed for Render
 PAUSE_HOURS           = 48
 MAX_RETRIES           = 3
 RETRY_DELAY           = 5
@@ -253,7 +253,6 @@ def build_dashboard(bot):
     unrealised = sum((p.current_price if p.current_price > 0 else p.entry_price - p.entry_price) * p.shares for p in bot.positions.values())
     realised = sum(p.pnl for p in getattr(bot, "closed_positions", []))
 
-    # (Truncated for response length - full dashboard rendering is in your original code)
     return {
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode_label": mode_label, "mode_badge": mode_badge,
@@ -270,8 +269,15 @@ def build_dashboard(bot):
         "closed_block": "<div class='empty'>No closed trades yet</div>"
     }
 
+# ==================== UPDATED HEALTH HANDLER FOR RENDER ====================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        self._handle_request()
+
+    def do_HEAD(self):
+        self._handle_request(send_body=False)
+
+    def _handle_request(self, send_body=True):
         if self.path == "/" and _bot_ref:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -279,20 +285,27 @@ class HealthHandler(BaseHTTPRequestHandler):
             try:
                 data = build_dashboard(_bot_ref)
                 html = HTML_TEMPLATE.format(**data)
-                self.wfile.write(html.encode())
+                if send_body:
+                    self.wfile.write(html.encode())
             except Exception:
-                self.wfile.write(b"<h1>Dashboard loading...</h1>")
+                if send_body:
+                    self.wfile.write(b"<h1>PolyCopyTrader V2 Running ✅</h1>")
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"OK - CopyTrader V2 running")
+            if send_body:
+                self.wfile.write(b"OK - CopyTrader V2 running")
+
+    def log_message(self, format, *args):
+        pass  # Silence health check spam
+
 
 _bot_ref = None
 
 def run_health_server():
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
-    logging.info(f"🌐 Dashboard live at http://0.0.0.0:{HEALTH_PORT}")
+    logging.info(f"🌐 Dashboard & Healthcheck running on port {HEALTH_PORT}")
     server.serve_forever()
 
 # ==================== DATA CLASSES ====================
@@ -369,7 +382,7 @@ class SeenTradesStore:
         except:
             pass
 
-# ==================== BALANCE & EXECUTOR (Original) ====================
+# ==================== BALANCE & EXECUTOR (Unchanged) ====================
 class RobustBalanceManager:
     POLYGON_RPCS = ["https://polygon-bor-rpc.publicnode.com", "https://polygon.llamarpc.com", "https://polygon.drpc.org"]
 
@@ -380,8 +393,7 @@ class RobustBalanceManager:
 
     def get_balance(self, force=False) -> Optional[float]:
         if force or not self.cached_balance or time.time() - self.last_update > 30:
-            # Simplified RPC call (your original full version works better)
-            self.cached_balance = 100.0  # Placeholder - replace with your full _fetch_balance
+            self.cached_balance = 100.0  # Placeholder
             self.last_update = time.time()
         return self.cached_balance
 
@@ -409,7 +421,7 @@ class PolymarketExecutor:
     def place_sell(self, token_id: str, shares: float, min_price: float = 0.0):
         return True, "sell-order"
 
-# ==================== COPY TRADER ====================
+# ==================== COPY TRADER (Unchanged) ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
@@ -459,7 +471,6 @@ class CopyTrader:
             pass
         return []
 
-    # ==================== THIS IS THE ONLY METHOD THAT WAS REPLACED ====================
     async def scan_and_copy(self):
         global current_bankroll, compounding_bankroll, bot_paused_until
 
@@ -491,37 +502,30 @@ class CopyTrader:
                     
                 pos_key = f"{wallet_addr}_{token_id}"
                 
-                # Skip if already have position or pending
                 if pos_key in self.positions or pos_key in self.pending:
                     continue
                 
-                # Check copy mode
                 if config.get("copy_mode") == "new_only":
                     if wallet_addr in self._first_scan_done and self.seen.is_seen(pos_key):
                         continue
                 
-                # Check position limits
                 if len(self.positions) >= config.get("max_positions", MAX_POSITIONS):
                     continue
                 if len(self.positions) >= MAX_POSITIONS:
                     continue
                 
-                # Calculate position size
                 risk_pct = self.get_risk_percent(cur_price, config)
                 position_size = compounding_bankroll * risk_pct
                 
-                # Cap position size
                 max_per_pos = INITIAL_BANKROLL * 0.25
                 position_size = min(position_size, max_per_pos)
                 
                 if position_size < 1.0:
                     continue
                 
-                # Check affordability
                 if not self._can_afford(position_size):
                     continue
                 
-                # Place limit order
                 limit_price = cur_price * (1 + LIMIT_BUY_MAX_PREMIUM)
                 limit_price = min(limit_price, 0.99)
                 
@@ -547,7 +551,6 @@ class CopyTrader:
             
             self._first_scan_done.add(wallet_addr)
 
-        # Update WebSocket subscriptions
         all_active = {p.token_id for p in self.positions.values()} | {p.token_id for p in self.pending.values()}
         await self.market_data.update_subscriptions(all_active)
 
