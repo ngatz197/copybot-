@@ -27,6 +27,9 @@ Additional changes:
   - Orderbook cache (3s TTL): avoids redundant fetches within a window
   - Sell loop no longer calls _get_best_bid() per position per cycle;
     orderbook is only fetched at the moment a sell is actually executed
+  - FIX: User-activity WS "no close frame received or sent" now caught
+    silently via websockets.exceptions.ConnectionClosedError so the log
+    is no longer polluted with spurious WARNING lines on every reconnect.
 """
 
 import os
@@ -41,6 +44,7 @@ from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 import websockets
+import websockets.exceptions
 import aiohttp
 import requests   # kept only for RobustBalanceManager RPC calls (sync ok there)
 
@@ -331,7 +335,12 @@ class MarketDataManager:
         wallet_set = {w.lower() for w in wallet_addresses}
         while self.running:
             try:
-                async with websockets.connect(uri, ping_interval=20, ping_timeout=30) as ws:
+                async with websockets.connect(
+                    uri,
+                    ping_interval=20,
+                    ping_timeout=30,
+                    close_timeout=5,
+                ) as ws:
                     self._user_ws = ws
                     logging.info("✅ User-activity WS connected")
                     await self._send_user_sub(ws, wallet_addresses)
@@ -355,6 +364,10 @@ class MarketDataManager:
                                 self._schedule_wake("unknown", event_type)
                         except Exception:
                             pass
+            except websockets.exceptions.ConnectionClosedError:
+                # Server dropped connection without a close frame — normal, reconnect silently
+                self._user_ws = None
+                await asyncio.sleep(3)
             except Exception as e:
                 logging.warning(f"User-activity WS disconnected: {e}. Reconnecting in 3s…")
                 self._user_ws = None
