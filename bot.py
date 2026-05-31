@@ -68,7 +68,7 @@ try:
             key=YOUR_PRIVATE_KEY,
             funder=YOUR_WALLET
         )
-        logging.info("✅ ClobClient initialized successfully")
+        logging.info("ClobClient initialized successfully")
 except Exception as e:
     logging.warning(f"ClobClient init failed: {e}")
 
@@ -88,7 +88,7 @@ class MarketDataManager:
             try:
                 async with websockets.connect(uri, ping_interval=20, ping_timeout=30) as websocket:
                     self.ws = websocket
-                    logging.info("✅ Connected to Polymarket WebSocket")
+                    logging.info("Connected to Polymarket WebSocket")
 
                     if self.subscribed_tokens:
                         await self._subscribe(list(self.subscribed_tokens))
@@ -152,7 +152,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <h1>🤖 PolyCopyTrader Dashboard</h1>
+    <h1>PolyCopyTrader Dashboard</h1>
     <p>Last updated: {last_updated}</p>
     <div class="card">
         <h3>Balance: ${balance:.2f} | Available: ${available:.2f}</h3>
@@ -218,7 +218,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     self.wfile.write(html.encode('utf-8'))
             except:
                 if send_body:
-                    self.wfile.write(b"<h1>PolyCopyTrader V2 Running ✅</h1>")
+                    self.wfile.write(b"<h1>PolyCopyTrader V2 Running</h1>")
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -233,7 +233,7 @@ _bot_ref = None
 
 def run_health_server():
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
-    logging.info(f"🌐 Dashboard running on port {HEALTH_PORT}")
+    logging.info(f"Dashboard running on port {HEALTH_PORT}")
     server.serve_forever()
 
 # ==================== DATA CLASSES ====================
@@ -258,7 +258,7 @@ class PendingLimitBuy:
     size_usd: float
     placed_at: datetime = field(default_factory=datetime.now)
 
-# ==================== BALANCE MANAGER (REAL) ====================
+# ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
     def __init__(self):
         self.cached_balance = None
@@ -323,7 +323,7 @@ class CopyTrader:
                     if config.get("copy_mode") == "new_only" and wallet_addr in self._first_scan_done:
                         continue
 
-                    size_usd = min(compounding_bankroll * 0.02, 8.0)  # Anti-spam + conservative
+                    size_usd = min(compounding_bankroll * 0.02, 8.0)
 
                     if size_usd < 1.0:
                         continue
@@ -334,17 +334,16 @@ class CopyTrader:
                     self.pending[pos_key] = PendingLimitBuy(pos_key, token_id, order_id, size_usd)
                     self.seen.add(pos_key)
 
-                    logging.info(f"📝 Limit order placed → {config['name']} | ${size_usd:.2f} @ {limit_price:.4f}")
+                    logging.info(f"Limit order placed -> {config['name']} | ${size_usd:.2f} @ {limit_price:.4f}")
             except Exception as e:
                 logging.debug(f"Scan error for {wallet_addr}: {e}")
 
         self._first_scan_done.update(WALLETS.keys())
 
     async def monitor_pending(self):
-        """Monitor and simulate fill for pending orders"""
         for key in list(self.pending.keys()):
             pending = self.pending[key]
-            if (datetime.now() - pending.placed_at).total_seconds() > 45:   # Simulate fill delay
+            if (datetime.now() - pending.placed_at).total_seconds() > 45:
                 price = market_data.get_current_price(pending.token_id) or 0.5
                 self.positions[key] = Position(
                     market_id="", question="Copied Market", outcome="Yes",
@@ -353,7 +352,7 @@ class CopyTrader:
                     source_wallet="", source_name="Copied"
                 )
                 del self.pending[key]
-                logging.info(f"✅ Position filled: {key}")
+                logging.info(f"Position filled: {key}")
 
     async def run(self):
         while True:
