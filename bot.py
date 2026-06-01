@@ -7,8 +7,8 @@ Integrates:
   - Pre-Signed Order Matrices (RAM-cached EIP-712 cryptographic payloads)
   - Tight Limit Premium Shields (Automated slippage cutoffs preventing bad fills)
   - Bulletproof Initialization Logic (Fixes existing-trade copy loops caused by network drops)
-  - RESTORED: Original Tiered Scaling and Fixed Allocation Risk Structures
-  - Retains all existing dashboard metrics, fallback scans, and multi-wallet state management.
+  - Original Tiered Scaling and Fixed Allocation Risk Structures
+  - DYNAMIC FIX: Automated background HFT asset extraction (Removes hardcoded array limits)
 """
 
 import os
@@ -641,7 +641,7 @@ class PendingLimitBuy:
     token_id:          str
     market_id:         str
     question:          str
-    outcome:           str
+    outcome:               str
     source_wallet:     str
     source_name:       str
     limit_price:       float
@@ -1266,9 +1266,19 @@ async def matrix_pre_sign_worker(bot: CopyTrader):
                 nonce_resp = requests.get(f"https://clob.polymarket.com/nonce?address={address_param}", timeout=5)
                 current_nonce = int(nonce_resp.json().get("nonce", 0))
                 
-                tracked_tokens = ["0x271a9918c9629f903c4cd098184e67a06a04f9b8f"] 
+                # --- DYNAMIC FIX APPLIED ---
+                # Aggregates active token IDs automatically from active portfolio streams
+                tracked_tokens = set()
+                for pos in bot.positions.values():
+                    tracked_tokens.add(pos.token_id)
+                for pend in bot.pending.values():
+                    tracked_tokens.add(pend.token_id)
                 
-                for tid in tracked_tokens:
+                # Fallback to standard baseline tracking loop assets if current portfolio is resting empty
+                if not tracked_tokens:
+                    tracked_tokens.add("0x271a9918c9629f903c4cd098184e67a06a04f9b8f")
+                
+                for tid in list(tracked_tokens):
                     mid_price, _ = await bot._get_orderbook(tid)
                     if mid_price <= 0:
                         mid_price = 0.50
