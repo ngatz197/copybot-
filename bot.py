@@ -3,6 +3,7 @@
 MULTI-WALLET COPY TRADER - PRODUCTION READY (HIGH-PERFORMANCE HFT VARIANT)
 
 Integrates:
+  - LIVE BALANCE LAYER: Dynamically fetches real wallet balances using py_clob_client_v2.
   - Pre-Warmed Network Pipelines (Persistent keep-alive sockets)
   - Pre-Signed Order Matrices (RAM-cached EIP-712 cryptographic payloads)
   - Tight Limit Premium Shields (Automated slippage cutoffs preventing bad fills)
@@ -107,7 +108,7 @@ POLY_SECRET      = os.getenv("POLY_SECRET", "")
 POLY_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 DATABASE_URL     = os.getenv("DATABASE_URL", "")
 
-INITIAL_BANKROLL      = 10.0
+INITIAL_BANKROLL      = 0.0 # Will be populated dynamically by the live API
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "20"))
 POLL_INTERVAL         = 15   
 COMPOUNDING_RATE      = float(os.getenv("COMPOUNDING_RATE", "0.70"))
@@ -770,16 +771,34 @@ class SeenTradesStore:
     def is_empty(self) -> bool:
         return len(self._seen) == 0
 
-# ==================== BALANCE LAYER ====================
+# ==================== LIVE REAL BALANCE LAYER ====================
 class RobustBalanceManager:
-    def __init__(self):
-        self.cached_balance = INITIAL_BANKROLL
+    def __init__(self, clob_client: Optional['ClobClient'] = None):
+        self.client = clob_client
+        self.cached_balance = 0.0
+
+    async def update_balance(self):
+        """Fetches live balance using credentials, or falls back gracefully."""
+        if self.client and CLOB_AVAILABLE:
+            try:
+                # Queries Polymarket's live REST server for actual pUSD/USDC holding state
+                live_bal = self.client.get_collateral_balance()
+                self.cached_balance = float(live_bal)
+                logging.info(f"💵 Balance sync successful | Real Balance: ${self.cached_balance:.2f}")
+                return
+            except Exception as e:
+                logging.error(f"Live balance fetch error: {e}. Keeping current cached state.")
+        
+        # Safe fallback if credentials aren't loaded or py_clob_client_v2 fails
+        if self.cached_balance == 0.0:
+            self.cached_balance = 10.0
 
 # ==================== MOTOR LOGIC CORE ====================
 class PolyCopyTrader:
-    def __init__(self):
+    def __init__(self, clob_client: Optional['ClobClient'] = None):
         self.dry_run = DRY_RUN
-        self.balance = RobustBalanceManager()
+        self.client = clob_client
+        self.balance = RobustBalanceManager(self.client)
         self.positions: Dict[str, Position] = {}
         self.closed_positions: List[Position] = []
         self.seen_store = SeenTradesStore(SEEN_TRADES_FILE, DATABASE_URL)
@@ -795,6 +814,12 @@ class PolyCopyTrader:
         
         logging.info("Initializing multi-wallet pipelines...")
         
+        # Update live metrics instantly upon runtime startup
+        await self.balance.update_balance()
+        
+        peak_bankroll = max(peak_bankroll, self.balance.cached_balance)
+        compounding_bankroll = max(compounding_bankroll, self.balance.cached_balance)
+
         # Populating actual dashboard dataset
         self.positions["pos_1"] = Position(
             market_id="m1", question="Will the price of Bitcoin be above $78,000 on June 1?",
@@ -831,16 +856,33 @@ class PolyCopyTrader:
     async def process_cycle(self):
         """High frequency background sync routine parsing active pipelines."""
         await throttle.acquire()
-        pass
+        # Periodically refresh the balance from the live exchange client
+        await self.balance.update_balance()
 
 # ==================== INFINITE RUNWAY SYSTEM ====================
 async def main_loop():
     """Main execution frame preventing engine runtime collapse on early exits."""
+    global peak_bankroll, compounding_bankroll
+    
     # Launch Visual Monitoring Server in a detached runtime frame
     server_thread = threading.Thread(target=run_health_server, daemon=True)
     server_thread.start()
 
-    bot = PolyCopyTrader()
+    # Initialize ClobClient if API parameters are available
+    clob_client = None
+    if CLOB_AVAILABLE and POLY_API_KEY and YOUR_PRIVATE_KEY:
+        try:
+            creds = ApiCreds(key=POLY_API_KEY, secret=POLY_SECRET, passphrase=POLY_PASSPHRASE)
+            clob_client = ClobClient(
+                host="https://clob.polymarket.com",
+                key=YOUR_PRIVATE_KEY,
+                creds=creds
+            )
+            logging.info("✅ Live ClobClient initialized successfully.")
+        except Exception as e:
+            logging.error(f"Failed to instantiate real ClobClient API context: {e}")
+
+    bot = PolyCopyTrader(clob_client=clob_client)
     await bot.initialize_and_sync()
 
     logging.info("🚀 PolyCopyTrader Engine fully online and operating in background loop.")
@@ -848,6 +890,9 @@ async def main_loop():
     while True:
         try:
             await bot.process_cycle()
+            # Dynamic updates for local state tracking matrices
+            peak_bankroll = max(peak_bankroll, bot.balance.cached_balance)
+            compounding_bankroll = max(compounding_bankroll, bot.balance.cached_balance)
         except Exception as e:
             logging.error(f"Error caught inside HFT tracking frame: {e}")
         
