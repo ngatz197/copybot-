@@ -7,6 +7,7 @@ Integrates:
   - Pre-Signed Order Matrices (RAM-cached EIP-712 cryptographic payloads)
   - Tight Limit Premium Shields (Automated slippage cutoffs preventing bad fills)
   - Bulletproof Initialization Logic (Fixes existing-trade copy loops caused by network drops)
+  - RESTORED: Original Tiered Scaling and Fixed Allocation Risk Structures
   - Retains all existing dashboard metrics, fallback scans, and multi-wallet state management.
 """
 
@@ -74,7 +75,7 @@ WALLETS = {
     },
     "0x0c0e270cf879583d6a0142fc817e05b768d0434e": {
         "name": "TheSpirit",
-        "risk_type": "price_based",
+        "risk_type": "price_based", # Uses the original multi-tier 3% / 1% / 0.6% rule
         "copy_mode": "new_only",
         "limit_buy_max_premium": 0.08,  # Tight Guard for high volatile entry
         "max_positions": 5,
@@ -82,14 +83,15 @@ WALLETS = {
     "0xa1795199a227f8d68134f30bf26314a9918c9629": {
         "name": "Coniyr",
         "risk_type": "fixed",
-        "fixed_risk": 0.025,
+        "fixed_risk": 0.025,       # Restored to original constant 2.5%
         "copy_mode": "copy_all",
         "limit_buy_max_premium": 0.10,
         "max_positions": 4,
     },
     "0xf903c4cd098184e67a06a04f9b8fdb36e7bbe028": {
         "name": "Viser",
-        "risk_type": "price_based",
+        "risk_type": "fixed",
+        "fixed_risk": 0.025,       # Restored to original constant 2.5%
         "copy_mode": "new_only",
         "limit_buy_max_premium": 0.05,  # Hyper-tight 5% shield
         "max_positions": 3,
@@ -978,10 +980,18 @@ class CopyTrader:
             self._pos_cache.set(wallet_addr, data)
         return data
 
+    # ==================== EXACT RESTORED TIERED RISKING ====================
     def get_risk_percent(self, price: float, config: dict) -> float:
         if config.get("risk_type") == "fixed":
-            return config.get("fixed_risk", 0.025)
-        return 0.03 if price >= 0.70 else (0.01 if price >= 0.30 else 0.006)
+            return config.get("fixed_risk", 0.025) # Handles original 2.5% flat rules for Viser and Coniyr
+        
+        # Exact multi-tiered allocation blueprint for price_based risk profiles (TheSpirit, Kruto)
+        if price >= 0.70:
+            return 0.030  # 3.0% tier
+        elif price >= 0.30:
+            return 0.010  # 1.0% tier
+        else:
+            return 0.006  # 0.6% tier
 
     def check_drawdown(self) -> bool:
         global peak_bankroll, bot_paused_until
@@ -1144,8 +1154,6 @@ class CopyTrader:
             config, name = WALLETS[wallet_addr], WALLETS[wallet_addr]["name"]
             
             # CRITICAL FIX: If the API failed to provide data, skip execution immediately.
-            # Because self._first_scan_done is NOT flagged yet, the bot handles it safely 
-            # and retries the initialization snapshot on the next loop cycle instead of copying raw values.
             if raw is None: 
                 logging.warning(f"⚠️ Initial tracking fetch failed for {name}. Postponing execution phase until snapshot secures data.")
                 continue
@@ -1157,7 +1165,6 @@ class CopyTrader:
                     self.seen.snapshot_existing(all_keys)
                     logging.info(f"🔒 [{name}] Successful initial snapshot. Protected {len(all_keys)} existing position(s).")
                 
-                # Flag initialization complete ONLY after data arrays pass integration requirements safely
                 self._first_scan_done.add(wallet_addr)
                 source_token_ids_by_wallet[wallet_addr] = source_token_ids
                 continue
