@@ -1,5 +1,178 @@
-Python
-from http.server import BaseHTTPRequestHandler
+import os
+import sys
+import json
+import time
+import logging
+import asyncio
+import traceback
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from threading import Thread
+
+import requests
+import websockets
+
+# ==================== LOGGING CONFIGURATION ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("PolyCopyTrader")
+
+# ==================== CONFIGURATION & CONSTANTS ====================
+POLY_CLOB_API_URL  = "https://clob.polymarket.com"
+POLY_WS_ENDPOINT    = "wss://clob.polymarket.com/ws/v2"
+
+# Strategy parameters 
+INITIAL_BANKROLL   = float(os.getenv("INITIAL_BANKROLL", "1000.0"))
+COMPOUNDING_RATE   = float(os.getenv("COMPOUNDING_RATE", "1.0"))  # 100% of PnL added
+MAX_DRAWDOWN       = float(os.getenv("MAX_DRAWDOWN", "0.30"))     # 30% safety halt
+
+# Global operational state
+compounding_bankroll = INITIAL_BANKROLL
+peak_bankroll        = INITIAL_BANKROLL
+bot_paused_until     = None
+_bot_ref             = None
+
+@dataclass
+class Position:
+    token_id: str
+    question: str
+    outcome: str
+    entry_price: float
+    current_price: float
+    shares: float
+    size_usd: float
+    source_name: str
+    opened_at: datetime
+
+@dataclass
+class ClosedPosition:
+    token_id: str
+    question: str
+    outcome: str
+    entry_price: float
+    exit_price: float
+    shares: float
+    pnl: float
+    source_name: str
+    closed_at: datetime
+
+class MockBalance:
+    def __init__(self, initial=1000.0):
+        self.cached_balance = initial
+
+# ==================== MARKET DATA MANAGER (WEBSOCKETS) ====================
+class MarketDataManager:
+    def __init__(self):
+        self.prices = {}
+        self.active_tokens = set()
+        self._loop = None
+        self._thread = None
+
+    def start(self):
+        self._thread = Thread(target=self._run_loop, daemon=True, name="MarketDataThread")
+        self._thread.start()
+
+    def _run_loop(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._main_handler())
+
+    async def _main_handler(self):
+        while True:
+            try:
+                if not self.active_tokens:
+                    await asyncio.sleep(2)
+                    continue
+                async with websockets.connect(POLY_WS_ENDPOINT, ping_interval=20, ping_timeout=10) as ws:
+                    sub_msg = {
+                        "type": "subscribe",
+                        "channels": ["price_feed"],
+                        "market_ids": list(self.active_tokens)
+                    }
+                    await ws.send(json.dumps(sub_msg))
+                    logger.info(f"Subscribed to price feed for {len(self.active_tokens)} markets")
+                    
+                    while True:
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        if isinstance(data, list):
+                            for item in data:
+                                self._process_price_item(item)
+                        elif isinstance(data, dict):
+                            self._process_price_item(data)
+            except Exception as e:
+                logger.error(f"WS stream disconnected ({e}). Reconnecting in 5s...")
+                await asyncio.sleep(5)
+
+    def _process_price_item(self, item):
+        if item.get("channel") == "price_feed" or "market_id" in item:
+            m_id = item.get("market_id")
+            price = item.get("price")
+            if m_id and price is not None:
+                try:
+                    self.prices[str(m_id)] = float(price)
+                except ValueError:
+                    pass
+
+    def track_tokens(self, token_ids: list):
+        updated = False
+        for t in token_ids:
+            t_str = str(t)
+            if t_str not in self.active_tokens:
+                self.active_tokens.add(t_str)
+                updated = True
+        if updated and self._loop and self._loop.is_running():
+            logger.info("New markets added. Cycling WS connections...")
+
+    def get_current_price(self, token_id: str) -> float:
+        return self.prices.get(str(token_id), 0.0)
+
+market_data = MarketDataManager()
+
+# ==================== CORE COPIER ENGINE ====================
+class PolyCopyTrader:
+    def __init__(self):
+        self.dry_run = True
+        self.balance = MockBalance(INITIAL_BANKROLL)
+        self.positions = {}
+        self.closed_positions = []
+        global _bot_ref
+        _bot_ref = self
+
+    def _available_balance(self) -> float:
+        allocated = sum(p.size_usd for p in self.positions.values())
+        return max(0.0, (self.balance.cached_balance or 0.0) - allocated)
+
+    def update_tracking(self):
+        t_ids = [p.token_id for p in self.positions.values() if p.token_id]
+        if t_ids:
+            market_data.track_tokens(t_ids)
+
+    def execute_mock_trade(self, source: str, q_text: str, side: str, t_id: str, amt: float):
+        global bot_paused_until, compounding_bankroll
+        if bot_paused_until and datetime.now() < bot_paused_until:
+            return
+            
+        key = f"{t_id}_{side.upper()}"
+        if key in self.positions:
+            return
+
+        entry_px = 0.50  # Mock fallback reference execution price
+        shares = amt / entry_px
+        
+        self.positions[key] = Position(
+            token_id=t_id, question=q_text, outcome=side.upper(),
+            entry_price=entry_px, current_price=entry_px,
+            shares=shares, size_usd=amt, source_name=source,
+            opened_at=datetime.now()
+        )
+        self.update_tracking()
+        logger.info(f"Mock Position Opened | {source} | {side.upper()} | {q_text[:40]}")
+
 # ==================== DASHBOARD VISUALS ====================
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -261,3 +434,25 @@ class HealthHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"OK - PolyCopyTrader running")
 
     def log_message(self, *args): pass
+
+def run_dashboard_server(port=8080):
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Dashboard UI web server live on port {port}")
+    server.serve_forever()
+
+# ==================== MAIN SERVICE EXECUTION ====================
+if __name__ == "__main__":
+    market_data.start()
+    bot = PolyCopyTrader()
+    
+    # Fire up dashboard UI thread
+    srv_thread = Thread(target=run_dashboard_server, daemon=True, name="DashboardServerThread")
+    srv_thread.start()
+    
+    # Keep the mock loop processing or waiting for tasks
+    logger.info("Bot components running. Monitoring entries...")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Terminating bot application...")
