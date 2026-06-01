@@ -30,6 +30,18 @@ Additional changes:
   - FIX: User-activity WS "no close frame received or sent" now caught
     silently via websockets.exceptions.ConnectionClosedError so the log
     is no longer polluted with spurious WARNING lines on every reconnect.
+
+Fixes applied:
+  - FIX 1: time.sleep(SELL_SETTLE_WAIT) replaced with await asyncio.sleep()
+    inside _execute_sell so the event loop is never blocked during settle.
+    The sleep and second balance fetch are also moved outside _trade_lock
+    since a threading lock must not be held across an await.
+  - FIX 4: CircuitBreaker class added (CLOSED -> OPEN -> HALF_OPEN states).
+    One breaker per wallet. After FAILURE_THRESHOLD consecutive fetch
+    failures the breaker trips OPEN, blocks further fetches and new buys
+    for that wallet, then probes after BACKOFF_SECONDS. Sell loop
+    continues to run while a breaker is open so existing positions can
+    still be exited. Breaker state is logged at every transition.
 """
 
 import os
@@ -177,6 +189,70 @@ class RequestThrottle:
 throttle = RequestThrottle()
 
 
+# ==================== CIRCUIT BREAKER ====================
+class CircuitBreaker:
+    """
+    Tracks consecutive REST failures per wallet.
+    States: CLOSED (normal) -> OPEN (tripped) -> HALF_OPEN (testing)
+
+    - After FAILURE_THRESHOLD consecutive errors, trips OPEN.
+    - After BACKOFF_SECONDS, moves to HALF_OPEN and allows one probe.
+    - Probe succeeds -> CLOSED. Probe fails -> back to OPEN.
+    - While OPEN, _get_positions returns None immediately (no request fired).
+    - A tripped breaker also blocks new buys for that wallet to prevent
+      acting on stale data. Sell loop continues regardless so existing
+      positions can still be exited.
+    """
+
+    FAILURE_THRESHOLD = 5
+    BACKOFF_SECONDS   = 60
+
+    def __init__(self, name: str):
+        self.name             = name
+        self._failures        = 0
+        self._state           = "CLOSED"   # CLOSED | OPEN | HALF_OPEN
+        self._opened_at: Optional[float] = None
+
+    @property
+    def state(self) -> str:
+        if self._state == "OPEN":
+            if time.monotonic() - self._opened_at >= self.BACKOFF_SECONDS:
+                self._state = "HALF_OPEN"
+                logging.info(f"CircuitBreaker [{self.name}] -> HALF_OPEN (probing)")
+        return self._state
+
+    def allow_request(self) -> bool:
+        """Returns True if a request should be fired."""
+        s = self.state
+        if s == "CLOSED":
+            return True
+        if s == "HALF_OPEN":
+            return True   # one probe allowed
+        return False      # OPEN — block
+
+    def record_success(self):
+        if self._state in ("OPEN", "HALF_OPEN"):
+            logging.info(f"CircuitBreaker [{self.name}] -> CLOSED (recovered)")
+        self._failures  = 0
+        self._state     = "CLOSED"
+        self._opened_at = None
+
+    def record_failure(self):
+        self._failures += 1
+        if self._state == "HALF_OPEN":
+            self._state     = "OPEN"
+            self._opened_at = time.monotonic()
+            logging.warning(
+                f"CircuitBreaker [{self.name}] probe failed -> OPEN "
+                f"(retry in {self.BACKOFF_SECONDS}s)")
+        elif self._failures >= self.FAILURE_THRESHOLD and self._state == "CLOSED":
+            self._state     = "OPEN"
+            self._opened_at = time.monotonic()
+            logging.warning(
+                f"CircuitBreaker [{self.name}] tripped after {self._failures} failures "
+                f"-> OPEN (retry in {self.BACKOFF_SECONDS}s)")
+
+
 # ==================== POSITION CACHE ====================
 @dataclass
 class CacheEntry:
@@ -230,10 +306,6 @@ class OrderbookCache:
         self._cache[token_id] = CacheEntry(data=(mid, best_ask))
 
     def get_bid(self, token_id: str) -> Optional[float]:
-        """Returns cached best_ask as a bid proxy (same fetch), or None."""
-        cached = self.get(token_id)
-        # orderbook cache stores (mid, best_ask); best bid needs a separate fetch
-        # but we also store bid separately when fetched for sells
         entry = self._cache.get(token_id)
         if entry and entry.is_fresh(self._ttl) and len(entry.data) == 3:
             return entry.data[2]
@@ -328,7 +400,6 @@ class MarketDataManager:
                 f"type={event_type} — debounce {WS_DEBOUNCE_SECONDS}s"
             )
             self._debounce_task = asyncio.create_task(self._debounce_wake())
-        # else: debounce already ticking — this event is coalesced silently
 
     async def connect_user(self, wallet_addresses: list):
         uri        = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
@@ -975,6 +1046,12 @@ class CopyTrader:
         self._pos_cache: PositionCache   = PositionCache(ttl=POSITION_CACHE_TTL)
         self._ob_cache:  OrderbookCache  = OrderbookCache(ttl=ORDERBOOK_CACHE_TTL)
 
+        # One circuit breaker per watched wallet
+        self._breakers: Dict[str, CircuitBreaker] = {
+            addr: CircuitBreaker(cfg["name"])
+            for addr, cfg in WALLETS.items()
+        }
+
         logging.info(f"CopyTrader started | mode={'DRY RUN' if dry_run else 'LIVE'}")
         logging.info(
             f"Watching {len(WALLETS)} wallets | max_positions={MAX_POSITIONS} | "
@@ -1053,19 +1130,16 @@ class CopyTrader:
             best_bid = float(bids[0]["price"]) if bids else 0.0
             best_ask = float(asks[0]["price"]) if asks else 0.0
             mid      = (best_bid + best_ask) / 2 if best_bid and best_ask else best_bid or best_ask
-            # Store full (mid, ask, bid) so _get_best_bid can reuse the same entry
             self._ob_cache.set_full(token_id, mid, best_ask, best_bid)
             return mid, best_ask
         return 0.0, 0.0
 
     async def _get_best_bid(self, token_id: str) -> float:
         """Returns best bid price. Reuses cached orderbook when fresh."""
-        # Try full cache entry first
         entry = self._ob_cache._cache.get(token_id)
         if entry and entry.is_fresh(ORDERBOOK_CACHE_TTL) and len(entry.data) == 3:
-            return entry.data[2]   # (mid, ask, bid)[2]
+            return entry.data[2]
 
-        # Fall back to a fresh fetch (also populates cache for mid/ask)
         data = await self._get(f"https://clob.polymarket.com/book?token_id={token_id}")
         if data:
             bids     = data.get("bids", [])
@@ -1083,7 +1157,7 @@ class CopyTrader:
     async def _get_positions(self, wallet_addr: str) -> Optional[list]:
         """
         Returns positions for wallet_addr.
-        Returns cached data if it is still within POSITION_CACHE_TTL seconds old,
+        Returns cached data if still within POSITION_CACHE_TTL seconds old,
         otherwise fetches fresh data and updates the cache.
         """
         cached = self._pos_cache.get(wallet_addr)
@@ -1161,7 +1235,7 @@ class CopyTrader:
                     shares_at_open=shares, source_shares_at_open=pending.source_shares,
                 )
                 del self.pending[pos_key]
-                logging.info(f"LIMIT BUY FILLED → position open | {pending.question[:40]} @ {pending.limit_price:.4f}")
+                logging.info(f"LIMIT BUY FILLED -> position open | {pending.question[:40]} @ {pending.limit_price:.4f}")
                 continue
 
             age = (datetime.now() - pending.placed_at).total_seconds()
@@ -1170,7 +1244,6 @@ class CopyTrader:
                 self.executor.cancel_order(pending.order_id)
                 del self.pending[pos_key]
 
-                # Orderbook cache will serve fresh price on retry if available
                 mid_price, best_ask = await self._get_orderbook(pending.token_id)
                 if best_ask <= 0 and mid_price <= 0:
                     logging.info(f"No orderbook on retry — skipping {pending.question[:40]}")
@@ -1199,6 +1272,10 @@ class CopyTrader:
 
     # ------------------------------------------------------------------
     # Sell execution
+    # FIX 1: time.sleep replaced with await asyncio.sleep so the event
+    # loop is never blocked during the settle window. The sleep and the
+    # second balance fetch are moved outside _trade_lock because a
+    # threading lock must not be held across an await.
     # ------------------------------------------------------------------
     async def _execute_sell(
         self,
@@ -1219,17 +1296,20 @@ class CopyTrader:
             ok       = True
             order_id = f"dry-sell-{int(time.time())}"
         else:
-            # _get_best_bid reuses orderbook cache if fresh (3s TTL)
             best_bid  = await self._get_best_bid(position.token_id)
             min_price = round(best_bid * (1 - MAX_SLIPPAGE), 4) if best_bid > 0 else 0.0
 
             pending_costs_before: Dict[str, float] = {pk: p.size_usd for pk, p in self.pending.items()}
 
+            # Acquire lock only for the synchronous place_sell call.
             with _trade_lock:
                 balance_before = self.balance.get_balance(force=True) or 0.0
                 ok, order_id   = self.executor.place_sell(position.token_id, shares_to_sell, min_price=min_price)
-                if ok:
-                    time.sleep(SELL_SETTLE_WAIT)
+
+            # Await outside the lock — the lock must not be held across an await.
+            if ok:
+                await asyncio.sleep(SELL_SETTLE_WAIT)
+                with _trade_lock:
                     balance_after = self.balance.get_balance(force=True) or 0.0
 
             if ok:
@@ -1251,7 +1331,7 @@ class CopyTrader:
             position.pnl        = pnl
             if pnl > 0:
                 compounding_bankroll += pnl * COMPOUNDING_RATE
-                logging.info(f"Compounding profit: +${pnl * COMPOUNDING_RATE:.4f} → ${compounding_bankroll:.2f}")
+                logging.info(f"Compounding profit: +${pnl * COMPOUNDING_RATE:.4f} -> ${compounding_bankroll:.2f}")
             logging.info(
                 f"[{name}] FULL SELL ({'DRY RUN' if self.dry_run else 'LIVE'}) | "
                 f"{position.question[:40]} | exit={exit_price:.4f} pnl=${pnl:.4f}")
@@ -1263,13 +1343,17 @@ class CopyTrader:
             position.source_shares = current_source_shares
             if pnl > 0:
                 compounding_bankroll += pnl * COMPOUNDING_RATE
-                logging.info(f"Compounding profit (partial): +${pnl * COMPOUNDING_RATE:.4f} → ${compounding_bankroll:.2f}")
+                logging.info(f"Compounding profit (partial): +${pnl * COMPOUNDING_RATE:.4f} -> ${compounding_bankroll:.2f}")
             logging.info(
                 f"[{name}] PARTIAL SELL ({'DRY RUN' if self.dry_run else 'LIVE'}) | "
                 f"{position.question[:40]} | sold={shares_to_sell:.4f} pnl=${pnl:.4f} remaining={position.shares:.4f}")
 
     # ------------------------------------------------------------------
     # Per-wallet scan
+    # FIX 4: Circuit breaker gates each wallet fetch. A wallet that
+    # fails FAILURE_THRESHOLD times consecutively trips OPEN and is
+    # skipped until BACKOFF_SECONDS have elapsed, then probed once.
+    # New buys are also blocked while a breaker is not CLOSED.
     # ------------------------------------------------------------------
     async def _scan_wallet(
         self,
@@ -1280,20 +1364,32 @@ class CopyTrader:
         Fetches (or returns cached) positions for one wallet.
         Returns (wallet_addr, raw_positions, source_token_ids, source_shares_map).
         """
-        raw = await self._get_positions(wallet_addr)
-        if raw is None:
+        breaker = self._breakers[wallet_addr]
+
+        if not breaker.allow_request():
+            logging.warning(
+                f"[{config['name']}] CircuitBreaker OPEN — skipping fetch "
+                f"(retries in ~{CircuitBreaker.BACKOFF_SECONDS}s)")
             return wallet_addr, None, set(), {}
+
+        data = await self._get_positions(wallet_addr)
+
+        if data is None:
+            breaker.record_failure()
+            return wallet_addr, None, set(), {}
+
+        breaker.record_success()
 
         source_token_ids:   set              = set()
         source_shares_map:  Dict[str, float] = {}
-        for pos in raw:
+        for pos in data:
             tid    = pos.get("asset", "")
             shares = float(pos.get("size", pos.get("shares", 0)))
             if tid and shares > 0:
                 source_token_ids.add(tid)
                 source_shares_map[tid] = shares
 
-        return wallet_addr, raw, source_token_ids, source_shares_map
+        return wallet_addr, data, source_token_ids, source_shares_map
 
     # ------------------------------------------------------------------
     # Main scan loop
@@ -1358,69 +1454,73 @@ class CopyTrader:
 
             logging.info(f"[{name}] {len(raw)} position(s) from API, {len(source_token_ids)} active")
 
-            # ---- BUY LOOP ----
-            for pos in raw:
-                token_id              = pos.get("asset", "")
-                market_id             = pos.get("conditionId", "")
-                question              = pos.get("title", "Unknown")
-                outcome               = pos.get("outcome", "YES")
-                size_usd              = float(pos.get("currentValue", 0))
-                source_shares_at_copy = float(pos.get("size", pos.get("shares", 0)))
+            # ---- BUY LOOP — skipped if circuit breaker is not CLOSED ----
+            if self._breakers[wallet_addr].state != "CLOSED":
+                logging.info(f"[{name}] Skipping buy loop — circuit breaker not CLOSED")
+                source_token_ids_by_wallet[wallet_addr] = source_token_ids
+            else:
+                for pos in raw:
+                    token_id              = pos.get("asset", "")
+                    market_id             = pos.get("conditionId", "")
+                    question              = pos.get("title", "Unknown")
+                    outcome               = pos.get("outcome", "YES")
+                    size_usd              = float(pos.get("currentValue", 0))
+                    source_shares_at_copy = float(pos.get("size", pos.get("shares", 0)))
 
-                min_value = 0.0 if config.get("copy_sub_dollar") else 1.0
-                if not token_id or size_usd < min_value or size_usd <= 0:
-                    continue
+                    min_value = 0.0 if config.get("copy_sub_dollar") else 1.0
+                    if not token_id or size_usd < min_value or size_usd <= 0:
+                        continue
 
-                pos_key = f"{wallet_addr}_{token_id}"
-                if self.seen.is_seen(pos_key) or pos_key in self.positions or pos_key in self.pending:
-                    continue
+                    pos_key = f"{wallet_addr}_{token_id}"
+                    if self.seen.is_seen(pos_key) or pos_key in self.positions or pos_key in self.pending:
+                        continue
 
-                if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
-                    logging.info("Global max positions reached — skipping new entries")
-                    break
+                    if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
+                        logging.info("Global max positions reached — skipping new entries")
+                        break
 
-                wallet_open    = sum(1 for p in self.positions.values() if p.source_wallet == wallet_addr)
-                wallet_pending = sum(1 for p in self.pending.values()   if p.source_wallet == wallet_addr)
-                wallet_max     = config.get("max_positions", MAX_POSITIONS)
-                if wallet_open + wallet_pending >= wallet_max:
-                    logging.info(f"[{name}] wallet cap ({wallet_open}+{wallet_pending}>={wallet_max})")
-                    break
+                    wallet_open    = sum(1 for p in self.positions.values() if p.source_wallet == wallet_addr)
+                    wallet_pending = sum(1 for p in self.pending.values()   if p.source_wallet == wallet_addr)
+                    wallet_max     = config.get("max_positions", MAX_POSITIONS)
+                    if wallet_open + wallet_pending >= wallet_max:
+                        logging.info(f"[{name}] wallet cap ({wallet_open}+{wallet_pending}>={wallet_max})")
+                        break
 
-                cur_price = market_data.get_current_price(token_id) or float(pos.get("curPrice", 0))
-                if cur_price <= 0:
-                    logging.info(f"[{name}] SKIP no price | {question[:40]}")
-                    continue
+                    cur_price = market_data.get_current_price(token_id) or float(pos.get("curPrice", 0))
+                    if cur_price <= 0:
+                        logging.info(f"[{name}] SKIP no price | {question[:40]}")
+                        continue
 
-                limit_price = round(cur_price, 4)
+                    limit_price = round(cur_price, 4)
 
-                if config.get("copy_sub_dollar") and size_usd < 1.0:
-                    my_size = round(size_usd, 2)
-                else:
-                    risk_pct = self.get_risk_percent(limit_price, config)
-                    my_size  = round(
-                        min(compounding_bankroll * risk_pct, self._available_balance() * 0.95), 2)
+                    if config.get("copy_sub_dollar") and size_usd < 1.0:
+                        my_size = round(size_usd, 2)
+                    else:
+                        risk_pct = self.get_risk_percent(limit_price, config)
+                        my_size  = round(
+                            min(compounding_bankroll * risk_pct, self._available_balance() * 0.95), 2)
 
-                if my_size <= 0 or not self._can_afford(my_size):
-                    logging.warning(f"[{name}] Skipping {question[:40]} — cannot afford ${my_size:.2f}")
-                    continue
+                    if my_size <= 0 or not self._can_afford(my_size):
+                        logging.warning(f"[{name}] Skipping {question[:40]} — cannot afford ${my_size:.2f}")
+                        continue
 
-                ok, order_id, actual_price = self.executor.place_limit_buy(token_id, my_size, limit_price)
-                if ok:
-                    self.seen.mark_seen(pos_key)
-                    await market_data.subscribe_tokens([token_id])
-                    self.pending[pos_key] = PendingLimitBuy(
-                        pos_key=pos_key, token_id=token_id, market_id=market_id,
-                        question=question, outcome=outcome,
-                        source_wallet=wallet_addr, source_name=name,
-                        limit_price=actual_price, size_usd=my_size,
-                        order_id=order_id, source_shares=source_shares_at_copy,
-                    )
-                    logging.info(
-                        f"[{name}] LIMIT BUY PLACED | {question[:40]} | "
-                        f"${my_size:.2f} @ {actual_price:.4f} "
-                        f"(avail=${self._available_balance():.2f} curPrice={cur_price:.4f})")
+                    ok, order_id, actual_price = self.executor.place_limit_buy(token_id, my_size, limit_price)
+                    if ok:
+                        self.seen.mark_seen(pos_key)
+                        await market_data.subscribe_tokens([token_id])
+                        self.pending[pos_key] = PendingLimitBuy(
+                            pos_key=pos_key, token_id=token_id, market_id=market_id,
+                            question=question, outcome=outcome,
+                            source_wallet=wallet_addr, source_name=name,
+                            limit_price=actual_price, size_usd=my_size,
+                            order_id=order_id, source_shares=source_shares_at_copy,
+                        )
+                        logging.info(
+                            f"[{name}] LIMIT BUY PLACED | {question[:40]} | "
+                            f"${my_size:.2f} @ {actual_price:.4f} "
+                            f"(avail=${self._available_balance():.2f} curPrice={cur_price:.4f})")
 
-            source_token_ids_by_wallet[wallet_addr] = source_token_ids
+                source_token_ids_by_wallet[wallet_addr] = source_token_ids
 
             # Update current prices
             cur_price_map = {
@@ -1436,7 +1536,7 @@ class CopyTrader:
                 elif cur_price_map.get(_pos.token_id, 0) > 0:
                     _pos.current_price = cur_price_map[_pos.token_id]
 
-            # ---- SELL LOOP ----
+            # ---- SELL LOOP — runs regardless of circuit breaker state ----
             for pos_key, position in list(self.positions.items()):
                 if position.source_wallet != wallet_addr or position.status != "open":
                     continue
@@ -1446,7 +1546,7 @@ class CopyTrader:
                 if current_source_shares > position.source_shares_at_open:
                     logging.info(
                         f"[{name}] Source ADDED shares "
-                        f"{position.source_shares_at_open:.4f} → {current_source_shares:.4f} | "
+                        f"{position.source_shares_at_open:.4f} -> {current_source_shares:.4f} | "
                         f"{position.question[:40]}")
                     position.source_shares_at_open = current_source_shares
                     position.source_shares         = current_source_shares
@@ -1494,21 +1594,27 @@ class CopyTrader:
                 for p in self.pending.values():
                     wallet_counts[p.source_name] = wallet_counts.get(p.source_name, 0) + 1
                 slot_summary = " | ".join(f"{n}={c}" for n, c in wallet_counts.items()) or "none"
+
+                # Show circuit breaker states in heartbeat
+                breaker_summary = " | ".join(
+                    f"{cfg['name']}={self._breakers[addr].state}"
+                    for addr, cfg in WALLETS.items()
+                )
                 logging.info(
                     f"Heartbeat | {status} | balance=${self.balance.cached_balance or 0:.2f} | "
                     f"available=${self._available_balance():.2f} | "
                     f"compounding=${compounding_bankroll:.2f} | "
                     f"slots=[{slot_summary}] total={len(self.positions)+len(self.pending)}/{MAX_POSITIONS} | "
-                    f"seen={len(self.seen._seen)} | storage={self.seen.backend}")
+                    f"seen={len(self.seen._seen)} | storage={self.seen.backend} | "
+                    f"breakers=[{breaker_summary}]")
                 last_heartbeat = now
 
-            # Wake on activity WS event (debounced) OR poll timeout — whichever is first
             market_data.activity_event.clear()
             try:
                 await asyncio.wait_for(market_data.activity_event.wait(), timeout=POLL_INTERVAL)
                 logging.info("⚡ Activity event — running early scan")
             except asyncio.TimeoutError:
-                pass  # Normal 15s poll cycle
+                pass
 
 
 # ==================== ENTRY POINT ====================
