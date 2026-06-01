@@ -3,6 +3,7 @@
 MULTI-WALLET COPY TRADER - PRODUCTION READY (HIGH-PERFORMANCE HFT VARIANT)
 
 Integrates:
+  - Live Polymarket CLOB V2 Client SDK Constructor Arguments (Fixed Keyword Arguments)
   - Live Polymarket CLOB V2 Balance Checking Layer (Fixed from mock values)
   - Accurate Cents-Value Rendering (¢) inside the original dashboard design
   - Pre-Warmed Network Pipelines (Persistent keep-alive sockets)
@@ -489,7 +490,6 @@ def build_dashboard(bot) -> dict:
     def _cls(v):  return "pos" if v > 0 else ("neg" if v < 0 else "neu")
     def _fmt(v):  return f"{abs(v):.4f}" if abs(v) < 0.005 else f"{abs(v):.2f}"
 
-    # Use lock to snapshot positions dynamically, preventing runtime state changes during execution
     with _trade_lock:
         active_positions = list(bot.positions.values())
         closed_list = list(getattr(bot, "closed_positions", []))
@@ -514,7 +514,6 @@ def build_dashboard(bot) -> dict:
         outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
         pnl_str     = f"{_sign(unreal)}${_fmt(unreal)}"
         
-        # Format Entry and Current prices into explicit Polymarket Cents (¢) values
         entry_cents_str = f"{p.entry_price * 100:.1f}¢"
         cur_cents_str   = f"{mid * 100:.1f}¢" if mid > 0 else "—"
         
@@ -544,7 +543,6 @@ def build_dashboard(bot) -> dict:
         outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
         pnl_str     = f"{_sign(p.pnl)}${_fmt(p.pnl)}"
         
-        # Format closed historical execution rows into explicit Polymarket Cents (¢) values
         entry_cents_str = f"{p.entry_price * 100:.1f}¢"
         exit_cents_str  = f"{p.exit_price * 100:.1f}¢"
         
@@ -821,14 +819,16 @@ class CopyTraderBot:
         self.clob_client = None
         if CLOB_AVAILABLE and YOUR_PRIVATE_KEY and POLY_API_KEY:
             try:
+                # Correct keyword arguments for Polymarket CLOB V2 Client SDK (v2 schema)
                 self.clob_client = ClobClient(
-                    api_url="https://clob.polymarket.com",
+                    host="https://clob.polymarket.com",
+                    chain_id=137,  # Polygon mainnet
+                    key=YOUR_PRIVATE_KEY,
                     creds=ApiCreds(
                         api_key=POLY_API_KEY,
-                        secret=POLY_SECRET,
-                        passphrase=POLY_PASSPHRASE
-                    ),
-                    private_key=YOUR_PRIVATE_KEY
+                        api_secret=POLY_SECRET,
+                        api_passphrase=POLY_PASSPHRASE
+                    )
                 )
                 logging.info("✅ Live Polymarket CLOB V2 Client interface initialized successfully.")
             except Exception as e:
