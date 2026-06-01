@@ -374,15 +374,17 @@ class CopyTrader:
 
     def _get_positions(self, wallet_addr: str) -> Optional[list]:
         """
-        Fetches live raw profile metadata positions of target copy addresses via CLOB API.
+        Fetches active token positions via standard CLOB REST interface.
         """
-        url = f"https://clob.polymarket.com/profile?address={wallet_addr}"
+        url = f"https://clob.polymarket.com/positions?user={wallet_addr}"
         for attempt in range(3):
             try:
                 resp = requests.get(url, timeout=10)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("positions", [])
+                    return resp.json()
+                elif resp.status_code == 404:
+                    # Explicit mapping for inactive accounts or zero position profiles
+                    return []
                 else:
                     logging.warning(f"[_get_positions] HTTP {resp.status_code} on {wallet_addr[:10]}")
             except Exception as e:
@@ -450,7 +452,6 @@ class CopyTrader:
         current_bal = self.balance.get_balance()
         if current_bal is None: return
 
-        # Sync down local processing chains
         self.clean_expired_limit_orders()
         self.process_pending_fills()
 
@@ -463,15 +464,19 @@ class CopyTrader:
                 logging.warning(f"[{config['name']}] Failed to fetch positions from API.")
                 continue
 
-            source_token_ids = {pos.get("asset") for pos in raw if pos.get("asset") and float(pos.get("size", pos.get("shares", 0))) > 0}
+            # Normalized structural check matching fallback definitions (asset vs asset_id properties)
+            source_token_ids = {
+                pos.get("asset") or pos.get("asset_id") 
+                for pos in raw 
+                if (pos.get("asset") or pos.get("asset_id")) and float(pos.get("size", pos.get("shares", 0))) > 0
+            }
             logging.info(f"[{config['name']}] {len(raw)} position(s) from API, {len(source_token_ids)} with active tokens")
 
-            # Warm initial snapshot states if deploying into 'new_only' environments
             if wallet_addr not in self._first_scan_done:
                 if config.get("copy_mode") == "new_only":
                     pre_existing = []
                     for pos in raw:
-                        asset_id = pos.get("asset")
+                        asset_id = pos.get("asset") or pos.get("asset_id")
                         side = pos.get("side", "YES").upper()
                         if asset_id:
                             pre_existing.append(f"{wallet_addr.lower()}_{asset_id}_{side}")
@@ -479,7 +484,7 @@ class CopyTrader:
                 self._first_scan_done.add(wallet_addr)
 
             for pos in raw:
-                token_id  = pos.get("asset")
+                token_id  = pos.get("asset") or pos.get("asset_id")
                 shares    = float(pos.get("size", pos.get("shares", 0)))
                 side      = pos.get("side", "YES").upper()
                 market_id = pos.get("conditionId", "unknown")
@@ -494,7 +499,6 @@ class CopyTrader:
                     logging.warning(f"Position limit max reached ({MAX_POSITIONS}) — Skipping buy trade execution.")
                     continue
 
-                # Sizing configuration matrices
                 if config.get("risk_type") == "fixed":
                     my_size = cfg.compounding_bankroll * config.get("fixed_risk", 0.025)
                 else:
@@ -529,8 +533,11 @@ class CopyTrader:
 
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
 
-            # Track live markup evaluations for accounting dashboards
-            cur_price_map = {pos.get("asset"): float(pos.get("curPrice", 0)) for pos in raw if pos.get("asset") and float(pos.get("curPrice", 0)) > 0}
+            cur_price_map = {
+                (pos.get("asset") or pos.get("asset_id")): float(pos.get("curPrice", 0)) 
+                for pos in raw 
+                if (pos.get("asset") or pos.get("asset_id")) and float(pos.get("curPrice", 0)) > 0
+            }
             for _pk, _pos in self.positions.items():
                 if _pos.source_wallet == wallet_addr and _pos.token_id in cur_price_map:
                     _pos.current_price = cur_price_map[_pos.token_id]
