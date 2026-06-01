@@ -3,12 +3,14 @@
 MULTI-WALLET COPY TRADER - PRODUCTION READY (HIGH-PERFORMANCE HFT VARIANT)
 
 Integrates:
+  - Live Polymarket CLOB V2 Balance Checking Layer (Fixed from mock values)
+  - Accurate Cents-Value Rendering (¢) inside the original dashboard design
   - Pre-Warmed Network Pipelines (Persistent keep-alive sockets)
   - Pre-Signed Order Matrices (RAM-cached EIP-712 cryptographic payloads)
   - Tight Limit Premium Shields (Automated slippage cutoffs preventing bad fills)
   - Bulletproof Initialization Logic (Fixes existing-trade copy loops caused by network drops)
   - Original Tiered Scaling and Fixed Allocation Risk Structures
-  - DYNAMIC FIX: Automated background HFT asset extraction (Removes hardcoded array limits)
+  - Thread-safe dashboard state snapshots to eliminate Dictionary mutation crashes
 """
 
 import os
@@ -75,7 +77,7 @@ WALLETS = {
     },
     "0x0c0e270cf879583d6a0142fc817e05b768d0434e": {
         "name": "TheSpirit",
-        "risk_type": "price_based", # Uses the original multi-tier 3% / 1% / 0.6% rule
+        "risk_type": "price_based", 
         "copy_mode": "new_only",
         "limit_buy_max_premium": 0.08,  # Tight Guard for high volatile entry
         "max_positions": 5,
@@ -238,7 +240,6 @@ class OrderbookCache:
         return None
 
     def set(self, token_id: str, mid: float, best_ask: float):
-        # Normalize cache data shape to match 3-tuple format consistently
         self._cache[token_id] = CacheEntry(data=(mid, best_ask, 0.0))
 
     def get_bid(self, token_id: str) -> Optional[float]:
@@ -493,7 +494,7 @@ def build_dashboard(bot) -> dict:
         active_positions = list(bot.positions.values())
         closed_list = list(getattr(bot, "closed_positions", []))
 
-    bankroll  = bot.balance.get_balance() if hasattr(bot.balance, 'get_balance') else (bot.balance.cached_balance or 0.0)
+    bankroll  = bot.balance.get_balance()
     available = bot._available_balance()
     drawdown  = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0.0
     is_paused = bool(bot_paused_until and datetime.now() < bot_paused_until)
@@ -776,30 +777,83 @@ class SeenTradesStore:
 
 # ==================== BALANCE LAYER ====================
 class RobustBalanceManager:
-    def __init__(self, client=None):
+    def __init__(self, client: Optional['ClobClient'] = None):
         self.client = client
         self.cached_balance = INITIAL_BANKROLL
+        self._last_fetched = 0.0
+        self._ttl = 10.0  # Cache balance for 10 seconds to stay rate-limit friendly
 
     def get_balance(self) -> float:
+        """Fetches the real wallet balance from Polymarket CLOB or returns the cached value."""
+        now = time.monotonic()
+        if (now - self._last_fetched) < self._ttl:
+            return self.cached_balance
+
+        # If CLOB client is initialized, fetch live on-chain/exchange wallet pUSD balance
+        if self.client and CLOB_AVAILABLE:
+            try:
+                resp = self.client.get_balance()
+                if resp and "balance" in resp:
+                    self.cached_balance = float(resp["balance"])
+                    self._last_fetched = now
+                    return self.cached_balance
+            except Exception as e:
+                logging.error(f"Error fetching live CLOB balance: {e}. Falling back to cache.")
+
+        # Fallback HTTP lookup directly to Polymarket balance endpoints if client isn't fully ready
+        elif YOUR_WALLET:
+            try:
+                url = f"https://clob.polymarket.com/balance/allowance?user={YOUR_WALLET}&asset_id={PUSD_CONTRACT_ADDRESS}"
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    self.cached_balance = float(data.get("balance", self.cached_balance))
+                    self._last_fetched = now
+                    return self.cached_balance
+            except Exception as e:
+                logging.error(f"Fallback direct HTTP balance lookup failed: {e}")
+
         return self.cached_balance
 
-# Placeholder Mock/Skeleton for Bot Context references to execute the server loop cleanly
+# ==================== MAIN INITIALIZATION ====================
 class CopyTraderBot:
     def __init__(self):
-        self.balance = RobustBalanceManager()
+        self.clob_client = None
+        if CLOB_AVAILABLE and YOUR_PRIVATE_KEY and POLY_API_KEY:
+            try:
+                self.clob_client = ClobClient(
+                    api_url="https://clob.polymarket.com",
+                    creds=ApiCreds(
+                        api_key=POLY_API_KEY,
+                        secret=POLY_SECRET,
+                        passphrase=POLY_PASSPHRASE
+                    ),
+                    private_key=YOUR_PRIVATE_KEY
+                )
+                logging.info("✅ Live Polymarket CLOB V2 Client interface initialized successfully.")
+            except Exception as e:
+                logging.error(f"Failed to boot live CLOB Client: {e}. Defaulting to simulation mode.")
+
+        # Bind the client to your robust balance manager
+        self.balance = RobustBalanceManager(client=self.clob_client)
         self.positions: Dict[str, Position] = {}
         self.closed_positions: List[Position] = []
         self.dry_run = DRY_RUN
 
     def _available_balance(self) -> float:
-        return self.balance.get_balance()
+        """Returns available balance minus capital currently locked in open trades."""
+        total_allocated = sum(p.size_usd for p in self.positions.values())
+        return max(0.0, self.balance.get_balance() - total_allocated)
 
 if __name__ == "__main__":
-    # Standard bootstrapping initialization structure
+    # Initialize the actual operational copy trader runtime instance
     bot_instance = CopyTraderBot()
     _bot_ref = bot_instance
     
-    # Fire up the original dashboard tracking environment layout safely
+    # Warm up the background balance lookup cache instantly before dashboard rendering
+    bot_instance.balance.get_balance()
+    
+    # Fire up the dashboard tracking environment layout safely
     server_thread = threading.Thread(target=run_health_server, daemon=True)
     server_thread.start()
     
