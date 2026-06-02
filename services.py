@@ -4,9 +4,11 @@ import json
 import time
 import asyncio
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, Set, Tuple, Optional, Callable, Awaitable
 from dataclasses import dataclass, field
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import config as cfg
 
@@ -220,7 +222,6 @@ class RobustBalanceManager:
         return 0.0
 
     def get_balance(self, force=False) -> Optional[float]:
-        # In dry run mode, return the tracked simulation virtual balance
         if self.dry_run and self.virtual_balance is not None:
             cfg.compounding_bankroll = self.virtual_balance
             return self.virtual_balance
@@ -231,7 +232,6 @@ class RobustBalanceManager:
                 self.cached_balance = real
                 self.last_update    = time.time()
                 
-                # Dynamic Live Compounding Sync
                 cfg.compounding_bankroll = real
                 
                 if self.dry_run and self.virtual_balance is None:
@@ -469,7 +469,6 @@ class CopyTrader:
         if WEBSOCKETS_AVAILABLE:
             self._ws_listener = PolymarketWSListener(token_ids=self._ws_tracked, ws_price_queue=self._ws_price_queue, on_trade_callback=self._on_ws_signal)
         
-        # Pull baseline balance immediately to accurately seed structural compounding
         try:
             self.balance.get_balance(force=True)
         except Exception as e:
@@ -550,3 +549,25 @@ class CopyTrader:
             except Exception:
                 time.sleep(1)
         return 0.0, 0.50
+
+# ==================== RENDER COMPLIANT HEALTH SERVER ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ('/health', '/'):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return  # Silences background request logging to clean up your logs
+
+def run_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logging.info(f"🚀 Render health check endpoint activated on port {port}")
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
