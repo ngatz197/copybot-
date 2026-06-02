@@ -258,7 +258,7 @@ class PolymarketExecutor:
 
 # ==================== WEBSOCKET LISTENER ====================
 class PolymarketWSListener:
-    WS_URL         = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+    WS_URL         = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     PING_INTERVAL  = 20
     RECONNECT_BASE =  2
     RECONNECT_MAX  = 60
