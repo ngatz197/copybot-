@@ -36,6 +36,13 @@ except ImportError:
     PSYCOPG2_AVAILABLE = False
     logging.warning("psycopg2 not installed — seen_trades will fall back to local file.")
 
+try:
+    from web3 import Web3
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
+    logging.warning("web3 not installed — calldata decoding disabled. Run: pip install web3")
+
 # Global environment overrides or fallbacks
 YOUR_PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 YOUR_WALLET      = os.getenv("DEPOSIT_WALLET_ADDRESS", "")
@@ -359,6 +366,176 @@ class PolymarketExecutor:
                 time.sleep(RETRY_DELAY)
         return False, ""
 
+# ==================== CALLDATA DECODER ====================
+EXCHANGE_CONTRACT = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+
+EXCHANGE_ABI = [
+    {
+        "name": "fillOrder", "type": "function",
+        "inputs": [
+            {"name": "order", "type": "tuple", "components": [
+                {"name": "salt",          "type": "uint256"},
+                {"name": "maker",         "type": "address"},
+                {"name": "signer",        "type": "address"},
+                {"name": "taker",         "type": "address"},
+                {"name": "tokenId",       "type": "uint256"},
+                {"name": "makerAmount",   "type": "uint256"},
+                {"name": "takerAmount",   "type": "uint256"},
+                {"name": "expiration",    "type": "uint256"},
+                {"name": "nonce",         "type": "uint256"},
+                {"name": "feeRateBps",    "type": "uint256"},
+                {"name": "side",          "type": "uint8"},
+                {"name": "signatureType", "type": "uint8"},
+            ]},
+            {"name": "fillAmount", "type": "uint256"},
+            {"name": "signature",  "type": "bytes"},
+        ],
+    },
+    {
+        "name": "matchOrders", "type": "function",
+        "inputs": [
+            {"name": "takerOrder", "type": "tuple", "components": [
+                {"name": "salt",          "type": "uint256"},
+                {"name": "maker",         "type": "address"},
+                {"name": "signer",        "type": "address"},
+                {"name": "taker",         "type": "address"},
+                {"name": "tokenId",       "type": "uint256"},
+                {"name": "makerAmount",   "type": "uint256"},
+                {"name": "takerAmount",   "type": "uint256"},
+                {"name": "expiration",    "type": "uint256"},
+                {"name": "nonce",         "type": "uint256"},
+                {"name": "feeRateBps",    "type": "uint256"},
+                {"name": "side",          "type": "uint8"},
+                {"name": "signatureType", "type": "uint8"},
+            ]},
+            {"name": "makerOrders", "type": "tuple[]", "components": [
+                {"name": "salt",          "type": "uint256"},
+                {"name": "maker",         "type": "address"},
+                {"name": "signer",        "type": "address"},
+                {"name": "taker",         "type": "address"},
+                {"name": "tokenId",       "type": "uint256"},
+                {"name": "makerAmount",   "type": "uint256"},
+                {"name": "takerAmount",   "type": "uint256"},
+                {"name": "expiration",    "type": "uint256"},
+                {"name": "nonce",         "type": "uint256"},
+                {"name": "feeRateBps",    "type": "uint256"},
+                {"name": "side",          "type": "uint8"},
+                {"name": "signatureType", "type": "uint8"},
+            ]},
+            {"name": "fillAmounts", "type": "uint256[]"},
+            {"name": "signatures",  "type": "bytes[]"},
+        ],
+    },
+]
+
+class CalldataDecoder:
+    """
+    Watches Polygon for on-chain trades made by tracked wallets by fetching
+    recent transactions via Polygonscan and decoding their calldata with web3.py.
+    Gives ~10-30s earlier signal than the REST API position poll.
+    Requires: pip install web3
+    Optional: POLYGONSCAN_API_KEY in .env for higher rate limits.
+    """
+    POLYGON_RPCS = [
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://polygon.llamarpc.com",
+        "https://polygon.drpc.org",
+    ]
+
+    def __init__(self):
+        self._w3       = None
+        self._contract = None
+        if not WEB3_AVAILABLE:
+            logging.warning("CalldataDecoder disabled — web3 not installed.")
+            return
+        self._connect()
+
+    def _connect(self):
+        for rpc in self.POLYGON_RPCS:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                if w3.is_connected():
+                    self._w3 = w3
+                    self._contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(EXCHANGE_CONTRACT),
+                        abi=EXCHANGE_ABI,
+                    )
+                    logging.info(f"✅ CalldataDecoder connected via {rpc}")
+                    return
+            except Exception as e:
+                logging.warning(f"CalldataDecoder RPC failed ({rpc}): {e}")
+        logging.error("❌ CalldataDecoder: no Polygon RPC available — calldata decoding disabled.")
+
+    def _parse_order(self, order, fill_amount: int) -> dict:
+        token_id     = str(order["tokenId"])
+        maker_amount = order["makerAmount"] / 1e6   # pUSD = 6 decimals
+        taker_amount = order["takerAmount"] / 1e6
+        side_int     = order["side"]                 # 0 = BUY, 1 = SELL
+        maker_addr   = order["maker"].lower()
+        # Price: for a BUY the maker spends pUSD (makerAmount) to receive shares (takerAmount)
+        if side_int == 0 and taker_amount > 0:
+            price = maker_amount / taker_amount
+        elif side_int == 1 and maker_amount > 0:
+            price = taker_amount / maker_amount
+        else:
+            price = 0.0
+        return {
+            "token_id":     token_id,
+            "side":         "BUY" if side_int == 0 else "SELL",
+            "maker":        maker_addr,
+            "maker_amount": maker_amount,
+            "taker_amount": taker_amount,
+            "fill_amount":  fill_amount / 1e6,
+            "price":        round(price, 6),
+        }
+
+    def decode_tx(self, tx_hash: str) -> Optional[dict]:
+        """
+        Fetch a single transaction from Polygon and decode its calldata.
+        Returns a parsed trade dict or None if the tx is not a recognised exchange call.
+        """
+        if not self._w3:
+            return None
+        try:
+            tx = self._w3.eth.get_transaction(tx_hash)
+            if not tx.get("to") or tx["to"].lower() != EXCHANGE_CONTRACT.lower():
+                return None
+            fn, args = self._contract.decode_function_input(tx["input"])
+            if fn.fn_name == "fillOrder":
+                return self._parse_order(args["order"], args.get("fillAmount", 0))
+            elif fn.fn_name == "matchOrders":
+                # takerOrder is the initiating (copied) trade
+                return self._parse_order(args["takerOrder"], args.get("fillAmounts", [0])[0])
+        except Exception as e:
+            logging.debug(f"CalldataDecoder: could not decode {tx_hash}: {e}")
+        return None
+
+    def get_recent_txns(self, wallet_addr: str) -> list:
+        """
+        Fetch the last 10 exchange transactions for a wallet via Polygonscan.
+        Falls back to an empty list on any error so the bot keeps running.
+        """
+        api_key = os.getenv("POLYGONSCAN_API_KEY", "")
+        url = (
+            f"https://api.polygonscan.com/api"
+            f"?module=account&action=txlist"
+            f"&address={wallet_addr}"
+            f"&startblock=0&endblock=latest"
+            f"&sort=desc&page=1&offset=10"
+            f"&apikey={api_key}"
+        )
+        try:
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            if data.get("status") == "1":
+                return [
+                    tx["hash"] for tx in data["result"]
+                    if tx.get("to", "").lower() == EXCHANGE_CONTRACT.lower()
+                ]
+        except Exception as e:
+            logging.warning(f"Polygonscan fetch failed for {wallet_addr[:10]}: {e}")
+        return []
+
 # ==================== COPY TRADER ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
@@ -370,6 +547,8 @@ class CopyTrader:
         self.seen = SeenTradesStore(SEEN_TRADES_FILE, DATABASE_URL)
         self._first_scan_done: Set[str] = set()
         self.closed_positions: list = []
+        self.decoder = CalldataDecoder()
+        self._seen_tx_hashes: Set[str] = set()
         logging.info(f"Multi-Wallet CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
 
     def _get_positions_sync(self, wallet_addr: str) -> Optional[list]:
@@ -457,6 +636,42 @@ class CopyTrader:
                 )
                 del self.pending[k]
 
+    async def _scan_onchain_signals(self):
+        """
+        Fast-path: decode on-chain calldata for all tracked wallets each cycle.
+        Runs before the REST API poll so new trades are logged ~10-30s earlier.
+        Skips silently if web3 is not installed or no RPC is reachable.
+        """
+        if not self.decoder._w3:
+            return
+
+        loop = asyncio.get_event_loop()
+
+        for wallet_addr, wallet_cfg in cfg.WALLETS.items():
+            try:
+                tx_hashes = await loop.run_in_executor(
+                    None, self.decoder.get_recent_txns, wallet_addr
+                )
+                for tx_hash in tx_hashes:
+                    if tx_hash in self._seen_tx_hashes:
+                        continue
+                    self._seen_tx_hashes.add(tx_hash)
+
+                    decoded = await loop.run_in_executor(
+                        None, self.decoder.decode_tx, tx_hash
+                    )
+                    if not decoded:
+                        continue
+
+                    logging.info(
+                        f"[CALLDATA] {wallet_cfg['name']} | {decoded['side']} "
+                        f"token {decoded['token_id'][:12]}... "
+                        f"@ {decoded['price']:.4f} "
+                        f"(${decoded['maker_amount']:.2f} pUSD)"
+                    )
+            except Exception as e:
+                logging.warning(f"[CALLDATA] Error scanning {wallet_cfg['name']}: {e}")
+
     async def scan_and_copy(self):
         if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until: return
 
@@ -471,6 +686,9 @@ class CopyTrader:
 
         self.clean_expired_limit_orders()
         self.process_pending_fills()
+
+        # Fast-path: decode on-chain calldata before REST API poll
+        await self._scan_onchain_signals()
 
         logging.info(f"Scan Run | Net Assets: ${current_bal:.2f} pUSD | Active Orders: {len(self.positions)} | Open Limits: {len(self.pending)}")
         source_token_ids_by_wallet = {}
