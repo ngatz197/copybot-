@@ -5,3 +5,4 @@ py-clob-client-v2
 websockets>=12.0
 eth-account==0.13.7
 psycopg2-binary
+web3
