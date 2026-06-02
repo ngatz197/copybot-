@@ -210,6 +210,7 @@ class SeenTradesStore:
     def is_empty(self) -> bool:
         return len(self._seen) == 0
 
+
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
     POLYGON_RPCS = [
@@ -249,7 +250,7 @@ class RobustBalanceManager:
         return 0.0
 
     def get_balance(self, force=False) -> Optional[float]:
-        # If simulation execution is active, skip chain consensus updates entirely to protect current local simulation changes
+        # During dry runs, ignore blockchain sync intervals to safeguard mutating virtual balance states
         if self.dry_run and self.cached_balance is not None:
             return self.cached_balance
 
@@ -291,7 +292,7 @@ class RobustBalanceManager:
         if self.dry_run and self.cached_balance is not None:
             self.cached_balance -= amount_usd
             cfg.compounding_bankroll = self.cached_balance
-            logging.info(f"[DRY RUN BALANCE] Deducting ${amount_usd:.2f} | Remaining Virtual Funds: ${self.cached_balance:.2f}")
+            logging.info(f"[DRY RUN] Deducted virtual funds: ${amount_usd:.2f} | Balance: ${self.cached_balance:.2f}")
 
     def apply_dry_run_sell(self, return_usd: float):
         if self.dry_run and self.cached_balance is not None:
@@ -300,7 +301,8 @@ class RobustBalanceManager:
             if self.cached_balance > self.peak_balance:
                 self.peak_balance = self.cached_balance
                 cfg.peak_bankroll = self.cached_balance
-            logging.info(f"[DRY RUN BALANCE] Crediting ${return_usd:.2f} | Current Virtual Funds: ${self.cached_balance:.2f}")
+            logging.info(f"[DRY RUN] Credited virtual return: ${return_usd:.2f} | Balance: ${self.cached_balance:.2f}")
+
 
 # ==================== EXECUTOR (V2) ====================
 class PolymarketExecutor:
@@ -385,6 +387,7 @@ class PolymarketExecutor:
                 logging.warning(f"SELL attempt {attempt+1} failed: {e}")
                 time.sleep(RETRY_DELAY)
         return False, ""
+
 
 # ==================== WEBSOCKET LISTENER ====================
 class PolymarketWSListener:
@@ -527,6 +530,7 @@ class PolymarketWSListener:
                         "taker_addr": taker_addr,
                     })
 
+
 # ==================== SIZING HELPERS ====================
 def _price_based_size(price: float) -> float:
     if price < 0.30:
@@ -536,6 +540,7 @@ def _price_based_size(price: float) -> float:
     else:
         pct = 0.030
     return cfg.compounding_bankroll * pct
+
 
 def _calc_size(config: dict, price: float, source_value: float = 0.0) -> float:
     if config.get("risk_type") == "fixed":
@@ -548,11 +553,11 @@ def _calc_size(config: dict, price: float, source_value: float = 0.0) -> float:
 
     return tiered
 
+
 # ==================== COPY TRADER ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run          = dry_run
-        # Pass context explicitly down to the balance manager
         self.balance          = RobustBalanceManager(dry_run=self.dry_run)
         
         # Seed compounding references dynamically across both execution pathways
@@ -650,7 +655,7 @@ class CopyTrader:
             logging.warning(f"[WS] Order placement failed for {config['name']} — REST poll will retry.")
             return
 
-        # Deduct local funds immediately if simulating so compounding adjusts correctly
+        # Handle local dry-run compounding balance adjustments immediately 
         if self.dry_run:
             self.balance.apply_dry_run_buy(my_size)
 
@@ -673,9 +678,6 @@ class CopyTrader:
         if self._ws_listener and token_id not in self._ws_tracked:
             asyncio.create_task(self._ws_listener.subscribe_token(token_id))
 
-    # -----------------------------
-    # Simulated/Live Sell Increments Example
-    # -----------------------------
     def handle_position_exit(self, token_id: str, shares: float, actual_exit_price: float):
         """
         Call this function inside your position scanning logic when an exit is confirmed.
@@ -740,3 +742,30 @@ class CopyTrader:
                 logging.warning(f"Error fetching orderbook for {token_id[:12]}: {e}")
                 time.sleep(1)
         return 0.0, 0.0
+
+
+# ==================== HEALTH SERVER ====================
+class HealthRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/health", "/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            response = {"status": "healthy", "timestamp": datetime.now().isoformat()}
+            self.wfile.write(json.dumps(response).encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        # Suppress standard HTTP logging to keep your clean terminal feed clear
+        return
+
+
+def run_health_server():
+    try:
+        server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthRequestHandler)
+        logging.info(f"🚀 Health server running on port {HEALTH_PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logging.error(f"Failed to start health server: {e}")
