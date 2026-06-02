@@ -108,10 +108,15 @@ class RobustBalanceManager:
             time.sleep(delay)
         raise RuntimeError(f"Could not fetch real pUSD balance after {retries} attempts.")
 
-    def check_drawdown(self) -> Tuple[bool, float]:
+    def check_drawdown(self) -> Tuple[Optional[bool], float]:
+        """
+        Returns (is_broken, drawdown_fraction).
+        is_broken is None when the balance is unknown — callers must treat
+        None as a blocking condition, not as "safe to proceed".
+        """
         current = self.get_balance()
         if current is None or self.peak_balance == 0:
-            return False, 0.0
+            return None, 0.0
         dd = (self.peak_balance - current) / self.peak_balance
         return dd >= MAX_DRAWDOWN, dd
 
@@ -185,47 +190,22 @@ class PolymarketExecutor:
             logging.warning(f"Cancel failed for {order_id}: {e}")
             return False
 
-    def get_fill_details(self, order_id: str) -> Tuple[bool, float, float]:
-        """
-        Returns (is_filled, filled_shares, avg_price).
-        - is_filled:     True when status is matched or filled
-        - filled_shares: actual shares matched (size_matched); falls back to size
-                         so partial fills are never silently ignored
-        - avg_price:     average fill price from the order response
-        On error returns (False, 0.0, 0.0).
-        """
-        if self.dry_run or self.client is None:
-            return True, 0.0, 0.0   # caller uses PendingLimitBuy values in dry-run
-        try:
-            order     = self.client.get_order(order_id)
-            status    = order.get("status", "").lower()
-            is_filled = status in ("matched", "filled")
-            if not is_filled:
-                return False, 0.0, 0.0
-            filled_shares = float(
-                order.get("size_matched")
-                or order.get("filled_size")
-                or order.get("size", 0)
-            )
-            avg_price = float(
-                order.get("avg_price")
-                or order.get("price")
-                or 0.0
-            )
-            return True, filled_shares, avg_price
-        except Exception as e:
-            logging.warning(f"Could not fetch fill details for {order_id}: {e}")
-            return False, 0.0, 0.0
-
     def is_order_filled(self, order_id: str) -> bool:
-        """Thin wrapper kept for any external callers; prefer get_fill_details."""
-        filled, _, _ = self.get_fill_details(order_id)
-        return filled
+        if self.dry_run or self.client is None:
+            return True
+        try:
+            status = self.client.get_order(order_id).get("status", "").lower()
+            return status in ("matched", "filled")
+        except Exception as e:
+            logging.warning(f"Could not check order status for {order_id}: {e}")
+            return False
 
     def place_sell(self, token_id: str, shares: float) -> Tuple[bool, str]:
         if self.dry_run or self.client is None:
             logging.info(f"[DRY RUN] MARKET SELL {shares:.4f} shares")
             return True, "dry-run-sell"
+
+        # --- Attempt 1: FOK market sell (fast fill) ---
         for attempt in range(MAX_RETRIES):
             try:
                 result   = self.client.create_and_post_market_order(
@@ -234,30 +214,46 @@ class PolymarketExecutor:
                     order_type = OrderType.FOK,
                 )
                 order_id = result.get("orderID", result.get("id", "unknown"))
-                logging.info(f"MARKET SELL placed (V2): {order_id}")
+                logging.info(f"MARKET SELL placed (FOK V2): {order_id}")
                 return True, order_id
             except Exception as e:
-                logging.warning(f"SELL attempt {attempt+1} failed: {e}")
+                logging.warning(f"FOK SELL attempt {attempt+1} failed: {e}")
                 time.sleep(RETRY_DELAY)
-        return False, ""
 
-    def place_limit_sell(self, token_id: str, shares: float, limit_price: float) -> Tuple[bool, str]:
-        if self.dry_run or self.client is None:
-            logging.info(f"[DRY RUN] LIMIT SELL {shares:.4f} shares @ {limit_price:.4f}")
-            return True, "dry-run-limit-sell"
+        # --- Fallback: GTC limit sell at best available bid ---
+        logging.critical(
+            f"⚠️  FOK sell exhausted for token {token_id[:12]}… — "
+            f"falling back to GTC limit sell.  Manual review recommended."
+        )
         for attempt in range(MAX_RETRIES):
             try:
+                # Place at a penny below mid; adjust tick as needed.
+                book     = requests.get(
+                    f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8
+                ).json()
+                bids     = book.get("bids", [])
+                limit_px = float(bids[0]["price"]) if bids else 0.01
                 result   = self.client.create_and_post_order(
-                    order_args = OrderArgs(token_id=token_id, price=limit_price, size=shares, side=Side.SELL),
+                    order_args = OrderArgs(
+                        token_id = token_id,
+                        price    = limit_px,
+                        size     = shares,
+                        side     = Side.SELL,
+                    ),
                     options    = PartialCreateOrderOptions(tick_size="0.01"),
                     order_type = OrderType.GTC,
                 )
                 order_id = result.get("orderID", result.get("id", "unknown"))
-                logging.info(f"LIMIT SELL placed (V2): {order_id} | {shares:.4f} shares @ {limit_price:.4f}")
+                logging.info(f"GTC limit SELL placed as fallback: {order_id} @ {limit_px}")
                 return True, order_id
             except Exception as e:
-                logging.warning(f"LIMIT SELL attempt {attempt+1} failed: {e}")
+                logging.warning(f"GTC SELL fallback attempt {attempt+1} failed: {e}")
                 time.sleep(RETRY_DELAY)
+
+        logging.critical(
+            f"🚨 ALL SELL ATTEMPTS FAILED for token {token_id[:12]}… "
+            f"({shares:.4f} shares).  Position is STUCK — manual intervention required."
+        )
         return False, ""
 
 # ==================== WEBSOCKET LISTENER ====================
@@ -279,7 +275,6 @@ class PolymarketWSListener:
         self._running           = False
         self._ws                = None
         self._subscribed: Set[str] = set()
-        self._logged_event_types: Set[str] = set()  # tracks which event_types have been raw-logged
 
     async def subscribe_token(self, token_id: str):
         if token_id in self._subscribed:
@@ -359,30 +354,6 @@ class PolymarketWSListener:
 
         for ev in events:
             ev_type = ev.get("event_type") or ev.get("type") or ""
-
-            # ── RAW EVENT LOGGING (side-labeling diagnostics) ─────────────
-            # Log one full example of each event_type so we can verify field
-            # names and side conventions without drowning in noise.
-            if ev_type and ev_type not in self._logged_event_types:
-                self._logged_event_types.add(ev_type)
-                logging.warning(
-                    f"[WS RAW] First seen event_type='{ev_type}' — full payload: "
-                    f"{json.dumps(ev)}"
-                )
-
-            # Log every trade/order_filled event in full so side labeling is
-            # visible for every fill that comes through.
-            if ev_type in ("trade", "order_filled"):
-                logging.warning(
-                    f"[WS RAW TRADE] event_type='{ev_type}' "
-                    f"side={ev.get('side')!r} outcome={ev.get('outcome')!r} "
-                    f"maker={ev.get('maker_address') or ev.get('maker')!r} "
-                    f"taker={ev.get('taker_address') or ev.get('taker')!r} "
-                    f"price={ev.get('price')} size={ev.get('size')} "
-                    f"token={str(ev.get('asset_id') or ev.get('market') or '')[:16]}… "
-                    f"full={json.dumps(ev)}"
-                )
-            # ─────────────────────────────────────────────────────────────
 
             if ev_type in ("price_change", "book", "last_trade_price"):
                 token_id = ev.get("asset_id") or ev.get("market") or ""

@@ -30,27 +30,43 @@ async def main():
     neon_thread = threading.Thread(target=keep_neon_alive, daemon=True)
     neon_thread.start()
 
-    # 3. Initialize application tracking instance service engine layers
+    # 3. Initialize bot — CopyTrader.__init__ already calls fetch_with_retry and
+    # sets cfg.compounding_bankroll / cfg.peak_bankroll, so no second fetch is
+    # needed here. A duplicate call would make two live RPC round-trips and
+    # silently overwrite the values set inside __init__ (fix A).
     bot = CopyTrader(dry_run=cfg.DRY_RUN)
     cfg._bot_ref = bot  # Connect tracking state pointer back globally to metric servers
 
-    # 4. Secure initial blockchain network collateral state synchronization
-    try:
-        starting_balance = bot.balance.fetch_with_retry(retries=5, delay=10)
-        cfg.peak_bankroll = starting_balance
-        cfg.compounding_bankroll = starting_balance
-        logging.info(f"✅ Balance verification synchronized successfully. Capital base: ${starting_balance:.2f} pUSD")
-    except Exception as e:
-        logging.critical(f"❌ Critical initialization failure mapping RPC balance parameters: {e}")
-        sys.exit(1)
+    # 4. Start WebSocket listener task so live trade signals are actually received.
+    # The listener is created in CopyTrader.__init__ but never scheduled — without
+    # this create_task the entire WS signal path (_on_ws_signal, instant copies,
+    # live price updates) is permanently dead (fix B).
+    if bot._ws_listener is not None:
+        asyncio.create_task(bot._ws_listener.run())
+        logging.info("⚡ WebSocket listener task started")
+    else:
+        logging.warning("WebSocket listener not available — running on REST polling only")
 
     # 5. Fall into continuous automated execution polling loop
     while True:
         try:
             await bot.scan_and_copy()
-        except Exception as loop_err:
-            logging.error(f"⚠️ Internal iteration anomaly caught on loop check: {loop_err}")
-        
+        except (
+            # Transient network / IO failures — safe to retry on the next poll.
+            OSError,
+            asyncio.TimeoutError,
+        ) as transient_err:
+            logging.warning(
+                f"Transient error in scan loop — will retry in {cfg.POLL_INTERVAL}s: "
+                f"{transient_err}"
+            )
+        except Exception:
+            # Anything else (KeyError, TypeError, AttributeError, logic bugs …)
+            # is unexpected. Log the full traceback so it's diagnosable, then
+            # re-raise so the process exits rather than spinning in a broken state.
+            logging.critical("Fatal error in scan loop — shutting down.", exc_info=True)
+            raise
+
         await asyncio.sleep(cfg.POLL_INTERVAL)
 
 if __name__ == "__main__":

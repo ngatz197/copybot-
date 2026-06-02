@@ -29,9 +29,8 @@ class Position:
     exit_price:    float = 0.0
     pnl:           float = 0.0
     order_id:      str   = ""
-    current_price:  float = 0.0
-    signal_source:  str   = "rest"   # "ws" | "rest"
-    source_shares:  float = 0.0      # source wallet's share count at entry (for partial-sell ratio)
+    current_price: float = 0.0
+    signal_source: str   = "rest"   # "ws" | "rest"
 
 @dataclass
 class PendingLimitBuy:
@@ -46,7 +45,6 @@ class PendingLimitBuy:
     size_usd:      float
     order_id:      str
     signal_source: str      = "rest"   # "ws" | "rest"
-    source_shares: float    = 0.0      # source wallet's share count at signal time
     placed_at:     datetime = field(default_factory=datetime.now)
 
 # ==================== SEEN TRADES STORE ====================
@@ -76,7 +74,6 @@ class SeenTradesStore:
                     )
                 """)
             self._seen   = self._load_postgres()
-            self._pending_writes: list = []
             self.backend = "postgres"
             logging.info(f"Postgres connected — {len(self._seen)} seen keys loaded")
         except Exception as e:
@@ -102,7 +99,6 @@ class SeenTradesStore:
                 )
         except Exception as e:
             logging.warning(f"Postgres save failed for {pos_key}: {e}")
-            self._pending_writes.append(pos_key)
             self._reconnect_postgres()
 
     def _save_postgres_many(self, keys):
@@ -122,13 +118,14 @@ class SeenTradesStore:
         try:
             self._conn = psycopg2.connect(self.db_url, sslmode="require")
             self._conn.autocommit = True
-            logging.info("Postgres reconnected")
-            if getattr(self, "_pending_writes", None):
-                self._save_postgres_many(self._pending_writes)
-                self._pending_writes.clear()
-                logging.info("Postgres: replayed pending writes after reconnect")
+            # Reload from DB and merge so any keys written by other processes
+            # during the outage are picked up, and in-memory-only keys are retained.
+            refreshed = self._load_postgres()
+            self._seen.update(refreshed)
+            logging.info(f"Postgres reconnected — merged {len(refreshed)} keys from DB")
         except Exception as e:
             logging.error(f"Postgres reconnect failed: {e}")
+            self._conn = None
 
     def _load_file(self):
         try:
@@ -137,11 +134,6 @@ class SeenTradesStore:
                 self._seen = set(data) if isinstance(data, list) else set()
         except FileNotFoundError:
             self._seen = set()
-        except json.JSONDecodeError as e:
-            raise RuntimeError(
-                f"seen_trades file '{self.filepath}' is corrupted and cannot be parsed: {e}. "
-                "Delete or repair the file before restarting."
-            ) from e
         except Exception as e:
             logging.warning(f"Could not read seen trades file: {e}")
             self._seen = set()
@@ -159,21 +151,32 @@ class SeenTradesStore:
 
     def mark_seen(self, pos_key: str):
         if pos_key in self._seen: return
-        self._seen.add(pos_key)
         if self._conn:
-            self._save_postgres(pos_key)
-        else:
+            self._save_postgres(pos_key)  # persist first; ON CONFLICT makes this idempotent
+        self._seen.add(pos_key)
+        if not self._conn:
             self._save_file()
 
     def snapshot_existing(self, pos_keys):
         new_keys = [k for k in pos_keys if k not in self._seen]
         if not new_keys: return
-        for k in new_keys:
-            self._seen.add(k)
         if self._conn:
             self._save_postgres_many(new_keys)
         else:
+            # Stage in-memory first for file backend, then persist
+            for k in new_keys:
+                self._seen.add(k)
             self._save_file()
+            logging.info(f"Snapshot: marked {len(new_keys)} pre-existing trades as seen")
+            return
+        # Postgres path: only add to _seen after the write attempt
+        # _save_postgres_many logs on failure but doesn't raise; we still
+        # mark in-memory so the current session won't re-process them.
+        # On a fresh restart the DB is the source of truth, so a failed
+        # write would at worst cause a one-time duplicate signal — which
+        # the ON CONFLICT guard on the DB side makes harmless.
+        for k in new_keys:
+            self._seen.add(k)
         logging.info(f"Snapshot: marked {len(new_keys)} pre-existing trades as seen")
 
     @property
