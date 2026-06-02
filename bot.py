@@ -1,11 +1,23 @@
 import sys
+import time
 import asyncio
 import logging
 import threading
+import psycopg2
 import config as cfg
 from services import CopyTrader, run_health_server
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+def keep_neon_alive():
+    while True:
+        try:
+            conn = psycopg2.connect(cfg.DATABASE_URL, sslmode="require")
+            conn.close()
+            logging.info("🟢 Neon keep-alive ping sent")
+        except Exception as e:
+            logging.warning(f"Neon keep-alive failed: {e}")
+        time.sleep(180)  # every 3 minutes
 
 async def main():
     logging.info("⚡ Booting Polymarket CopyBot Core Runtime Pipeline Interface...")
@@ -14,11 +26,15 @@ async def main():
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
-    # 2. Initialize application tracking instance service engine layers
+    # 2. Start Neon keep-alive thread
+    neon_thread = threading.Thread(target=keep_neon_alive, daemon=True)
+    neon_thread.start()
+
+    # 3. Initialize application tracking instance service engine layers
     bot = CopyTrader(dry_run=cfg.DRY_RUN)
     cfg._bot_ref = bot  # Connect tracking state pointer back globally to metric servers
 
-    # 3. Secure initial blockchain network collateral state synchronization
+    # 4. Secure initial blockchain network collateral state synchronization
     try:
         starting_balance = bot.balance.fetch_with_retry(retries=5, delay=10)
         cfg.peak_bankroll = starting_balance
@@ -28,7 +44,7 @@ async def main():
         logging.critical(f"❌ Critical initialization failure mapping RPC balance parameters: {e}")
         sys.exit(1)
 
-    # 4. Fall into continuous automated execution polling loop
+    # 5. Fall into continuous automated execution polling loop
     while True:
         try:
             await bot.scan_and_copy()
