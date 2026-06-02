@@ -374,9 +374,9 @@ class CopyTrader:
 
     def _get_positions(self, wallet_addr: str) -> Optional[list]:
         """
-        Fetches live raw wallet positions using official REST endpoint mappings.
+        Original method lookup: Directly targets the explicit web view profile metric layout.
         """
-        url = f"https://clob.polymarket.com/positions?user={wallet_addr}"
+        url = f"https://gamma-api.polymarket.com/profile?address={wallet_addr}"
         for attempt in range(3):
             try:
                 resp = requests.get(url, timeout=10)
@@ -463,13 +463,11 @@ class CopyTrader:
                 logging.warning(f"[{config['name']}] Failed to fetch positions from API.")
                 continue
 
-            # Normalized parsing adjustments to capture correct asset sizing properties
-            source_token_ids = set()
-            for pos in raw:
-                t_id = pos.get("asset_id")
-                size_val = float(pos.get("size", 0))
-                if t_id and size_val > 0:
-                    source_token_ids.add(t_id)
+            # Original bot data layout properties mapping: "asset" and "shares"/"size"
+            source_token_ids = {
+                pos.get("asset") for pos in raw 
+                if pos.get("asset") and float(pos.get("size", pos.get("shares", 0))) > 0
+            }
 
             logging.info(f"[{config['name']}] {len(raw)} position(s) from API, {len(source_token_ids)} with active tokens")
 
@@ -477,18 +475,18 @@ class CopyTrader:
                 if config.get("copy_mode") == "new_only":
                     pre_existing = []
                     for pos in raw:
-                        asset_id = pos.get("asset_id")
+                        asset_id = pos.get("asset")
                         side = pos.get("side", "YES").upper()
-                        if asset_id and float(pos.get("size", 0)) > 0:
+                        if asset_id and float(pos.get("size", pos.get("shares", 0))) > 0:
                             pre_existing.append(f"{wallet_addr.lower()}_{asset_id}_{side}")
                     self.seen.snapshot_existing(pre_existing)
                 self._first_scan_done.add(wallet_addr)
 
             for pos in raw:
-                token_id  = pos.get("asset_id")
-                shares    = float(pos.get("size", 0))
+                token_id  = pos.get("asset")
+                shares    = float(pos.get("size", pos.get("shares", 0)))
                 side      = pos.get("side", "YES").upper()
-                market_id = pos.get("condition_id", "unknown")
+                market_id = pos.get("conditionId", "unknown")
                 
                 if not token_id or shares <= 0: continue
 
@@ -535,9 +533,9 @@ class CopyTrader:
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
 
             cur_price_map = {
-                pos.get("asset_id"): float(pos.get("curPrice", 0)) 
+                pos.get("asset"): float(pos.get("curPrice", 0)) 
                 for pos in raw 
-                if pos.get("asset_id") and float(pos.get("curPrice", 0)) > 0
+                if pos.get("asset") and float(pos.get("curPrice", 0)) > 0
             }
             for _pk, _pos in self.positions.items():
                 if _pos.source_wallet == wallet_addr and _pos.token_id in cur_price_map:
