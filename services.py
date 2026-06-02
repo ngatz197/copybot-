@@ -539,6 +539,45 @@ class PolymarketWSListener:
                         "taker_addr": taker_addr,
                     })
 
+# ==================== SIZING HELPERS ====================
+
+def _price_based_size(price: float) -> float:
+    """
+    Tier bankroll percentage by market price for price_based wallets.
+      price < 0.30  → 0.6% of compounding_bankroll
+      0.30–0.70     → 1.0%
+      price > 0.70  → 3.0%
+    """
+    if price < 0.30:
+        pct = 0.006
+    elif price <= 0.70:
+        pct = 0.010
+    else:
+        pct = 0.030
+    return cfg.compounding_bankroll * pct
+
+
+def _calc_size(config: dict, price: float, source_value: float = 0.0) -> float:
+    """
+    Return position size in USD based on wallet risk_type.
+      fixed       -> fixed_risk % of bankroll (e.g. Coniyr)
+      price_based -> tiered % of bankroll by market price (TheSpirit, Viser, Kruto)
+
+    Special case - Kruto only (copy_sub_dollar: True):
+      If the tiered size is < $1.00, fall back to 1:1 mirror of the source
+      wallet's actual position value instead of rejecting the trade.
+    """
+    if config.get("risk_type") == "fixed":
+        return cfg.compounding_bankroll * config.get("fixed_risk", 0.025)
+
+    tiered = _price_based_size(price)
+
+    if tiered < 1.0 and config.get("copy_sub_dollar", False) and source_value > 0:
+        return source_value
+
+    return tiered
+
+
 # ==================== COPY TRADER ====================
 class CopyTrader:
     """
@@ -639,18 +678,7 @@ class CopyTrader:
             logging.warning(f"[WS] Position limit reached — skipping {config['name']} signal.")
             return
 
-        # Size
-        if config.get("risk_type") == "fixed":
-            my_size = cfg.compounding_bankroll * config.get("fixed_risk", 0.025)
-        else:
-            # WS doesn't carry initialValue — fall back to fixed_risk or a minimum
-            my_size = cfg.compounding_bankroll * config.get("fixed_risk", 0.025)
-
-        if my_size < 1.0 and not config.get("copy_sub_dollar", False):
-            logging.info(f"[WS] Sub-dollar size (${my_size:.2f}) rejected for {config['name']}.")
-            return
-
-        # Pricing
+        # Pricing first — needed for price_based sizing
         best_ask, mid_price = self.get_orderbook_prices(token_id)
         if best_ask <= 0:
             actual_price = mid_price
@@ -660,6 +688,15 @@ class CopyTrader:
 
         if actual_price <= 0 or actual_price >= 1.0:
             logging.error(f"[WS] Invalid price {actual_price} for {token_id[:12]} — aborting.")
+            return
+
+        # Size (price_based tiers by actual_price; fixed uses fixed_risk %)
+        # For Kruto sub-dollar fallback, pass the fill size from the WS event
+        source_value = float(ev.get("size", 0.0)) * actual_price
+        my_size = _calc_size(config, actual_price, source_value)
+
+        if my_size < 1.0 and not config.get("copy_sub_dollar", False):
+            logging.info(f"[WS] Sub-dollar size (${my_size:.2f}) rejected for {config['name']}.")
             return
 
         logging.info(
@@ -942,15 +979,6 @@ class CopyTrader:
                     logging.warning(f"[REST] Position limit reached — skipping REST fallback.")
                     continue
 
-                if config.get("risk_type") == "fixed":
-                    my_size = cfg.compounding_bankroll * config.get("fixed_risk", 0.025)
-                else:
-                    my_size = float(pos.get("initialValue", pos.get("value", 2.0)))
-
-                if my_size < 1.0 and not config.get("copy_sub_dollar", False):
-                    logging.info(f"[REST] Sub-dollar size (${my_size:.2f}) rejected.")
-                    continue
-
                 best_ask, mid_price = self.get_orderbook_prices(token_id)
                 if best_ask <= 0:
                     actual_price = mid_price
@@ -960,6 +988,15 @@ class CopyTrader:
 
                 if actual_price <= 0 or actual_price >= 1.0:
                     logging.error(f"[REST] Invalid price {actual_price} — skipping.")
+                    continue
+
+                # Size (price_based tiers by actual_price; fixed uses fixed_risk %)
+                # For Kruto sub-dollar fallback, pass the source wallet's position value
+                source_value = float(pos.get("initialValue", pos.get("value", 0.0)))
+                my_size = _calc_size(config, actual_price, source_value)
+
+                if my_size < 1.0 and not config.get("copy_sub_dollar", False):
+                    logging.info(f"[REST] Sub-dollar size (${my_size:.2f}) rejected.")
                     continue
 
                 question_str = self.get_market_question(market_id)
