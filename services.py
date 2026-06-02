@@ -374,21 +374,22 @@ class CopyTrader:
 
     def _get_positions(self, wallet_addr: str) -> Optional[list]:
         """
-        Original method lookup: Directly targets the explicit web view profile metric layout.
+        Fetch open positions for a wallet from Polymarket data API.
+        Returns a list of position dicts, or None on failure.
         """
-        url = f"https://gamma-api.polymarket.com/profile?address={wallet_addr}"
-        for attempt in range(3):
+        url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50"
+        for attempt in range(MAX_RETRIES):
             try:
-                resp = requests.get(url, timeout=10)
+                resp = requests.get(url, timeout=12)
                 if resp.status_code == 200:
                     return resp.json()
                 elif resp.status_code == 404:
                     return []
                 else:
-                    logging.warning(f"[_get_positions] HTTP {resp.status_code} on {wallet_addr[:10]}")
+                    logging.warning(f"[_get_positions] HTTP {resp.status_code} for {wallet_addr[:10]}")
             except Exception as e:
-                logging.warning(f"[_get_positions] Connection attempt {attempt+1} dropped: {e}")
-                time.sleep(2)
+                logging.warning(f"[_get_positions] Attempt {attempt+1} failed: {e}")
+                time.sleep(RETRY_DELAY)
         return None
 
     def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
@@ -441,7 +442,7 @@ class CopyTrader:
 
     async def scan_and_copy(self):
         if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until: return
-        
+
         is_broken, dd_pct = self.balance.check_drawdown()
         if is_broken:
             logging.critical(f"🛑 CRITICAL DRAWDOWN TRIGGERED ({dd_pct*100:.1f}%)! Locking operations.")
@@ -459,13 +460,12 @@ class CopyTrader:
 
         for wallet_addr, config in cfg.WALLETS.items():
             raw = self._get_positions(wallet_addr)
-            if raw is None: 
+            if raw is None:
                 logging.warning(f"[{config['name']}] Failed to fetch positions from API.")
                 continue
 
-            # Original bot data layout properties mapping: "asset" and "shares"/"size"
             source_token_ids = {
-                pos.get("asset") for pos in raw 
+                pos.get("asset") for pos in raw
                 if pos.get("asset") and float(pos.get("size", pos.get("shares", 0))) > 0
             }
 
@@ -487,7 +487,7 @@ class CopyTrader:
                 shares    = float(pos.get("size", pos.get("shares", 0)))
                 side      = pos.get("side", "YES").upper()
                 market_id = pos.get("conditionId", "unknown")
-                
+
                 if not token_id or shares <= 0: continue
 
                 pos_key = f"{wallet_addr.lower()}_{token_id}_{side}"
@@ -533,8 +533,8 @@ class CopyTrader:
             source_token_ids_by_wallet[wallet_addr] = source_token_ids
 
             cur_price_map = {
-                pos.get("asset"): float(pos.get("curPrice", 0)) 
-                for pos in raw 
+                pos.get("asset"): float(pos.get("curPrice", 0))
+                for pos in raw
                 if pos.get("asset") and float(pos.get("curPrice", 0)) > 0
             }
             for _pk, _pos in self.positions.items():
