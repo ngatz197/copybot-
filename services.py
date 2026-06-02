@@ -518,6 +518,111 @@ class CopyTrader:
         if self._ws_listener and token_id not in self._ws_tracked:
             asyncio.create_task(self._ws_listener.subscribe_token(token_id))
 
+    async def scan_and_copy(self):
+        """
+        Layer 2 — Authoritative REST poll fallback.
+        Scans all tracked wallets, reconciles pending orders, detects exits, 
+        and updates compounding bankroll capital states.
+        """
+        self.balance.get_balance()
+
+        if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until: return
+        is_broken, _ = self.balance.check_drawdown()
+        if is_broken: return
+
+        pending_keys = list(self.pending.keys())
+        for pk in pending_keys:
+            p_order = self.pending[pk]
+            if self.executor.is_order_filled(p_order.order_id):
+                logging.info(f"✨ [FILL CONFIRMED] Order {p_order.order_id} filled completely.")
+                self.positions[p_order.token_id] = Position(
+                    market_id=p_order.market_id, question=p_order.question, outcome=p_order.outcome,
+                    token_id=p_order.token_id, entry_price=p_order.limit_price, size_usd=p_order.size_usd,
+                    shares=round(p_order.size_usd / p_order.limit_price, 4), source_wallet=p_order.source_wallet,
+                    source_name=p_order.source_name, order_id=p_order.order_id, signal_source=p_order.signal_source
+                )
+                del self.pending[pk]
+            elif (datetime.now() - p_order.placed_at).seconds > 300:
+                logging.warning(f"⏳ [TIMEOUT] Cancelling expired limit buy order {p_order.order_id}")
+                self.executor.cancel_order(p_order.order_id)
+                if self.dry_run and self.balance.virtual_balance is not None:
+                    self.balance.virtual_balance += p_order.size_usd
+                    cfg.compounding_bankroll = self.balance.virtual_balance
+                del self.pending[pk]
+
+        wallets_data = await self._fetch_all_wallets()
+        tracked_wallets = {addr.lower(): cfg.WALLETS[addr] for addr in cfg.WALLETS}
+
+        for wallet_addr, positions_list in wallets_data.items():
+            if positions_list is None: continue
+            wallet_lower = wallet_addr.lower()
+            config = tracked_wallets.get(wallet_lower)
+            if not config: continue
+
+            current_source_tokens = set()
+
+            for pos in positions_list:
+                token_id = pos.get("asset") or pos.get("token_id") or ""
+                if not token_id: continue
+
+                side = str(pos.get("side") or pos.get("outcome") or "YES").upper()
+                size_usd = float(pos.get("curValue") or pos.get("size") or 0.0)
+                current_source_tokens.add(token_id)
+                pos_key = f"{wallet_lower}_{token_id}_{side}"
+
+                if wallet_addr not in self._first_scan_done:
+                    self.seen.mark_seen(pos_key)
+                    continue
+
+                if self.seen.is_seen(pos_key) or pos_key in self.pending or token_id in self.positions: continue
+                if len(self.positions) >= MAX_POSITIONS: continue
+
+                best_ask, mid_price = self.get_orderbook_prices(token_id)
+                actual_price = min(best_ask, mid_price * (1.0 + config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM))) if best_ask > 0 else mid_price
+
+                if actual_price <= 0 or actual_price >= 1.0: continue
+
+                my_size = _calc_size(config, actual_price, size_usd)
+                if my_size < 1.0 and not config.get("copy_sub_dollar", False): continue
+
+                logging.info(f"🔍 [REST FALLBACK] Found missing trade for {config['name']} | [signal_source=rest]")
+                ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
+                if ok:
+                    self.seen.mark_seen(pos_key)
+                    self.pending[pos_key] = PendingLimitBuy(
+                        pos_key=pos_key, token_id=token_id, market_id=pos.get("conditionId", "unknown"),
+                        question=pos.get("title", "REST discovered market"), outcome=side, source_wallet=wallet_addr,
+                        source_name=config["name"], limit_price=actual_price, size_usd=my_size, order_id=order_id, signal_source="rest"
+                    )
+                    if self._ws_listener and token_id not in self._ws_tracked:
+                        asyncio.create_task(self._ws_listener.subscribe_token(token_id))
+
+            if wallet_addr not in self._first_scan_done:
+                self._first_scan_done.add(wallet_addr)
+                logging.info(f"✅ Initial profile snapshot established for {config['name']}")
+
+            active_tokens = list(self.positions.keys())
+            for t_id in active_tokens:
+                my_pos = self.positions[t_id]
+                if my_pos.source_wallet.lower() == wallet_lower and t_id not in current_source_tokens:
+                    logging.info(f"📉 [EXIT DETECTED] Target {my_pos.source_name} closed position in token {t_id[:12]}")
+                    _, mid_price = self.get_orderbook_prices(t_id)
+                    ok, _ = self.executor.place_sell(t_id, my_pos.shares, estimated_price=mid_price)
+                    if ok:
+                        my_pos.status = "closed"
+                        my_pos.exit_price = mid_price
+                        my_pos.pnl = (mid_price - my_pos.entry_price) * my_pos.shares
+                        self.closed_positions.append(my_pos)
+                        del self.positions[t_id]
+
+        while not self._ws_price_queue.empty():
+            try:
+                upd = self._ws_price_queue.get_nowait()
+                if upd["token_id"] in self.positions:
+                    self.positions[upd["token_id"]].current_price = upd["price"]
+            except asyncio.QueueEmpty:
+                break
+
     def _get_positions_sync(self, wallet_addr: str) -> Optional[list]:
         url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50"
         for attempt in range(MAX_RETRIES):
@@ -563,7 +668,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        return  # Silences background request logging to clean up your logs
+        return
 
 def run_health_server():
     port = int(os.getenv("PORT", "8080"))
