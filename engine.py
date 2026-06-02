@@ -20,6 +20,7 @@ MAX_RETRIES           = 3
 RETRY_DELAY           = 5
 LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
 LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
+PARTIAL_SELL_THRESHOLD = float(os.getenv("PARTIAL_SELL_THRESHOLD", "0.20"))  # 20 % reduction triggers proportional sell
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 DATABASE_URL          = os.getenv("DATABASE_URL", "")
 
@@ -63,6 +64,7 @@ class CopyTrader:
             initial_balance = self.balance.fetch_with_retry(retries=5, delay=5)
             cfg.compounding_bankroll = initial_balance
             cfg.peak_bankroll        = initial_balance
+            cfg.initial_bankroll     = initial_balance
         except Exception as e:
             logging.error(f"Critical initialization failure: {e}")
             raise SystemExit("Exiting bot: Unable to ascertain initial balance configuration.")
@@ -114,7 +116,43 @@ class CopyTrader:
 
         token_id = ev["token_id"]
         side     = ev["side"]
-        pos_key  = f"{matched_lower}_{token_id}_{side}"
+
+        # ── SIDE-LABELING DIAGNOSTIC ───────────────────────────────────────
+        wallet_role = "maker" if matched_lower == maker else "taker"
+        logging.warning(
+            f"[WS SIGNAL] wallet={config['name']} matched as {wallet_role} | "
+            f"side={side!r} | maker={maker[:10]}… | taker={taker[:10]}… | "
+            f"token={token_id[:16]}… | price={ev.get('price')} size={ev.get('size')}"
+        )
+        # What to look for:
+        #   If wallet is MAKER and side='BUY'  → wallet placed a resting buy → entry
+        #   If wallet is MAKER and side='SELL' → wallet placed a resting sell → exit
+        #   If wallet is TAKER and side='BUY'  → wallet lifted an ask → entry
+        #     (maker's side is reported, so taker buying shows as maker SELL or BUY
+        #      depending on exchange convention — this log will reveal the truth)
+        #   If wallet is TAKER and side='SELL' → wallet hit a bid → exit
+        # ──────────────────────────────────────────────────────────────────
+
+        # ── WS SELL DETECTION ──────────────────────────────────────────────
+        # A "sell" event from a tracked wallet means they exited — mirror it.
+        if side.upper() == "SELL":
+            # The open position was recorded under the BUY side key (YES/NO).
+            # Search by token_id + source_wallet; side recorded at entry may differ.
+            for pos_key, position in list(self.positions.items()):
+                if (
+                    position.token_id      == token_id
+                    and position.source_wallet.lower() == matched_lower
+                    and position.status    == "open"
+                ):
+                    logging.info(
+                        f"⚡ [WS SELL] {config['name']} exited "
+                        f"token {token_id[:12]}… — mirroring sell [signal_source=ws]"
+                    )
+                    self._execute_sell(pos_key, position, signal_source="ws")
+            return
+        # ──────────────────────────────────────────────────────────────────
+
+        pos_key = f"{matched_lower}_{token_id}_{side}"
 
         if self.seen.is_seen(pos_key) or pos_key in self.pending:
             return
@@ -123,7 +161,7 @@ class CopyTrader:
             logging.warning(f"[WS] Position limit reached — skipping {config['name']} signal.")
             return
 
-        best_ask, mid_price = self.get_orderbook_prices(token_id)
+        _, best_ask, mid_price = self.get_orderbook_prices(token_id)
         if best_ask <= 0:
             actual_price = mid_price
         else:
@@ -151,9 +189,6 @@ class CopyTrader:
         if not ok:
             logging.warning(f"[WS] Order placement failed for {config['name']} — REST poll will retry.")
             return
-
-        if self.dry_run:
-            self.balance.apply_dry_run_buy(my_size)
 
         self.seen.mark_seen(pos_key)
 
@@ -191,7 +226,7 @@ class CopyTrader:
         return None
 
     async def _fetch_all_wallets(self) -> Dict[str, Optional[list]]:
-        loop         = asyncio.get_event_loop()
+        loop         = asyncio.get_running_loop()
         wallet_addrs = list(cfg.WALLETS.keys())
         tasks        = [
             loop.run_in_executor(None, self._get_positions_sync, addr)
@@ -207,7 +242,8 @@ class CopyTrader:
                 out[addr] = result
         return out
 
-    def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
+    def get_orderbook_prices(self, token_id: str) -> Tuple[float, float, float]:
+        """Returns (best_bid, best_ask, mid)."""
         for attempt in range(MAX_RETRIES):
             try:
                 r = requests.get(
@@ -224,11 +260,11 @@ class CopyTrader:
                         if best_bid and best_ask
                         else (best_bid or best_ask or 0.50)
                     )
-                    return best_ask, mid
+                    return best_bid, best_ask, mid
             except Exception as e:
                 logging.warning(f"Orderbook request error: {e}")
                 time.sleep(1)
-        return 0.0, 0.50
+        return 0.0, 0.0, 0.50
 
     def get_market_question(self, market_id: str) -> str:
         if not market_id or market_id in ("unknown", "pending-ws"):
@@ -274,26 +310,47 @@ class CopyTrader:
 
     def process_pending_fills(self):
         for k, p in list(self.pending.items()):
-            if self.executor.is_order_filled(p.order_id):
-                logging.info(
-                    f"✨ [FILL] {p.source_name} | {p.outcome} | "
-                    f"signal_source={p.signal_source}"
-                )
-                self.positions[k] = Position(
-                    market_id     = p.market_id,
-                    question      = p.question,
-                    outcome       = p.outcome,
-                    token_id      = p.token_id,
-                    entry_price   = p.limit_price,
-                    size_usd      = p.size_usd,
-                    shares        = round(p.size_usd / p.limit_price, 4),
-                    source_wallet = p.source_wallet,
-                    source_name   = p.source_name,
-                    order_id      = p.order_id,
-                    current_price = p.limit_price,
-                    signal_source = p.signal_source,
-                )
-                del self.pending[k]
+            is_filled, filled_shares, avg_price = self.executor.get_fill_details(p.order_id)
+            if not is_filled:
+                continue
+
+            # In dry-run get_fill_details returns (True, 0.0, 0.0) — fall back to
+            # the pending order's own values so accounting stays correct.
+            if self.dry_run or filled_shares <= 0:
+                filled_shares = round(p.size_usd / p.limit_price, 4)
+                avg_price     = p.limit_price
+
+            actual_size_usd = round(filled_shares * avg_price, 4)
+
+            logging.info(
+                f"✨ [FILL] {p.source_name} | {p.outcome} | "
+                f"{filled_shares:.4f} shares @ {avg_price:.4f} "
+                f"(${actual_size_usd:.2f}) | signal_source={p.signal_source}"
+            )
+
+            if self.dry_run:
+                self.balance.apply_dry_run_buy(actual_size_usd)
+
+            question = p.question
+            if p.market_id == "pending-ws" or question.startswith("WS signal"):
+                question = self.get_market_question(p.market_id)
+
+            self.positions[k] = Position(
+                market_id     = p.market_id,
+                question      = question,
+                outcome       = p.outcome,
+                token_id      = p.token_id,
+                entry_price   = avg_price,
+                size_usd      = actual_size_usd,
+                shares        = filled_shares,
+                source_wallet = p.source_wallet,
+                source_name   = p.source_name,
+                order_id      = p.order_id,
+                current_price = avg_price,
+                signal_source = p.signal_source,
+                source_shares = p.source_shares,
+            )
+            del self.pending[k]
 
     async def _drain_ws_price_queue(self):
         drained = 0
@@ -311,6 +368,179 @@ class CopyTrader:
             drained += 1
         if drained:
             logging.debug(f"[WS] Drained {drained} price update(s)")
+
+    def _execute_partial_sell(
+        self,
+        pos_key:               str,
+        position:              "Position",
+        reduction:             float,
+        new_source_shares:     float,
+    ):
+        """
+        Source wallet reduced its position by `reduction` (0.0–1.0).
+        Sell the same proportion of our shares, then update source_shares
+        so the next scan compares against the new baseline.
+        If the proportional sell would leave a dust amount (<1 share) we sell
+        the remainder in full to avoid unmanageable residuals.
+        """
+        shares_to_sell = round(position.shares * reduction, 4)
+        shares_remaining = round(position.shares - shares_to_sell, 4)
+
+        # Treat near-zero residual as a full exit
+        if shares_remaining < 1.0:
+            logging.info(
+                f"✂️  [PARTIAL→FULL] {position.source_name} reduced "
+                f"{reduction*100:.1f}% — residual {shares_remaining:.4f} shares, "
+                f"treating as full exit"
+            )
+            self._execute_sell(pos_key, position, signal_source=position.signal_source)
+            return
+
+        logging.info(
+            f"✂️  [PARTIAL SELL] {position.source_name} reduced "
+            f"{reduction*100:.1f}% | selling {shares_to_sell:.4f} of "
+            f"{position.shares:.4f} shares (token {position.token_id[:12]}…)"
+        )
+
+        best_bid, _, _ = self.get_orderbook_prices(position.token_id)
+        exit_price     = best_bid if best_bid > 0 else position.current_price or position.entry_price
+
+        ok = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            ok, _ = self.executor.place_sell(position.token_id, shares_to_sell)
+            if ok:
+                break
+            logging.warning(
+                f"[PARTIAL SELL] FOK attempt {attempt}/{MAX_RETRIES} failed for "
+                f"{position.source_name}"
+            )
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+
+        if not ok and best_bid > 0:
+            logging.warning(
+                f"[PARTIAL SELL] FOK exhausted — limit sell {shares_to_sell:.4f} shares "
+                f"@ {best_bid:.4f} for {position.source_name}"
+            )
+            ok, _ = self.executor.place_limit_sell(position.token_id, shares_to_sell, best_bid)
+            if ok:
+                exit_price = best_bid
+
+        if not ok:
+            logging.error(
+                f"❌ [PARTIAL SELL] All attempts failed for {position.source_name} "
+                f"token {position.token_id[:12]}… — will retry next cycle."
+            )
+            return
+
+        # Book the partial realised PnL and update position size
+        partial_pnl = (exit_price - position.entry_price) * shares_to_sell
+        position.shares        = shares_remaining
+        position.size_usd      = round(shares_remaining * position.entry_price, 4)
+        position.source_shares = new_source_shares   # new baseline for next comparison
+        position.pnl          += partial_pnl
+
+        if self.dry_run:
+            self.balance.apply_dry_run_sell(shares_to_sell * exit_price)
+        else:
+            if partial_pnl > 0:
+                cfg.compounding_bankroll += partial_pnl * cfg.COMPOUNDING_RATE
+
+        logging.info(
+            f"✅ [PARTIAL SELL] Done | {position.source_name} | "
+            f"sold {shares_to_sell:.4f} @ {exit_price:.4f} | "
+            f"PnL fragment {'+' if partial_pnl >= 0 else ''}${partial_pnl:.4f} | "
+            f"remaining {shares_remaining:.4f} shares"
+        )
+
+    def _execute_sell(self, pos_key: str, position: "Position", signal_source: str = "rest"):
+        """
+        Attempt to sell `position`.  Strategy:
+          1. Try a market (FOK) sell up to MAX_RETRIES times.
+          2. If every FOK attempt fails, place a limit sell at best_bid as fallback.
+        On success the position is moved to closed_positions.
+        """
+        # Guard against a concurrent WS + REST sell firing on the same position.
+        # Set immediately so a second caller sees "closing" before any await/sleep.
+        if position.status != "open":
+            logging.debug(
+                f"[SELL] Skipping {position.source_name} token {position.token_id[:12]}… "
+                f"— already {position.status}"
+            )
+            return
+        position.status = "closing"
+
+        best_bid, _, _ = self.get_orderbook_prices(position.token_id)
+        exit_price     = best_bid if best_bid > 0 else position.current_price or position.entry_price
+
+        # ── FOK attempts ──────────────────────────────────────────────────
+        ok = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            ok, _ = self.executor.place_sell(position.token_id, position.shares)
+            if ok:
+                logging.info(
+                    f"✅ [SELL] FOK filled on attempt {attempt} | "
+                    f"{position.source_name} | {position.outcome} "
+                    f"[signal_source={signal_source}]"
+                )
+                break
+            logging.warning(
+                f"[SELL] FOK attempt {attempt}/{MAX_RETRIES} failed for "
+                f"{position.source_name} token {position.token_id[:12]}…"
+            )
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+
+        # ── Limit sell fallback ───────────────────────────────────────────
+        if not ok:
+            if best_bid > 0:
+                logging.warning(
+                    f"[SELL] All FOK attempts exhausted — placing limit sell "
+                    f"@ best_bid {best_bid:.4f} for {position.source_name} "
+                    f"token {position.token_id[:12]}… [signal_source={signal_source}]"
+                )
+                ok, _ = self.executor.place_limit_sell(
+                    position.token_id, position.shares, best_bid
+                )
+                if ok:
+                    exit_price = best_bid
+                    logging.info(
+                        f"✅ [SELL] Limit sell placed @ {best_bid:.4f} for "
+                        f"{position.source_name}"
+                    )
+                else:
+                    logging.error(
+                        f"❌ [SELL] Limit sell also failed for "
+                        f"{position.source_name} token {position.token_id[:12]}… "
+                        "— position left open, will retry next cycle."
+                    )
+                    position.status = "open"
+                    return          # leave position open; next scan will retry
+            else:
+                logging.error(
+                    f"❌ [SELL] No valid best_bid for {position.source_name} "
+                    f"token {position.token_id[:12]}… — cannot place limit sell. "
+                    "Retrying next cycle."
+                )
+                position.status = "open"
+                return
+
+        # ── Book the closed position ──────────────────────────────────────
+        pnl                 = (exit_price - position.entry_price) * position.shares
+        position.status     = "closed"
+        position.exit_price = exit_price
+        position.pnl        = pnl
+        position.signal_source = signal_source
+
+        if self.dry_run:
+            self.balance.apply_dry_run_sell(position.shares * exit_price)
+        else:
+            if pnl > 0:
+                cfg.compounding_bankroll += pnl * cfg.COMPOUNDING_RATE
+
+        self.closed_positions.append(position)
+        if pos_key in self.positions:
+            del self.positions[pos_key]
 
     async def scan_and_copy(self):
         if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until:
@@ -386,7 +616,7 @@ class CopyTrader:
                     logging.warning(f"[REST] Position limit reached — skipping REST fallback.")
                     continue
 
-                best_ask, mid_price = self.get_orderbook_prices(token_id)
+                _, best_ask, mid_price = self.get_orderbook_prices(token_id)
                 if best_ask <= 0:
                     actual_price = mid_price
                 else:
@@ -413,9 +643,6 @@ class CopyTrader:
 
                 ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
                 if ok:
-                    if self.dry_run:
-                        self.balance.apply_dry_run_buy(my_size)
-
                     self.seen.mark_seen(pos_key)
 
                     if self._ws_listener and token_id not in self._ws_tracked:
@@ -433,6 +660,7 @@ class CopyTrader:
                         size_usd      = my_size,
                         order_id      = order_id,
                         signal_source = "rest",
+                        source_shares = shares,
                     )
 
             cur_price_map = {
@@ -446,31 +674,42 @@ class CopyTrader:
                     if rest_price > 0:
                         _pos.current_price = rest_price
 
+            # Build a map of current source shares for partial-sell detection
+            source_shares_map = {
+                pos.get("asset"): float(pos.get("size", pos.get("shares", 0)))
+                for pos in raw
+                if pos.get("asset")
+            }
+
             for pos_key, position in list(self.positions.items()):
-                if position.source_wallet != wallet_addr:
+                if position.source_wallet != wallet_addr or position.status != "open":
                     continue
-                if position.token_id not in source_token_ids and position.status == "open":
+
+                current_source_shares = source_shares_map.get(position.token_id, 0.0)
+
+                # ── Backfill source_shares on first REST scan after a WS fill ──
+                if position.source_shares <= 0 and current_source_shares > 0:
+                    position.source_shares = current_source_shares
+                    logging.debug(
+                        f"[PARTIAL] Backfilled source_shares={current_source_shares:.4f} "
+                        f"for {position.source_name} token {position.token_id[:12]}…"
+                    )
+
+                # ── Full exit (token gone from source wallet) ─────────────────
+                if position.token_id not in source_token_ids:
                     logging.info(
                         f"📉 [EXIT] {position.source_name} closed position — "
                         f"syncing sell [signal_source={position.signal_source}]"
                     )
-                    exit_price, _ = self.get_orderbook_prices(position.token_id)
-                    ok, _         = self.executor.place_sell(position.token_id, position.shares)
-                    if ok:
-                        pnl                 = (exit_price - position.entry_price) * position.shares
-                        position.status     = "closed"
-                        position.exit_price = exit_price
-                        position.pnl        = pnl
-                        
-                        if self.dry_run:
-                            estimated_return = position.shares * exit_price
-                            self.balance.apply_dry_run_sell(estimated_return)
-                        else:
-                            if pnl > 0:
-                                cfg.compounding_bankroll += pnl * cfg.COMPOUNDING_RATE
+                    self._execute_sell(pos_key, position, signal_source=position.signal_source)
+                    continue
 
-                        self.closed_positions.append(position)
-                        del self.positions[pos_key]
+                # ── Partial sell (source reduced ≥ PARTIAL_SELL_THRESHOLD) ────
+                if position.source_shares > 0 and current_source_shares > 0:
+                    reduction = (position.source_shares - current_source_shares) / position.source_shares
+                    if reduction >= PARTIAL_SELL_THRESHOLD:
+                        self._execute_partial_sell(pos_key, position, reduction, current_source_shares)
+
 
 # ==================== WEB DASHBOARD ====================
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -665,7 +904,7 @@ def build_dashboard(bot) -> dict:
 
     total_pnl  = realised + unrealised
     def _fmt(v): return f"{abs(v):.4f}" if abs(v) < 0.005 else f"{abs(v):.2f}"
-    comp_delta = cfg.compounding_bankroll - (bot.balance.peak_balance or 10.0)
+    comp_delta = cfg.compounding_bankroll - cfg.initial_bankroll
 
     return {
         "last_updated":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

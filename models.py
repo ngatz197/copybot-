@@ -29,8 +29,9 @@ class Position:
     exit_price:    float = 0.0
     pnl:           float = 0.0
     order_id:      str   = ""
-    current_price: float = 0.0
-    signal_source: str   = "rest"   # "ws" | "rest"
+    current_price:  float = 0.0
+    signal_source:  str   = "rest"   # "ws" | "rest"
+    source_shares:  float = 0.0      # source wallet's share count at entry (for partial-sell ratio)
 
 @dataclass
 class PendingLimitBuy:
@@ -45,6 +46,7 @@ class PendingLimitBuy:
     size_usd:      float
     order_id:      str
     signal_source: str      = "rest"   # "ws" | "rest"
+    source_shares: float    = 0.0      # source wallet's share count at signal time
     placed_at:     datetime = field(default_factory=datetime.now)
 
 # ==================== SEEN TRADES STORE ====================
@@ -74,6 +76,7 @@ class SeenTradesStore:
                     )
                 """)
             self._seen   = self._load_postgres()
+            self._pending_writes: list = []
             self.backend = "postgres"
             logging.info(f"Postgres connected — {len(self._seen)} seen keys loaded")
         except Exception as e:
@@ -99,6 +102,7 @@ class SeenTradesStore:
                 )
         except Exception as e:
             logging.warning(f"Postgres save failed for {pos_key}: {e}")
+            self._pending_writes.append(pos_key)
             self._reconnect_postgres()
 
     def _save_postgres_many(self, keys):
@@ -119,6 +123,10 @@ class SeenTradesStore:
             self._conn = psycopg2.connect(self.db_url, sslmode="require")
             self._conn.autocommit = True
             logging.info("Postgres reconnected")
+            if getattr(self, "_pending_writes", None):
+                self._save_postgres_many(self._pending_writes)
+                self._pending_writes.clear()
+                logging.info("Postgres: replayed pending writes after reconnect")
         except Exception as e:
             logging.error(f"Postgres reconnect failed: {e}")
 
@@ -129,6 +137,11 @@ class SeenTradesStore:
                 self._seen = set(data) if isinstance(data, list) else set()
         except FileNotFoundError:
             self._seen = set()
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"seen_trades file '{self.filepath}' is corrupted and cannot be parsed: {e}. "
+                "Delete or repair the file before restarting."
+            ) from e
         except Exception as e:
             logging.warning(f"Could not read seen trades file: {e}")
             self._seen = set()
