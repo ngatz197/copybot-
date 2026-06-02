@@ -5,7 +5,7 @@ import logging
 import threading
 import psycopg2
 import config as cfg
-from services import CopyTrader, run_health_server
+from engine import CopyTrader, run_health_server
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
