@@ -1,0 +1,647 @@
+# engine.py
+import os
+import time
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, Set, Tuple, Optional
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import requests
+import config as cfg
+
+# Import internal modular representations
+from models import Position, PendingLimitBuy, SeenTradesStore
+from exchange import RobustBalanceManager, PolymarketExecutor, PolymarketWSListener
+
+MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "8"))
+LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
+LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
+SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
+DATABASE_URL          = os.getenv("DATABASE_URL", "")
+HEALTH_PORT           = int(os.getenv("PORT", "8080"))
+
+def _price_based_size(price: float) -> float:
+    if price < 0.30:
+        pct = 0.006
+    elif price <= 0.70:
+        pct = 0.010
+    else:
+        pct = 0.030
+    return cfg.compounding_bankroll * pct
+
+def _calc_size(config: dict, price: float, source_value: float = 0.0) -> float:
+    if config.get("risk_type") == "fixed":
+        return cfg.compounding_bankroll * config.get("fixed_risk", 0.025)
+
+    tiered = _price_based_size(price)
+    if tiered < 1.0 and config.get("copy_sub_dollar", False) and source_value > 0:
+        return source_value
+    return tiered
+
+class CopyTrader:
+    def __init__(self, dry_run: bool = True):
+        self.dry_run          = dry_run
+        self.balance          = RobustBalanceManager(dry_run=self.dry_run)
+        
+        try:
+            logging.info("Initializing bankroll allocation from live wallet balance...")
+            initial_balance = self.balance.fetch_with_retry(retries=5, delay=5)
+            cfg.compounding_bankroll = initial_balance
+            cfg.peak_bankroll        = initial_balance
+        except Exception as e:
+            logging.error(f"Critical initialization failure: {e}")
+            raise SystemExit("Exiting bot: Unable to ascertain initial balance configuration.")
+
+        self.positions:       Dict[str, Position]        = {}
+        self.pending:         Dict[str, PendingLimitBuy] = {}
+        self.closed_positions: list                      = []
+        self.executor         = PolymarketExecutor(dry_run)
+        self.seen             = SeenTradesStore(SEEN_TRADES_FILE, DATABASE_URL)
+        self._first_scan_done: Set[str] = set()
+
+        self._ws_price_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+        self._ws_tracked:     Set[str]      = set()
+        
+        try:
+            import websockets
+            self._ws_listener = PolymarketWSListener(
+                token_ids          = self._ws_tracked,
+                ws_price_queue     = self._ws_price_queue,
+                on_trade_callback  = self._on_ws_signal,
+            )
+            logging.info("PolymarketWSListener initialised with trade callback")
+        except ImportError:
+            self._ws_listener = None
+            logging.warning("WebSocket listener inactive — install websockets to enable")
+
+        logging.info(f"CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
+
+    async def _on_ws_signal(self, ev: dict):
+        if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until:
+            return
+        is_broken, _ = self.balance.check_drawdown()
+        if is_broken:
+            return
+
+        tracked_wallets = {addr.lower(): addr for addr in cfg.WALLETS}
+        maker, taker    = ev.get("maker_addr", ""), ev.get("taker_addr", "")
+        matched_lower   = next((w for w in tracked_wallets if w in (maker, taker)), None)
+        if not matched_lower:
+            return
+
+        matched_addr = tracked_wallets[matched_lower]
+        config       = cfg.WALLETS.get(matched_addr) or cfg.WALLETS.get(matched_lower)
+        if not config:
+            return
+
+        token_id = ev["token_id"]
+        side     = ev["side"]
+        pos_key  = f"{matched_lower}_{token_id}_{side}"
+
+        if self.seen.is_seen(pos_key) or pos_key in self.pending:
+            return
+
+        if len(self.positions) >= MAX_POSITIONS:
+            logging.warning(f"[WS] Position limit reached — skipping {config['name']} signal.")
+            return
+
+        best_ask, mid_price = self.get_orderbook_prices(token_id)
+        if best_ask <= 0:
+            actual_price = mid_price
+        else:
+            premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+            actual_price = min(best_ask, mid_price * (1.0 + premium))
+
+        if actual_price <= 0 or actual_price >= 1.0:
+            logging.error(f"[WS] Invalid price {actual_price} for {token_id[:12]} — aborting.")
+            return
+
+        source_value = float(ev.get("size", 0.0)) * actual_price
+        my_size = _calc_size(config, actual_price, source_value)
+
+        if my_size < 1.0 and not config.get("copy_sub_dollar", False):
+            logging.info(f"[WS] Sub-dollar size (${my_size:.2f}) rejected for {config['name']}.")
+            return
+
+        logging.info(f"⚡ [WS INSTANT] {config['name']} | {side} token {token_id[:12]}… @ {actual_price:.4f} (${my_size:.2f}) [signal_source=ws]")
+
+        ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
+        if not ok:
+            logging.warning(f"[WS] Order placement failed for {config['name']} — REST poll will retry.")
+            return
+
+        if self.dry_run:
+            self.balance.apply_dry_run_buy(my_size)
+
+        self.seen.mark_seen(pos_key)
+
+        self.pending[pos_key] = PendingLimitBuy(
+            pos_key       = pos_key,
+            token_id      = token_id,
+            market_id     = "pending-ws",
+            question      = f"WS signal — {token_id[:16]}…",
+            outcome       = side,
+            source_wallet = matched_addr,
+            source_name   = config["name"],
+            limit_price   = actual_price,
+            size_usd      = my_size,
+            order_id      = order_id,
+            signal_source = "ws",
+        )
+
+        if self._ws_listener and token_id not in self._ws_tracked:
+            asyncio.create_task(self._ws_listener.subscribe_token(token_id))
+
+    def _get_positions_sync(self, wallet_addr: str) -> Optional[list]:
+        url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50"
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.get(url, timeout=12)
+                if resp.status_code == 200:
+                    return resp.json()
+                elif resp.status_code == 404:
+                    return []
+            except Exception as e:
+                logging.warning(f"[REST] Attempt {attempt+1} failed: {e}")
+                time.sleep(RETRY_DELAY)
+        return None
+
+    async def _fetch_all_wallets(self) -> Dict[str, Optional[list]]:
+        loop         = asyncio.get_event_loop()
+        wallet_addrs = list(cfg.WALLETS.keys())
+        tasks        = [loop.run_in_executor(None, self._get_positions_sync, addr) for addr in wallet_addrs]
+        results      = await asyncio.gather(*tasks, return_exceptions=True)
+        out = {}
+        for addr, result in zip(wallet_addrs, results):
+            if isinstance(result, Exception):
+                out[addr] = None
+            else:
+                out[addr] = result
+        return out
+
+    def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8)
+                if r.status_code == 200:
+                    data     = r.json()
+                    bids     = data.get("bids", [])
+                    asks     = data.get("asks", [])
+                    best_bid = float(bids[0]["price"]) if bids else 0.0
+                    best_ask = float(asks[0]["price"]) if asks else 0.0
+                    mid      = ((best_bid + best_ask) / 2 if best_bid and best_ask else (best_bid or best_ask or 0.50))
+                    return best_ask, mid
+            except Exception:
+                time.sleep(1)
+        return 0.0, 0.50
+
+    def get_market_question(self, market_id: str) -> str:
+        if not market_id or market_id in ("unknown", "pending-ws"):
+            return "Polymarket Asset"
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = requests.get(f"https://clob.polymarket.com/markets/{market_id}", timeout=8)
+                if r.status_code == 200:
+                    return r.json().get("question", "Polymarket Asset")
+            except Exception:
+                time.sleep(1)
+        return "Polymarket Asset"
+
+    def _reconcile_ws_pending(self, raw_by_wallet: Dict[str, Optional[list]]):
+        for pos_key, pending in self.pending.items():
+            if pending.market_id != "pending-ws":
+                continue
+            wallet_raw = raw_by_wallet.get(pending.source_wallet) or []
+            for rest_pos in wallet_raw:
+                if rest_pos.get("asset") == pending.token_id:
+                    market_id = rest_pos.get("conditionId", "unknown")
+                    question  = self.get_market_question(market_id)
+                    pending.market_id = market_id
+                    pending.question  = question
+                    logging.info(f"[WS→REST] Reconciled pending '{question[:40]}' for {pending.source_name}")
+                    break
+
+    def clean_expired_limit_orders(self):
+        now = datetime.now()
+        for k, p in list(self.pending.items()):
+            if (now - p.placed_at).total_seconds() >= LIMIT_EXPIRY_SECONDS:
+                if self.executor.cancel_order(p.order_id):
+                    del self.pending[k]
+
+    def process_pending_fills(self):
+        for k, p in list(self.pending.items()):
+            if self.executor.is_order_filled(p.order_id):
+                logging.info(f"✨ [FILL] {p.source_name} | {p.outcome} | signal_source={p.signal_source}")
+                self.positions[k] = Position(
+                    market_id     = p.market_id,
+                    question      = p.question,
+                    outcome       = p.outcome,
+                    token_id      = p.token_id,
+                    entry_price   = p.limit_price,
+                    size_usd      = p.size_usd,
+                    shares        = round(p.size_usd / p.limit_price, 4),
+                    source_wallet = p.source_wallet,
+                    source_name   = p.source_name,
+                    order_id      = p.order_id,
+                    current_price = p.limit_price,
+                    signal_source = p.signal_source,
+                )
+                del self.pending[k]
+
+    async def _drain_ws_price_queue(self):
+        drained = 0
+        while not self._ws_price_queue.empty():
+            try:
+                ev = self._ws_price_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            token_id = ev.get("token_id", "")
+            price    = ev.get("price", 0.0)
+            if token_id and price:
+                for pos in self.positions.values():
+                    if pos.token_id == token_id:
+                        pos.current_price = price
+            drained += 1
+
+    async def scan_and_copy(self):
+        if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until:
+            return
+
+        is_broken, dd_pct = self.balance.check_drawdown()
+        if is_broken:
+            logging.critical(f"🛑 DRAWDOWN TRIGGERED ({dd_pct*100:.1f}%) — pausing 48 h.")
+            cfg.bot_paused_until = datetime.now() + timedelta(hours=48)
+            return
+
+        current_bal = self.balance.get_balance()
+        if current_bal is None:
+            return
+
+        self.clean_expired_limit_orders()
+        self.process_pending_fills()
+        await self._drain_ws_price_queue()
+
+        logging.info(f"Poll | Balance: ${current_bal:.2f} | Positions: {len(self.positions)} | Pending: {len(self.pending)} | WS tokens: {len(self._ws_tracked)}")
+
+        all_wallet_data = await self._fetch_all_wallets()
+        self._reconcile_ws_pending(all_wallet_data)
+
+        for wallet_addr, config in cfg.WALLETS.items():
+            raw = all_wallet_data.get(wallet_addr)
+            if raw is None:
+                continue
+
+            source_token_ids = {
+                pos.get("asset") for pos in raw
+                if pos.get("asset") and float(pos.get("size", pos.get("shares", 0))) > 0
+            }
+
+            if wallet_addr not in self._first_scan_done:
+                if config.get("copy_mode") == "new_only":
+                    pre_existing = [
+                        f"{wallet_addr.lower()}_{pos.get('asset')}_{pos.get('side','YES').upper()}"
+                        for pos in raw
+                        if pos.get("asset") and float(pos.get("size", pos.get("shares", 0))) > 0
+                    ]
+                    self.seen.snapshot_existing(pre_existing)
+                self._first_scan_done.add(wallet_addr)
+
+            for pos in raw:
+                token_id  = pos.get("asset")
+                shares    = float(pos.get("size", pos.get("shares", 0)))
+                side      = pos.get("side", "YES").upper()
+                market_id = pos.get("conditionId", "unknown")
+
+                if not token_id or shares <= 0:
+                    continue
+
+                pos_key = f"{wallet_addr.lower()}_{token_id}_{side}"
+
+                if self.seen.is_seen(pos_key) or pos_key in self.pending:
+                    continue
+
+                if len(self.positions) >= MAX_POSITIONS:
+                    continue
+
+                best_ask, mid_price = self.get_orderbook_prices(token_id)
+                if best_ask <= 0:
+                    actual_price = mid_price
+                else:
+                    premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                    actual_price = min(best_ask, mid_price * (1.0 + premium))
+
+                if actual_price <= 0 or actual_price >= 1.0:
+                    continue
+
+                source_value = float(pos.get("initialValue", pos.get("value", 0.0)))
+                my_size = _calc_size(config, actual_price, source_value)
+
+                if my_size < 1.0 and not config.get("copy_sub_dollar", False):
+                    continue
+
+                question_str = self.get_market_question(market_id)
+                logging.info(f"🔁 [REST FALLBACK] {config['name']} | {side} | '{question_str[:40]}' @ {actual_price:.4f} [signal_source=rest]")
+
+                ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
+                if ok:
+                    if self.dry_run:
+                        self.balance.apply_dry_run_buy(my_size)
+                    self.seen.mark_seen(pos_key)
+
+                    if self._ws_listener and token_id not in self._ws_tracked:
+                        asyncio.create_task(self._ws_listener.subscribe_token(token_id))
+
+                    self.pending[pos_key] = PendingLimitBuy(
+                        pos_key       = pos_key,
+                        token_id      = token_id,
+                        market_id     = market_id,
+                        question      = question_str,
+                        outcome       = side,
+                        source_wallet = wallet_addr,
+                        source_name   = config["name"],
+                        limit_price   = actual_price,
+                        size_usd      = my_size,
+                        order_id      = order_id,
+                        signal_source = "rest",
+                    )
+
+            cur_price_map = {
+                pos.get("asset"): float(pos.get("curPrice", 0))
+                for pos in raw
+                if pos.get("asset") and float(pos.get("curPrice", 0)) > 0
+            }
+            for _pos in self.positions.values():
+                if _pos.source_wallet == wallet_addr and _pos.token_id in cur_price_map:
+                    rest_price = cur_price_map[_pos.token_id]
+                    if rest_price > 0:
+                        _pos.current_price = rest_price
+
+            for pos_key, position in list(self.positions.items()):
+                if position.source_wallet != wallet_addr:
+                    continue
+                if position.token_id not in source_token_ids and position.status == "open":
+                    logging.info(f"📉 [EXIT] {position.source_name} closed position — syncing sell [signal_source={position.signal_source}]")
+                    exit_price, _ = self.get_orderbook_prices(position.token_id)
+                    ok, _         = self.executor.place_sell(position.token_id, position.shares)
+                    if ok:
+                        pnl                 = (exit_price - position.entry_price) * position.shares
+                        position.status     = "closed"
+                        position.exit_price = exit_price
+                        position.pnl        = pnl
+                        
+                        if self.dry_run:
+                            self.balance.apply_dry_run_sell(position.shares * exit_price)
+                        else:
+                            if pnl > 0:
+                                cfg.compounding_bankroll += pnl * cfg.COMPOUNDING_RATE
+
+                        self.closed_positions.append(position)
+                        del self.positions[pos_key]
+
+# ==================== WEB DASHBOARD LAYER ====================
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>CopyTrader Dashboard</title>
+    <meta http-equiv="refresh" content="15">
+    <style>
+        *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: 'Segoe UI', system-ui, sans-serif; background: #0d0d0f; color: #e2e8f0; min-height: 100vh; padding: 24px 16px; }}
+        .page {{ max-width: 1100px; margin: 0 auto; }}
+        .header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; flex-wrap: wrap; gap: 8px; }}
+        .header-title {{ font-size: 1.25rem; font-weight: 700; color: #f8fafc; letter-spacing: -0.3px; }}
+        .header-title span {{ color: #6ee7b7; }}
+        .badge {{ font-size: 0.72rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; letter-spacing: 0.4px; text-transform: uppercase; }}
+        .badge-live   {{ background: #064e3b; color: #6ee7b7; border: 1px solid #065f46; }}
+        .badge-dry    {{ background: #1e1b4b; color: #a5b4fc; border: 1px solid #312e81; }}
+        .badge-paused {{ background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }}
+        .badge-ws     {{ background: #083344; color: #67e8f9; border: 1px solid #155e75; }}
+        .badge-src-ws       {{ background: #083344; color: #67e8f9; font-size: 0.62rem; padding: 1px 6px; border-radius: 999px; }}
+        .badge-src-rest     {{ background: #1e1b4b; color: #a5b4fc; font-size: 0.62rem; padding: 1px 6px; border-radius: 999px; }}
+        .timestamp    {{ font-size: 0.75rem; color: #64748b; }}
+        .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 24px; }}
+        .stat-card {{ background: #16181d; border: 1px solid #1e2230; border-radius: 12px; padding: 18px 20px; }}
+        .stat-label {{ font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; color: #64748b; margin-bottom: 6px; }}
+        .stat-value {{ font-size: 1.6rem; font-weight: 700; color: #f1f5f9; line-height: 1; }}
+        .stat-sub {{ font-size: 0.75rem; color: #475569; margin-top: 5px; }}
+        .pos {{ color: #34d399; }} .neg {{ color: #f87171; }} .neu {{ color: #94a3b8; }}
+        .section {{ background: #16181d; border: 1px solid #1e2230; border-radius: 12px; margin-bottom: 20px; overflow: hidden; }}
+        .section-header {{ display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid #1e2230; }}
+        .section-title {{ font-size: 0.85rem; font-weight: 700; color: #cbd5e1; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .count-pill {{ font-size: 0.72rem; font-weight: 700; background: #1e2230; color: #94a3b8; border-radius: 999px; padding: 2px 10px; }}
+        .tbl-wrap {{ overflow-x: auto; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
+        thead th {{ padding: 10px 16px; text-align: left; font-size: 0.70rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #475569; background: #13151a; white-space: nowrap; }}
+        tbody tr {{ border-top: 1px solid #1a1d26; transition: background 0.15s; }}
+        tbody tr:hover {{ background: #1c1f28; }}
+        tbody td {{ padding: 12px 16px; color: #cbd5e1; vertical-align: middle; }}
+        .market-name {{ font-weight: 500; color: #e2e8f0; max-width: 280px; }}
+        .outcome-pill {{ display: inline-block; font-size: 0.68rem; font-weight: 700; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; }}
+        .outcome-yes {{ background: #064e3b; color: #6ee7b7; }}
+        .outcome-no  {{ background: #450a0a; color: #fca5a5; }}
+        .source-tag  {{ font-size: 0.70rem; font-weight: 600; color: #818cf8; background: #1e1b4b; padding: 2px 8px; border-radius: 999px; }}
+        .price-mono  {{ font-family: 'Courier New', monospace; font-size: 0.80rem; }}
+        .pnl-cell    {{ font-weight: 700; font-size: 0.83rem; white-space: nowrap; }}
+        .empty {{ padding: 32px 20px; text-align: center; color: #334155; font-size: 0.85rem; }}
+        .empty-icon  {{ font-size: 1.8rem; margin-bottom: 8px; }}
+    </style>
+</head>
+<body>
+<div class="page">
+    <div class="header">
+        <div>
+            <div class="header-title">🤖 Poly<span>CopyTrader</span></div>
+            <div class="timestamp">Updated {last_updated} &nbsp;·&nbsp; Auto-refresh 15s</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <span class="badge {mode_badge}">{mode_label}</span>
+            <span class="badge {status_badge}">{status_label}</span>
+            <span class="badge badge-ws">⚡ WS {ws_token_count} tokens</span>
+        </div>
+    </div>
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-label">Total Balance</div>
+            <div class="stat-value">${balance:.2f}</div>
+            <div class="stat-sub">pUSD &nbsp;·&nbsp; Peak ${peak:.2f}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Compounding Bankroll</div>
+            <div class="stat-value {comp_cls}">${comp_bankroll:.2f}</div>
+            <div class="stat-sub">Sizing base &nbsp;·&nbsp; Rate {comp_rate:.0f}%</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Total PnL</div>
+            <div class="stat-value {total_pnl_cls}">{total_pnl_sign}${total_pnl_abs}</div>
+            <div class="stat-sub">Realised + Unrealised</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Unrealised</div>
+            <div class="stat-value {unreal_cls}">{unreal_sign}${unreal_abs}</div>
+            <div class="stat-sub">{open_count} open position(s)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Realised</div>
+            <div class="stat-value {real_cls}">{real_sign}${real_abs}</div>
+            <div class="stat-sub">{closed_count} closed trade(s)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Drawdown</div>
+            <div class="stat-value {dd_cls}">{drawdown:.1f}%</div>
+            <div class="stat-sub">Max {max_dd:.0f}%</div>
+        </div>
+    </div>
+    <div class="section">
+        <div class="section-header">
+            <span class="section-title">Open Positions</span>
+            <span class="count-pill">{open_count}</span>
+        </div>
+        {positions_block}
+    </div>
+    <div class="section">
+        <div class="section-header">
+            <span class="section-title">Closed Trades</span>
+            <span class="count-pill">{closed_count}</span>
+        </div>
+        {closed_block}
+    </div>
+</div>
+</body>
+</html>
+"""
+
+def _signal_badge(source: str) -> str:
+    cls = {"ws": "badge-src-ws", "rest": "badge-src-rest"}.get(source, "badge-src-rest")
+    return f'<span class="{cls}">{source}</span>'
+
+def build_dashboard(bot) -> dict:
+    def _sign(v): return "+" if v > 0 else ("-" if v < 0 else "")
+    def _cls(v):  return "pos" if v > 0 else ("neg" if v < 0 else "neu")
+
+    bankroll  = bot.balance.cached_balance or 0.0
+    drawdown  = ((cfg.peak_bankroll - bankroll) / cfg.peak_bankroll * 100) if cfg.peak_bankroll > 0 else 0.0
+    is_paused = bool(cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until)
+
+    status_label = "Paused" if is_paused else "Running"
+    status_badge = "badge-paused" if is_paused else "badge-live"
+    mode_label   = "Dry Run" if bot.dry_run else "Live"
+    mode_badge   = "badge-dry" if bot.dry_run else "badge-live"
+
+    unrealised = 0.0
+    pos_rows   = ""
+    for p in bot.positions.values():
+        mid    = p.current_price if p.current_price > 0 else p.entry_price
+        unreal = (mid - p.entry_price) * p.shares
+        unrealised += unreal
+
+        outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
+        pnl_cls     = _cls(unreal)
+        pnl_fmt     = ".4f" if abs(unreal) < 0.005 else ".2f"
+        pnl_str     = f"{_sign(unreal)}${abs(unreal):{pnl_fmt}}"
+        cur_str     = f"{mid:.3f}" if p.current_price > 0 else "—"
+
+        pos_rows += f"""
+        <tr>
+            <td><span class="source-tag">{{p.source_name}}</span>&nbsp;{_signal_badge(p.signal_source)}</td>
+            <td class="market-name">{{p.question[:55]}}</td>
+            <td><span class="outcome-pill {outcome_cls}">{{p.outcome}}</span></td>
+            <td>${{p.size_usd:.2f}}<br><span style="font-size:0.70rem;color:#475569;">{{p.shares:.4f}} shares</span></td>
+            <td class="price-mono">{{p.entry_price:.3f}}</td>
+            <td class="price-mono">{cur_str}</td>
+            <td class="pnl-cell {pnl_cls}">{pnl_str}</td>
+        </tr>"""
+
+    positions_block = (
+        f'<div class="tbl-wrap"><table>'
+        f'<thead><tr><th>Source</th><th>Market</th><th>Side</th><th>Size</th>'
+        f'<th>Entry</th><th>Current</th><th>Unreal PnL</th></tr></thead>'
+        f'<tbody>{pos_rows}</tbody></table></div>'
+        if pos_rows else
+        '<div class="empty"><div class="empty-icon">📭</div>No open positions</div>'
+    )
+
+    closed_list = getattr(bot, "closed_positions", [])
+    realised    = sum(p.pnl for p in closed_list)
+    closed_rows = ""
+    for p in reversed(closed_list):
+        outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
+        pnl_str     = f"{_sign(p.pnl)}${abs(p.pnl):.2f}"
+        closed_rows += f"""
+        <tr>
+            <td><span class="source-tag">{{p.source_name}}</span>&nbsp;{_signal_badge(p.signal_source)}</td>
+            <td class="market-name">{{p.question[:55]}}</td>
+            <td><span class="outcome-pill {outcome_cls}">{{p.outcome}}</span></td>
+            <td class="price-mono">{{p.entry_price:.3f}}</td>
+            <td class="price-mono">{{p.exit_price:.3f}}</td>
+            <td class="pnl-cell {_cls(p.pnl)}">{pnl_str}</td>
+        </tr>"""
+
+    closed_block = (
+        f'<div class="tbl-wrap"><table>'
+        f'<thead><tr><th>Source</th><th>Market</th><th>Side</th>'
+        f'<th>Entry</th><th>Exit</th><th>Realised PnL</th></tr></thead>'
+        f'<tbody>{closed_rows}</tbody></table></div>'
+        if closed_rows else
+        '<div class="empty"><div class="empty-icon">📋</div>No closed trades yet</div>'
+    )
+
+    total_pnl  = realised + unrealised
+    def _fmt(v): return f"{abs(v):.4f}" if abs(v) < 0.005 else f"{abs(v):.2f}"
+    comp_delta = cfg.compounding_bankroll - (bot.balance.peak_balance or 10.0)
+
+    return {
+        "last_updated":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode_label":     mode_label,
+        "mode_badge":     mode_badge,
+        "status_label":   status_label,
+        "status_badge":   status_badge,
+        "ws_token_count": len(bot._ws_tracked),
+        "balance":        bankroll,
+        "peak":           cfg.peak_bankroll,
+        "drawdown":       drawdown,
+        "dd_cls":         "neg" if drawdown > 10 else ("neu" if drawdown > 5 else "pos"),
+        "max_dd":         MAX_DRAWDOWN * 100,
+        "comp_bankroll":  cfg.compounding_bankroll,
+        "comp_cls":       _cls(comp_delta),
+        "comp_rate":      cfg.COMPOUNDING_RATE * 100,
+        "total_pnl_cls":  _cls(total_pnl),
+        "total_pnl_sign": _sign(total_pnl),
+        "total_pnl_abs":  _fmt(total_pnl),
+        "unreal_cls":     _cls(unrealised),
+        "unreal_sign":    _sign(unrealised),
+        "unreal_abs":     _fmt(unrealised),
+        "real_cls":       _cls(realised),
+        "real_sign":      _sign(realised),
+        "real_abs":       _fmt(realised),
+        "open_count":     len(bot.positions),
+        "closed_count":   len(closed_list),
+        "positions_block": positions_block,
+        "closed_block":    closed_block,
+    }
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/" and cfg._bot_ref:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            try:
+                data = build_dashboard(cfg._bot_ref)
+                html = HTML_TEMPLATE.format(**data)
+                self.wfile.write(html.encode())
+            except Exception:
+                self.wfile.write(b"<h1>Dashboard loading...</h1>")
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK - CopyTrader V2 running")
+
+    def log_message(self, format, *args):
+        pass
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
+    logging.info(f"🌐 Dashboard live at http://0.0.0.0:{HEALTH_PORT}")
+    server.serve_forever()
