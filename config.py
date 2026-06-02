@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime
-from typing import Optional, Dict, Set
+from typing import Optional, Dict
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -9,11 +9,11 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ==================== OPERATIONAL FLAGS ====================
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-POLL_INTERVAL = int(os.getenv("POLL_SECONDS", "40"))
-COMCOUNDING_RATE = float(os.getenv("COMPOUNDING_RATE", "0.70"))
-MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.20"))
-HEALTH_PORT = int(os.getenv("PORT", "8080"))
+DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
+POLL_INTERVAL    = int(os.getenv("POLL_SECONDS", "40"))
+COMPOUNDING_RATE = float(os.getenv("COMPOUNDING_RATE", "0.70"))  # ✅ fixed typo
+MAX_DRAWDOWN     = float(os.getenv("MAX_DRAWDOWN", "0.20"))
+HEALTH_PORT      = int(os.getenv("PORT", "8080"))
 
 # ==================== WALLET DEFINITIONS ====================
 WALLETS: Dict[str, dict] = {
@@ -44,25 +44,25 @@ WALLETS: Dict[str, dict] = {
 
 # ==================== SECRETS & REQS ====================
 YOUR_PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
-YOUR_WALLET = os.getenv("DEPOSIT_WALLET_ADDRESS", "")
-POLY_API_KEY = os.getenv("POLY_API_KEY", "")
-POLY_SECRET = os.getenv("POLY_SECRET", "")
-POLY_PASSPHRASE = os.getenv("POLY_PASSPHRASE", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+YOUR_WALLET      = os.getenv("DEPOSIT_WALLET_ADDRESS", "")
+POLY_API_KEY     = os.getenv("POLY_API_KEY", "")
+POLY_SECRET      = os.getenv("POLY_SECRET", "")
+POLY_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
+DATABASE_URL     = os.getenv("DATABASE_URL", "")
 
-INITIAL_BANKROLL = 10.0
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "8"))
-PAUSE_HOURS = 48
-MAX_RETRIES = 3
-RETRY_DELAY = 5
+INITIAL_BANKROLL      = 10.0
+MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "8"))
+PAUSE_HOURS           = 48
+MAX_RETRIES           = 3
+RETRY_DELAY           = 5
 
 LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
-LIMIT_EXPIRY_SECONDS = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
-SEEN_TRADES_FILE = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
+LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
+SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
 # ==================== RUNTIME SYSTEM HOOKS ====================
-bot_paused_until: Optional[datetime] = None
+bot_paused_until:     Optional[datetime] = None
 compounding_bankroll: float = INITIAL_BANKROLL
-peak_bankroll: float = INITIAL_BANKROLL
-_bot_ref = None  # Dashboard context anchor
+peak_bankroll:        float = INITIAL_BANKROLL
+_bot_ref                    = None  # Dashboard context anchor
