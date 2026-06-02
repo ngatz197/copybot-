@@ -4,7 +4,7 @@ import json
 import time
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Set, Tuple, Optional
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -372,11 +372,8 @@ class CopyTrader:
         self.closed_positions: list = []
         logging.info(f"Multi-Wallet CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
 
-    def _get_positions(self, wallet_addr: str) -> Optional[list]:
-        """
-        Fetch open positions for a wallet from Polymarket data API.
-        Returns a list of position dicts, or None on failure.
-        """
+    def _get_positions_sync(self, wallet_addr: str) -> Optional[list]:
+        """Blocking fetch — runs inside a thread via _fetch_all_wallets."""
         url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50"
         for attempt in range(MAX_RETRIES):
             try:
@@ -391,6 +388,26 @@ class CopyTrader:
                 logging.warning(f"[_get_positions] Attempt {attempt+1} failed: {e}")
                 time.sleep(RETRY_DELAY)
         return None
+
+    async def _fetch_all_wallets(self) -> Dict[str, Optional[list]]:
+        """Fetch all wallet positions simultaneously using a thread pool."""
+        loop = asyncio.get_event_loop()
+        wallet_addrs = list(cfg.WALLETS.keys())
+
+        tasks = [
+            loop.run_in_executor(None, self._get_positions_sync, addr)
+            for addr in wallet_addrs
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        out = {}
+        for addr, result in zip(wallet_addrs, results):
+            if isinstance(result, Exception):
+                logging.warning(f"[_fetch_all_wallets] Exception for {addr[:10]}: {result}")
+                out[addr] = None
+            else:
+                out[addr] = result
+        return out
 
     def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
         for attempt in range(MAX_RETRIES):
@@ -446,7 +463,7 @@ class CopyTrader:
         is_broken, dd_pct = self.balance.check_drawdown()
         if is_broken:
             logging.critical(f"🛑 CRITICAL DRAWDOWN TRIGGERED ({dd_pct*100:.1f}%)! Locking operations.")
-            cfg.bot_paused_until = datetime.now() + asyncio.timedelta(hours=48)
+            cfg.bot_paused_until = datetime.now() + timedelta(hours=48)
             return
 
         current_bal = self.balance.get_balance()
@@ -458,8 +475,11 @@ class CopyTrader:
         logging.info(f"Scan Run | Net Assets: ${current_bal:.2f} pUSD | Active Orders: {len(self.positions)} | Open Limits: {len(self.pending)}")
         source_token_ids_by_wallet = {}
 
+        # ---- Fetch all 4 wallets simultaneously ----
+        all_wallet_data = await self._fetch_all_wallets()
+
         for wallet_addr, config in cfg.WALLETS.items():
-            raw = self._get_positions(wallet_addr)
+            raw = all_wallet_data.get(wallet_addr)
             if raw is None:
                 logging.warning(f"[{config['name']}] Failed to fetch positions from API.")
                 continue
