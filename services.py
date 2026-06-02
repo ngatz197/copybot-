@@ -1,21 +1,3 @@
-
-
-
-#!/usr/bin/env python3 import os import json import time import asyncio import logging from datetime import datetime, timedelta from typing import Dict, Set, Tuple, Optional, Callable, Awaitable from dataclasses import dataclass, field from http.server import HTTPServer, BaseHTTPRequestHandler impor
-
-pasted
-
-
-remove hardcoded initial bankroll =10$. ensure initial bankroll  is fetched balance
-
-
-You are out of free messages until 10:20 PM
-Upgrade
-Pasted content
-55.71 KB •1,313 lines
-•
-Formatting may be inconsistent from source
-
 #!/usr/bin/env python3
 import os
 import json
@@ -64,7 +46,6 @@ POLY_SECRET           = os.getenv("POLY_SECRET", "")
 POLY_PASSPHRASE       = os.getenv("POLY_PASSPHRASE", "")
 DATABASE_URL          = os.getenv("DATABASE_URL", "")
 
-INITIAL_BANKROLL      = 10.0
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "8"))
 MAX_DRAWDOWN          = float(os.getenv("MAX_DRAWDOWN", "0.20"))
 HEALTH_PORT           = int(os.getenv("PORT", "8080"))
@@ -237,7 +218,8 @@ class RobustBalanceManager:
         "https://polygon.drpc.org",
     ]
 
-    def __init__(self):
+    def __init__(self, dry_run: bool = False):
+        self.dry_run = dry_run
         self.cached_balance: Optional[float] = None
         self.last_update = 0
         self.peak_balance = 0.0
@@ -267,6 +249,10 @@ class RobustBalanceManager:
         return 0.0
 
     def get_balance(self, force=False) -> Optional[float]:
+        # During dry runs, ignore blockchain sync intervals to safeguard mutating virtual balance states
+        if self.dry_run and self.cached_balance is not None:
+            return self.cached_balance
+
         if force or self.cached_balance is None or (time.time() - self.last_update > 30):
             real = self._fetch_balance()
             if real > 0:
@@ -300,6 +286,21 @@ class RobustBalanceManager:
             return False, 0.0
         dd = (self.peak_balance - current) / self.peak_balance
         return dd >= MAX_DRAWDOWN, dd
+
+    def apply_dry_run_buy(self, amount_usd: float):
+        if self.dry_run and self.cached_balance is not None:
+            self.cached_balance -= amount_usd
+            cfg.compounding_bankroll = self.cached_balance
+            logging.info(f"[DRY RUN] Deducted virtual funds: ${amount_usd:.2f} | Balance: ${self.cached_balance:.2f}")
+
+    def apply_dry_run_sell(self, return_usd: float):
+        if self.dry_run and self.cached_balance is not None:
+            self.cached_balance += return_usd
+            cfg.compounding_bankroll = self.cached_balance
+            if self.cached_balance > self.peak_balance:
+                self.peak_balance = self.cached_balance
+                cfg.peak_bankroll = self.cached_balance
+            logging.info(f"[DRY RUN] Credited virtual return: ${return_usd:.2f} | Balance: ${self.cached_balance:.2f}")
 
 # ==================== EXECUTOR (V2) ====================
 class PolymarketExecutor:
@@ -558,7 +559,6 @@ class PolymarketWSListener:
                     })
 
 # ==================== SIZING HELPERS ====================
-
 def _price_based_size(price: float) -> float:
     """
     Tier bankroll percentage by market price for price_based wallets.
@@ -616,7 +616,18 @@ class CopyTrader:
 
     def __init__(self, dry_run: bool = True):
         self.dry_run          = dry_run
-        self.balance          = RobustBalanceManager()
+        self.balance          = RobustBalanceManager(dry_run=self.dry_run)
+        
+        # Seed compounding references dynamically across both execution pathways
+        try:
+            logging.info("Initializing bankroll allocation from live wallet balance...")
+            initial_balance = self.balance.fetch_with_retry(retries=5, delay=5)
+            cfg.compounding_bankroll = initial_balance
+            cfg.peak_bankroll        = initial_balance
+        except Exception as e:
+            logging.error(f"Critical initialization failure: {e}")
+            raise SystemExit("Exiting bot: Unable to ascertain initial balance configuration.")
+
         self.positions:       Dict[str, Position]        = {}
         self.pending:         Dict[str, PendingLimitBuy] = {}
         self.closed_positions: list                      = []
@@ -645,7 +656,6 @@ class CopyTrader:
     # ------------------------------------------------------------------
     # WS Layer 1 — immediate signal handler
     # ------------------------------------------------------------------
-
     async def _on_ws_signal(self, ev: dict):
         """
         Called directly by PolymarketWSListener on every confirmed fill event.
@@ -729,6 +739,10 @@ class CopyTrader:
             # Do NOT mark seen — REST poll fallback will catch it on next cycle
             return
 
+        # Handle local dry-run compounding balance adjustments immediately 
+        if self.dry_run:
+            self.balance.apply_dry_run_buy(my_size)
+
         # Mark seen before REST poll runs so it skips this pos_key
         self.seen.mark_seen(pos_key)
 
@@ -754,7 +768,6 @@ class CopyTrader:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
     def _get_positions_sync(self, wallet_addr: str) -> Optional[list]:
         url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50"
         for attempt in range(MAX_RETRIES):
@@ -883,7 +896,6 @@ class CopyTrader:
     # ------------------------------------------------------------------
     # Layer 1b — drain WS price queue (keeps dashboard P&L live)
     # ------------------------------------------------------------------
-
     async def _drain_ws_price_queue(self):
         """Flush price_update events queued by the WS listener — no order logic here."""
         drained = 0
@@ -905,7 +917,6 @@ class CopyTrader:
     # ------------------------------------------------------------------
     # Layer 3 — REST poll (authoritative fallback + reconciliation)
     # ------------------------------------------------------------------
-
     async def scan_and_copy(self):
         """
         Poll loop body.  Runs every SCAN_INTERVAL seconds.
@@ -1026,6 +1037,10 @@ class CopyTrader:
 
                 ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
                 if ok:
+                    # Handle local dry-run compounding balance adjustments immediately 
+                    if self.dry_run:
+                        self.balance.apply_dry_run_buy(my_size)
+
                     self.seen.mark_seen(pos_key)
 
                     if self._ws_listener and token_id not in self._ws_tracked:
@@ -1073,8 +1088,14 @@ class CopyTrader:
                         position.status     = "closed"
                         position.exit_price = exit_price
                         position.pnl        = pnl
-                        if pnl > 0:
-                            cfg.compounding_bankroll += pnl * cfg.COMPOUNDING_RATE
+                        
+                        if self.dry_run:
+                            estimated_return = position.shares * exit_price
+                            self.balance.apply_dry_run_sell(estimated_return)
+                        else:
+                            if pnl > 0:
+                                cfg.compounding_bankroll += pnl * cfg.COMPOUNDING_RATE
+
                         self.closed_positions.append(position)
                         del self.positions[pos_key]
 
@@ -1271,7 +1292,7 @@ def build_dashboard(bot) -> dict:
 
     total_pnl  = realised + unrealised
     def _fmt(v): return f"{abs(v):.4f}" if abs(v) < 0.005 else f"{abs(v):.2f}"
-    comp_delta = cfg.compounding_bankroll - (bot.balance.peak_balance or INITIAL_BANKROLL)
+    comp_delta = cfg.compounding_bankroll - (bot.balance.peak_balance or 10.0)
 
     return {
         "last_updated":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
