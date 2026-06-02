@@ -1,38 +1,45 @@
-# exchange.py
+#!/usr/bin/env python3
 import os
 import time
 import json
 import logging
 import asyncio
 import requests
-from typing import Set, Tuple, Optional, Callable, Awaitable
+from typing import Tuple, Optional, Set, Callable, Awaitable
 import config as cfg
 
+# ==================== OPTIONAL DEPENDENCIES ====================
 try:
     from py_clob_client_v2 import (
         ClobClient, OrderArgs, MarketOrderArgs,
         OrderType, Side, ApiCreds, PartialCreateOrderOptions,
     )
     CLOB_AVAILABLE = True
+    logging.info("✅ py_clob_client_v2 loaded successfully")
 except ImportError:
     CLOB_AVAILABLE = False
+    logging.warning("py_clob_client_v2 not installed — running in simulation mode.")
 
 try:
     import websockets
     WEBSOCKETS_AVAILABLE = True
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
+    logging.warning("websockets not installed — WS listener disabled. Run: pip install websockets")
 
+# ==================== ENVIRONMENT / CONSTANTS ====================
 YOUR_PRIVATE_KEY      = os.getenv("PRIVATE_KEY", "")
 YOUR_WALLET           = os.getenv("DEPOSIT_WALLET_ADDRESS", "")
 POLY_API_KEY          = os.getenv("POLY_API_KEY", "")
 POLY_SECRET           = os.getenv("POLY_SECRET", "")
 POLY_PASSPHRASE       = os.getenv("POLY_PASSPHRASE", "")
+
 MAX_DRAWDOWN          = float(os.getenv("MAX_DRAWDOWN", "0.20"))
 MAX_RETRIES           = 3
 RETRY_DELAY           = 5
 PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
+# ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
     POLYGON_RPCS = [
         "https://polygon-bor-rpc.publicnode.com",
@@ -123,6 +130,7 @@ class RobustBalanceManager:
                 cfg.peak_bankroll = self.cached_balance
             logging.info(f"[DRY RUN] Credited virtual return: ${return_usd:.2f} | Balance: ${self.cached_balance:.2f}")
 
+# ==================== EXECUTOR (V2) ====================
 class PolymarketExecutor:
     def __init__(self, dry_run: bool):
         self.dry_run = dry_run
@@ -206,6 +214,7 @@ class PolymarketExecutor:
                 time.sleep(RETRY_DELAY)
         return False, ""
 
+# ==================== WEBSOCKET LISTENER ====================
 class PolymarketWSListener:
     WS_URL         = "wss://ws-subscriptions-clob.polymarket.com/ws/"
     PING_INTERVAL  = 20
@@ -218,9 +227,9 @@ class PolymarketWSListener:
         ws_price_queue:  asyncio.Queue,
         on_trade_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
     ):
-        self.token_ids          = token_ids
+        self.token_ids          = token_ids          
         self.ws_price_queue     = ws_price_queue
-        self.on_trade_callback  = on_trade_callback
+        self.on_trade_callback  = on_trade_callback  
         self._running           = False
         self._ws                = None
         self._subscribed: Set[str] = set()

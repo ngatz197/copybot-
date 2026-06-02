@@ -1,25 +1,35 @@
-# engine.py
+#!/usr/bin/env python3
 import os
 import time
-import asyncio
 import logging
+import asyncio
+import requests
 from datetime import datetime, timedelta
 from typing import Dict, Set, Tuple, Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import requests
 import config as cfg
 
-# Import internal modular representations
 from models import Position, PendingLimitBuy, SeenTradesStore
 from exchange import RobustBalanceManager, PolymarketExecutor, PolymarketWSListener
 
+# ==================== ENVIRONMENT / CONSTANTS ====================
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "8"))
+MAX_DRAWDOWN          = float(os.getenv("MAX_DRAWDOWN", "0.20"))
+HEALTH_PORT           = int(os.getenv("PORT", "8080"))
+MAX_RETRIES           = 3
+RETRY_DELAY           = 5
 LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
 LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 DATABASE_URL          = os.getenv("DATABASE_URL", "")
-HEALTH_PORT           = int(os.getenv("PORT", "8080"))
 
+try:
+    import websockets
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
+
+# ==================== SIZING HELPERS ====================
 def _price_based_size(price: float) -> float:
     if price < 0.30:
         pct = 0.006
@@ -29,15 +39,20 @@ def _price_based_size(price: float) -> float:
         pct = 0.030
     return cfg.compounding_bankroll * pct
 
+
 def _calc_size(config: dict, price: float, source_value: float = 0.0) -> float:
     if config.get("risk_type") == "fixed":
         return cfg.compounding_bankroll * config.get("fixed_risk", 0.025)
 
     tiered = _price_based_size(price)
+
     if tiered < 1.0 and config.get("copy_sub_dollar", False) and source_value > 0:
         return source_value
+
     return tiered
 
+
+# ==================== COPY TRADER ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run          = dry_run
@@ -57,21 +72,21 @@ class CopyTrader:
         self.closed_positions: list                      = []
         self.executor         = PolymarketExecutor(dry_run)
         self.seen             = SeenTradesStore(SEEN_TRADES_FILE, DATABASE_URL)
+
         self._first_scan_done: Set[str] = set()
 
         self._ws_price_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._ws_tracked:     Set[str]      = set()
-        
-        try:
-            import websockets
+        self._ws_listener:    Optional[PolymarketWSListener] = None
+
+        if WEBSOCKETS_AVAILABLE:
             self._ws_listener = PolymarketWSListener(
                 token_ids          = self._ws_tracked,
                 ws_price_queue     = self._ws_price_queue,
-                on_trade_callback  = self._on_ws_signal,
+                on_trade_callback  = self._on_ws_signal,   
             )
             logging.info("PolymarketWSListener initialised with trade callback")
-        except ImportError:
-            self._ws_listener = None
+        else:
             logging.warning("WebSocket listener inactive — install websockets to enable")
 
         logging.info(f"CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
@@ -85,7 +100,10 @@ class CopyTrader:
 
         tracked_wallets = {addr.lower(): addr for addr in cfg.WALLETS}
         maker, taker    = ev.get("maker_addr", ""), ev.get("taker_addr", "")
-        matched_lower   = next((w for w in tracked_wallets if w in (maker, taker)), None)
+
+        matched_lower = next(
+            (w for w in tracked_wallets if w in (maker, taker)), None
+        )
         if not matched_lower:
             return
 
@@ -123,7 +141,11 @@ class CopyTrader:
             logging.info(f"[WS] Sub-dollar size (${my_size:.2f}) rejected for {config['name']}.")
             return
 
-        logging.info(f"⚡ [WS INSTANT] {config['name']} | {side} token {token_id[:12]}… @ {actual_price:.4f} (${my_size:.2f}) [signal_source=ws]")
+        logging.info(
+            f"⚡ [WS INSTANT] {config['name']} | {side} "
+            f"token {token_id[:12]}… @ {actual_price:.4f} "
+            f"(${my_size:.2f}) [signal_source=ws]"
+        )
 
         ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
         if not ok:
@@ -138,7 +160,7 @@ class CopyTrader:
         self.pending[pos_key] = PendingLimitBuy(
             pos_key       = pos_key,
             token_id      = token_id,
-            market_id     = "pending-ws",
+            market_id     = "pending-ws",   
             question      = f"WS signal — {token_id[:16]}…",
             outcome       = side,
             source_wallet = matched_addr,
@@ -161,6 +183,8 @@ class CopyTrader:
                     return resp.json()
                 elif resp.status_code == 404:
                     return []
+                else:
+                    logging.warning(f"[REST] HTTP {resp.status_code} for {wallet_addr[:10]}")
             except Exception as e:
                 logging.warning(f"[REST] Attempt {attempt+1} failed: {e}")
                 time.sleep(RETRY_DELAY)
@@ -169,11 +193,15 @@ class CopyTrader:
     async def _fetch_all_wallets(self) -> Dict[str, Optional[list]]:
         loop         = asyncio.get_event_loop()
         wallet_addrs = list(cfg.WALLETS.keys())
-        tasks        = [loop.run_in_executor(None, self._get_positions_sync, addr) for addr in wallet_addrs]
-        results      = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks        = [
+            loop.run_in_executor(None, self._get_positions_sync, addr)
+            for addr in wallet_addrs
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         out = {}
         for addr, result in zip(wallet_addrs, results):
             if isinstance(result, Exception):
+                logging.warning(f"[REST] Exception for {addr[:10]}: {result}")
                 out[addr] = None
             else:
                 out[addr] = result
@@ -182,16 +210,23 @@ class CopyTrader:
     def get_orderbook_prices(self, token_id: str) -> Tuple[float, float]:
         for attempt in range(MAX_RETRIES):
             try:
-                r = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8)
+                r = requests.get(
+                    f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8
+                )
                 if r.status_code == 200:
                     data     = r.json()
                     bids     = data.get("bids", [])
                     asks     = data.get("asks", [])
                     best_bid = float(bids[0]["price"]) if bids else 0.0
                     best_ask = float(asks[0]["price"]) if asks else 0.0
-                    mid      = ((best_bid + best_ask) / 2 if best_bid and best_ask else (best_bid or best_ask or 0.50))
+                    mid      = (
+                        (best_bid + best_ask) / 2
+                        if best_bid and best_ask
+                        else (best_bid or best_ask or 0.50)
+                    )
                     return best_ask, mid
-            except Exception:
+            except Exception as e:
+                logging.warning(f"Orderbook request error: {e}")
                 time.sleep(1)
         return 0.0, 0.50
 
@@ -200,7 +235,9 @@ class CopyTrader:
             return "Polymarket Asset"
         for attempt in range(MAX_RETRIES):
             try:
-                r = requests.get(f"https://clob.polymarket.com/markets/{market_id}", timeout=8)
+                r = requests.get(
+                    f"https://clob.polymarket.com/markets/{market_id}", timeout=8
+                )
                 if r.status_code == 200:
                     return r.json().get("question", "Polymarket Asset")
             except Exception:
@@ -218,20 +255,30 @@ class CopyTrader:
                     question  = self.get_market_question(market_id)
                     pending.market_id = market_id
                     pending.question  = question
-                    logging.info(f"[WS→REST] Reconciled pending '{question[:40]}' for {pending.source_name}")
+                    logging.info(
+                        f"[WS→REST] Reconciled pending '{question[:40]}' "
+                        f"for {pending.source_name}"
+                    )
                     break
 
     def clean_expired_limit_orders(self):
         now = datetime.now()
         for k, p in list(self.pending.items()):
             if (now - p.placed_at).total_seconds() >= LIMIT_EXPIRY_SECONDS:
+                logging.info(
+                    f"[EXPIRY] Limit order expired for {p.source_name} "
+                    f"[signal_source={p.signal_source}] — cancelling…"
+                )
                 if self.executor.cancel_order(p.order_id):
                     del self.pending[k]
 
     def process_pending_fills(self):
         for k, p in list(self.pending.items()):
             if self.executor.is_order_filled(p.order_id):
-                logging.info(f"✨ [FILL] {p.source_name} | {p.outcome} | signal_source={p.signal_source}")
+                logging.info(
+                    f"✨ [FILL] {p.source_name} | {p.outcome} | "
+                    f"signal_source={p.signal_source}"
+                )
                 self.positions[k] = Position(
                     market_id     = p.market_id,
                     question      = p.question,
@@ -262,6 +309,8 @@ class CopyTrader:
                     if pos.token_id == token_id:
                         pos.current_price = price
             drained += 1
+        if drained:
+            logging.debug(f"[WS] Drained {drained} price update(s)")
 
     async def scan_and_copy(self):
         if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until:
@@ -279,22 +328,35 @@ class CopyTrader:
 
         self.clean_expired_limit_orders()
         self.process_pending_fills()
+
         await self._drain_ws_price_queue()
 
-        logging.info(f"Poll | Balance: ${current_bal:.2f} | Positions: {len(self.positions)} | Pending: {len(self.pending)} | WS tokens: {len(self._ws_tracked)}")
+        logging.info(
+            f"Poll | Balance: ${current_bal:.2f} | "
+            f"Positions: {len(self.positions)} | "
+            f"Pending: {len(self.pending)} | "
+            f"WS tokens: {len(self._ws_tracked)}"
+        )
 
         all_wallet_data = await self._fetch_all_wallets()
+
         self._reconcile_ws_pending(all_wallet_data)
 
         for wallet_addr, config in cfg.WALLETS.items():
             raw = all_wallet_data.get(wallet_addr)
             if raw is None:
+                logging.warning(f"[REST] Failed to fetch positions for {config['name']}.")
                 continue
 
             source_token_ids = {
                 pos.get("asset") for pos in raw
                 if pos.get("asset") and float(pos.get("size", pos.get("shares", 0))) > 0
             }
+
+            logging.info(
+                f"[REST] {config['name']} — {len(raw)} position(s), "
+                f"{len(source_token_ids)} active tokens"
+            )
 
             if wallet_addr not in self._first_scan_done:
                 if config.get("copy_mode") == "new_only":
@@ -321,6 +383,7 @@ class CopyTrader:
                     continue
 
                 if len(self.positions) >= MAX_POSITIONS:
+                    logging.warning(f"[REST] Position limit reached — skipping REST fallback.")
                     continue
 
                 best_ask, mid_price = self.get_orderbook_prices(token_id)
@@ -331,21 +394,28 @@ class CopyTrader:
                     actual_price = min(best_ask, mid_price * (1.0 + premium))
 
                 if actual_price <= 0 or actual_price >= 1.0:
+                    logging.error(f"[REST] Invalid price {actual_price} — skipping.")
                     continue
 
                 source_value = float(pos.get("initialValue", pos.get("value", 0.0)))
                 my_size = _calc_size(config, actual_price, source_value)
 
                 if my_size < 1.0 and not config.get("copy_sub_dollar", False):
+                    logging.info(f"[REST] Sub-dollar size (${my_size:.2f}) rejected.")
                     continue
 
                 question_str = self.get_market_question(market_id)
-                logging.info(f"🔁 [REST FALLBACK] {config['name']} | {side} | '{question_str[:40]}' @ {actual_price:.4f} [signal_source=rest]")
+                logging.info(
+                    f"🔁 [REST FALLBACK] {config['name']} | {side} | "
+                    f"'{question_str[:40]}' @ {actual_price:.4f} "
+                    f"[signal_source=rest]"
+                )
 
                 ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
                 if ok:
                     if self.dry_run:
                         self.balance.apply_dry_run_buy(my_size)
+
                     self.seen.mark_seen(pos_key)
 
                     if self._ws_listener and token_id not in self._ws_tracked:
@@ -380,7 +450,10 @@ class CopyTrader:
                 if position.source_wallet != wallet_addr:
                     continue
                 if position.token_id not in source_token_ids and position.status == "open":
-                    logging.info(f"📉 [EXIT] {position.source_name} closed position — syncing sell [signal_source={position.signal_source}]")
+                    logging.info(
+                        f"📉 [EXIT] {position.source_name} closed position — "
+                        f"syncing sell [signal_source={position.signal_source}]"
+                    )
                     exit_price, _ = self.get_orderbook_prices(position.token_id)
                     ok, _         = self.executor.place_sell(position.token_id, position.shares)
                     if ok:
@@ -390,7 +463,8 @@ class CopyTrader:
                         position.pnl        = pnl
                         
                         if self.dry_run:
-                            self.balance.apply_dry_run_sell(position.shares * exit_price)
+                            estimated_return = position.shares * exit_price
+                            self.balance.apply_dry_run_sell(estimated_return)
                         else:
                             if pnl > 0:
                                 cfg.compounding_bankroll += pnl * cfg.COMPOUNDING_RATE
@@ -398,7 +472,7 @@ class CopyTrader:
                         self.closed_positions.append(position)
                         del self.positions[pos_key]
 
-# ==================== WEB DASHBOARD LAYER ====================
+# ==================== WEB DASHBOARD ====================
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -512,7 +586,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 def _signal_badge(source: str) -> str:
-    cls = {"ws": "badge-src-ws", "rest": "badge-src-rest"}.get(source, "badge-src-rest")
+    cls = {
+        "ws":   "badge-src-ws",
+        "rest": "badge-src-rest",
+    }.get(source, "badge-src-rest")
     return f'<span class="{cls}">{source}</span>'
 
 def build_dashboard(bot) -> dict:
@@ -543,11 +620,11 @@ def build_dashboard(bot) -> dict:
 
         pos_rows += f"""
         <tr>
-            <td><span class="source-tag">{{p.source_name}}</span>&nbsp;{_signal_badge(p.signal_source)}</td>
-            <td class="market-name">{{p.question[:55]}}</td>
-            <td><span class="outcome-pill {outcome_cls}">{{p.outcome}}</span></td>
-            <td>${{p.size_usd:.2f}}<br><span style="font-size:0.70rem;color:#475569;">{{p.shares:.4f}} shares</span></td>
-            <td class="price-mono">{{p.entry_price:.3f}}</td>
+            <td><span class="source-tag">{p.source_name}</span>&nbsp;{_signal_badge(p.signal_source)}</td>
+            <td class="market-name">{p.question[:55]}</td>
+            <td><span class="outcome-pill {outcome_cls}">{p.outcome}</span></td>
+            <td>${p.size_usd:.2f}<br><span style="font-size:0.70rem;color:#475569;">{p.shares:.4f} shares</span></td>
+            <td class="price-mono">{p.entry_price:.3f}</td>
             <td class="price-mono">{cur_str}</td>
             <td class="pnl-cell {pnl_cls}">{pnl_str}</td>
         </tr>"""
@@ -569,11 +646,11 @@ def build_dashboard(bot) -> dict:
         pnl_str     = f"{_sign(p.pnl)}${abs(p.pnl):.2f}"
         closed_rows += f"""
         <tr>
-            <td><span class="source-tag">{{p.source_name}}</span>&nbsp;{_signal_badge(p.signal_source)}</td>
-            <td class="market-name">{{p.question[:55]}}</td>
-            <td><span class="outcome-pill {outcome_cls}">{{p.outcome}}</span></td>
-            <td class="price-mono">{{p.entry_price:.3f}}</td>
-            <td class="price-mono">{{p.exit_price:.3f}}</td>
+            <td><span class="source-tag">{p.source_name}</span>&nbsp;{_signal_badge(p.signal_source)}</td>
+            <td class="market-name">{p.question[:55]}</td>
+            <td><span class="outcome-pill {outcome_cls}">{p.outcome}</span></td>
+            <td class="price-mono">{p.entry_price:.3f}</td>
+            <td class="price-mono">{p.exit_price:.3f}</td>
             <td class="pnl-cell {_cls(p.pnl)}">{pnl_str}</td>
         </tr>"""
 

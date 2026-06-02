@@ -1,17 +1,19 @@
-# models.py
-import json
+#!/usr/bin/env python3
 import logging
-from datetime import datetime
+import json
 from dataclasses import dataclass, field
-from typing import Set
+from datetime import datetime
 
+# ==================== OPTIONAL DEPENDENCIES ====================
 try:
     import psycopg2
     import psycopg2.extras
     PSYCOPG2_AVAILABLE = True
 except ImportError:
     PSYCOPG2_AVAILABLE = False
+    logging.warning("psycopg2 not installed — seen_trades will fall back to local file.")
 
+# ==================== DATA CLASSES ====================
 @dataclass
 class Position:
     market_id:     str
@@ -45,11 +47,12 @@ class PendingLimitBuy:
     signal_source: str      = "rest"   # "ws" | "rest"
     placed_at:     datetime = field(default_factory=datetime.now)
 
+# ==================== SEEN TRADES STORE ====================
 class SeenTradesStore:
     def __init__(self, filepath: str, db_url: str = ""):
         self.filepath = filepath
         self.db_url   = db_url
-        self._seen: Set[str] = set()
+        self._seen: set = set()
         self._conn   = None
 
         if db_url and PSYCOPG2_AVAILABLE:
@@ -78,7 +81,7 @@ class SeenTradesStore:
             self._conn = None
             self._load_file()
 
-    def _load_postgres(self) -> Set[str]:
+    def _load_postgres(self):
         try:
             with self._conn.cursor() as cur:
                 cur.execute("SELECT pos_key FROM seen_trades")
