@@ -50,7 +50,7 @@ POLY_SECRET      = os.getenv("POLY_SECRET", "")
 POLY_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 DATABASE_URL     = os.getenv("DATABASE_URL", "")
 
-INITIAL_BANKROLL      = 10.0
+INITIAL_BANKROLL      = 0.0   # sentinel — overwritten by fetch_with_retry() at startup
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "8"))
 PAUSE_HOURS           = 48
 MAX_RETRIES           = 3
@@ -63,6 +63,6 @@ PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
 # ==================== RUNTIME SYSTEM HOOKS ====================
 bot_paused_until:     Optional[datetime] = None
-compounding_bankroll: float = INITIAL_BANKROLL
-peak_bankroll:        float = INITIAL_BANKROLL
+compounding_bankroll: float = 0.0   # set to real balance at startup via fetch_with_retry()
+peak_bankroll:        float = 0.0   # same — 0.0 means "not yet initialised"
 _bot_ref                    = None  # Dashboard context anchor
