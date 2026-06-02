@@ -23,19 +23,19 @@ WALLETS: Dict[str, dict] = {
         "copy_mode": "new_only",
     },
     "0xf903c4cd098184e67a06a04f9b8fdb36e7bbe028": {
-        "name": "Wallet903",
+        "name": "Viser",
         "risk_type": "price_based",
         "copy_mode": "new_only",
     },
     "0xe8ca3f758c93f44f3ec210542ab78afb7c0bcccb": {
-        "name": "WalletE8ca",
+        "name": "Kruto",
         "risk_type": "price_based",
         "copy_mode": "new_only",
         "limit_buy_max_premium": 0.10,
         "copy_sub_dollar": True,
     },
     "0xa1795199a227f8d68134f30bf26314a9918c9629": {
-        "name": "WalletA179",
+        "name": "Coniyr",
         "risk_type": "fixed",
         "fixed_risk": 0.025,
         "copy_mode": "copy_all",
