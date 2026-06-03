@@ -91,9 +91,13 @@ class CopyTrader:
         self._ws_price_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._ws_tracked:     Set[str]      = set()
         self._ws_listener:    Optional[PolymarketWSListener] = None
-        # Tracks (pos_key, sell_fraction_str) pairs that have already been acted
-        # on via WS so the REST fallback knows not to re-fire them.
-        self._ws_sell_executed: Set[str] = set()
+        # Tracks dedup keys for WS sell signals that have already been acted on,
+        # mapped to the monotonic timestamp at which they were recorded.
+        # Using a dict (key → timestamp) instead of a plain set lets us evict
+        # only entries that are genuinely stale (> 10 min old) rather than
+        # clearing the entire set at once, which would drop still-relevant guards
+        # and allow the REST poller to re-fire a sell already handled by WS.
+        self._ws_sell_executed: Dict[str, float] = {}
 
         if WEBSOCKETS_AVAILABLE:
             self._ws_listener = PolymarketWSListener(
@@ -290,9 +294,15 @@ class CopyTrader:
         dedup_key = f"{pos_key}_{sell_fraction:.6f}"
         if dedup_key in self._ws_sell_executed:
             return
-        self._ws_sell_executed.add(dedup_key)
+        now_mono = time.monotonic()
+        self._ws_sell_executed[dedup_key] = now_mono
+        # Evict only entries older than 10 minutes so we never drop a guard that
+        # is still within a plausible REST-poll window (fix #7).
         if len(self._ws_sell_executed) > 2000:
-            self._ws_sell_executed.clear()
+            cutoff = now_mono - 600  # 10 minutes
+            self._ws_sell_executed = {
+                k: ts for k, ts in self._ws_sell_executed.items() if ts >= cutoff
+            }
 
         signal_price = float(ev.get("price", 0.0))
         logging.info(
@@ -464,7 +474,12 @@ class CopyTrader:
 
     async def _reconcile_ws_pending(self, raw_by_wallet: Dict[str, Optional[list]]):
         loop = asyncio.get_running_loop()
-        for pos_key, pending in self.pending.items():
+        # Snapshot the dict before iterating: the `await` inside the loop yields
+        # control to the event loop, where _on_ws_buy_event (or expiry cleanup)
+        # could add/remove entries and raise RuntimeError: dictionary changed size
+        # during iteration (fix #9).
+        pending_snapshot = list(self.pending.items())
+        for pos_key, pending in pending_snapshot:
             if pending.market_id != "pending-ws":
                 continue
             wallet_raw = raw_by_wallet.get(pending.source_wallet) or []
@@ -625,14 +640,53 @@ class CopyTrader:
 
                 pos_key = f"{wallet_addr.lower()}_{token_id}_{side}"
 
-                # Fetch orderbook BEFORE acquiring the lock so we don't hold
-                # the lock during a blocking HTTP call.
+                # Both calls below are blocking HTTP — do them BEFORE acquiring
+                # the lock so we never hold _pending_lock across I/O (fix #8).
                 best_ask, mid_price = await loop.run_in_executor(
                     None, self.get_orderbook_prices, token_id
                 )
 
-                # Acquire lock before the seen-check so a concurrent WS signal
-                # for the same pos_key cannot also slip through (#14).
+                source_price = float(pos.get("avgPrice", pos.get("price", 0.0)))
+                if source_price > 0:
+                    if best_ask > 0:
+                        premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                        actual_price = min(best_ask, source_price * (1.0 + premium))
+                    else:
+                        premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                        actual_price = source_price * (1.0 + premium)
+                else:
+                    if best_ask <= 0:
+                        actual_price = mid_price
+                    else:
+                        premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                        actual_price = min(best_ask, mid_price * (1.0 + premium))
+
+                if actual_price <= 0 or actual_price >= 1.0:
+                    logging.error(f"[REST] Invalid price {actual_price} — skipping.")
+                    continue
+
+                if source_price > 0 and actual_price > source_price * 1.50:
+                    logging.warning(
+                        f"[REST] Market moved too far from source price "
+                        f"(source={source_price:.4f}, market={actual_price:.4f}) — skipping."
+                    )
+                    continue
+
+                source_value = float(pos.get("initialValue", pos.get("value", 0.0)))
+                my_size = _calc_size(config, actual_price, source_value)
+
+                current_bal = self.balance.get_balance()
+                if current_bal is not None and my_size > current_bal:
+                    logging.warning(f"[REST] Order size ${my_size:.2f} exceeds balance ${current_bal:.2f} — skipping.")
+                    continue
+
+                # Fetch market question outside the lock (blocking HTTP, fix #8).
+                question_str = await loop.run_in_executor(
+                    None, self.get_market_question, market_id
+                )
+
+                # Acquire lock only for the lightweight guard + state-mutation
+                # section.  All blocking I/O has already completed above (fix #8).
                 async with self._pending_lock:
                     if self.seen.is_seen(pos_key) or pos_key in self.pending:
                         continue
@@ -640,48 +694,6 @@ class CopyTrader:
                     if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
                         logging.warning(f"[REST] Position limit reached — skipping REST fallback.")
                         continue
-
-                    source_price = float(pos.get("avgPrice", pos.get("price", 0.0)))
-                    if source_price > 0:
-                        # Use the actual price the source paid as reference
-                        if best_ask > 0:
-                            premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-                            actual_price = min(best_ask, source_price * (1.0 + premium))
-                        else:
-                            # Orderbook failed — use source price with small premium
-                            premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-                            actual_price = source_price * (1.0 + premium)
-                    else:
-                        if best_ask <= 0:
-                            actual_price = mid_price
-                        else:
-                            premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-                            actual_price = min(best_ask, mid_price * (1.0 + premium))
-
-                    if actual_price <= 0 or actual_price >= 1.0:
-                        logging.error(f"[REST] Invalid price {actual_price} — skipping.")
-                        continue
-
-                    # Guard: if we used source price but market is now way higher, skip
-                    if source_price > 0 and actual_price > source_price * 1.50:
-                        logging.warning(
-                            f"[REST] Market moved too far from source price "
-                            f"(source={source_price:.4f}, market={actual_price:.4f}) — skipping."
-                        )
-                        continue
-
-                    source_value = float(pos.get("initialValue", pos.get("value", 0.0)))
-                    my_size = _calc_size(config, actual_price, source_value)
-
-                    current_bal = self.balance.get_balance()
-                    if current_bal is not None and my_size > current_bal:
-                        logging.warning(f"[REST] Order size ${my_size:.2f} exceeds balance ${current_bal:.2f} — skipping.")
-                        continue
-
-                    # Offload blocking HTTP call (#11)
-                    question_str = await loop.run_in_executor(
-                        None, self.get_market_question, market_id
-                    )
                     logging.info(
                         f"🔁 [REST FALLBACK] {config['name']} | {side} | "
                         f"'{question_str[:40]}' @ {actual_price:.4f} "
@@ -952,17 +964,21 @@ def build_dashboard(bot) -> dict:
         unreal = (mid - p.entry_price) * p.shares
         unrealised += unreal
 
-        outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
-        pnl_cls     = _cls(unreal)
-        pnl_fmt     = ".4f" if abs(unreal) < 0.005 else ".2f"
-        pnl_str     = f"{_sign(unreal)}${abs(unreal):{pnl_fmt}}"
-        cur_str     = f"{mid:.3f}" if p.current_price > 0 else "—"
+        outcome_cls  = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
+        pnl_cls      = _cls(unreal)
+        pnl_fmt      = ".4f" if abs(unreal) < 0.005 else ".2f"
+        pnl_str      = f"{_sign(unreal)}${abs(unreal):{pnl_fmt}}"
+        cur_str      = f"{mid:.3f}" if p.current_price > 0 else "—"
+        _src_name    = html.escape(p.source_name)
+        _question    = html.escape(p.question[:55])
+        _outcome     = html.escape(p.outcome)
+        _sig_source  = html.escape(p.signal_source)
 
         pos_rows += f"""
         <tr>
-            <td><span class="source-tag">{p.source_name}</span>&nbsp;{_signal_badge(p.signal_source)}</td>
-            <td class="market-name">{p.question[:55]}</td>
-            <td><span class="outcome-pill {outcome_cls}">{p.outcome}</span></td>
+            <td><span class="source-tag">{_src_name}</span>&nbsp;{_signal_badge(_sig_source)}</td>
+            <td class="market-name">{_question}</td>
+            <td><span class="outcome-pill {outcome_cls}">{_outcome}</span></td>
             <td>${p.size_usd:.2f}<br><span style="font-size:0.70rem;color:#475569;">{p.shares:.4f} shares</span></td>
             <td class="price-mono">{p.entry_price:.3f}</td>
             <td class="price-mono">{cur_str}</td>
