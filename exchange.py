@@ -319,7 +319,6 @@ class PolymarketExecutor:
 # ==================== WEBSOCKET LISTENER ====================
 class PolymarketWSListener:
     WS_URL_MARKET  = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    WS_URL_TRADE   = "wss://ws-subscriptions-clob.polymarket.com/ws/trade"
     PING_INTERVAL  = 20
     RECONNECT_BASE =  2
     RECONNECT_MAX  = 60
@@ -330,82 +329,63 @@ class PolymarketWSListener:
         ws_price_queue:    asyncio.Queue,
         on_trade_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
     ):
-        self.token_ids          = token_ids          
+        self.token_ids          = token_ids
         self.ws_price_queue     = ws_price_queue
-        self.on_trade_callback  = on_trade_callback  
+        self.on_trade_callback  = on_trade_callback
         self._running           = False
-        self._ws                = None
-        self._ws_market         = None
-        self._ws_trade          = None
+        self._ws_market:  Optional[object] = None
         self._subscribed: Set[str] = set()
 
     async def subscribe_token(self, token_id: str):
         if token_id in self._subscribed:
             return
         self.token_ids.add(token_id)
-        errors = []
-        for channel, ws in (("market", getattr(self, "_ws_market", None)),
-                             ("trade",  getattr(self, "_ws_trade",  None))):
-            if ws is not None:
-                try:
-                    await self._send_subscribe(ws, {token_id}, channel)
-                    logging.info(f"[WS/{channel}] Live-subscribed token {token_id[:12]}…")
-                except Exception as e:
-                    errors.append(f"{channel}: {e}")
-                    logging.warning(f"[WS/{channel}] Live subscribe failed for {token_id[:12]}: {e}")
-        if not errors:
-            self._subscribed.add(token_id)
+        if self._ws_market is not None:
+            try:
+                await self._send_subscribe(self._ws_market, {token_id})
+                logging.info(f"[WS] Live-subscribed token {token_id[:12]}…")
+                self._subscribed.add(token_id)
+            except Exception as e:
+                logging.warning(f"[WS] Live subscribe failed for {token_id[:12]}: {e}")
 
     async def run(self):
         if not WEBSOCKETS_AVAILABLE:
             logging.warning("[WS] websockets not installed — listener inactive.")
             return
         self._running = True
-        # Run both channel connections concurrently; each reconnects independently.
-        await asyncio.gather(
-            self._run_channel("market", self.WS_URL_MARKET),
-            self._run_channel("trade",  self.WS_URL_TRADE),
-        )
+        await self._run_channel()
 
-    async def _run_channel(self, channel: str, url: str):
+    async def _run_channel(self):
         delay = self.RECONNECT_BASE
         while self._running:
             try:
-                await self._connect_and_listen(channel, url)
+                await self._connect_and_listen()
                 delay = self.RECONNECT_BASE
             except Exception as e:
-                logging.warning(f"[WS/{channel}] Disconnected: {e} — reconnecting in {delay}s")
+                logging.warning(f"[WS] Disconnected: {e} — reconnecting in {delay}s")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self.RECONNECT_MAX)
 
     def stop(self):
         self._running = False
 
-    async def _connect_and_listen(self, channel: str, url: str):
-        logging.info(f"[WS/{channel}] Connecting to {url} …")
+    async def _connect_and_listen(self):
+        logging.info(f"[WS] Connecting to {self.WS_URL_MARKET} …")
         async with websockets.connect(
-            url,
+            self.WS_URL_MARKET,
             ping_interval = self.PING_INTERVAL,
             ping_timeout  = 30,
             close_timeout = 10,
         ) as ws:
-            # Each connection owns only its channel's _ws reference and subscribed set.
-            # Use per-channel attributes so the two connections don't clobber each other.
-            if channel == "market":
-                self._ws_market = ws
-            else:
-                self._ws_trade  = ws
-            self._ws = ws   # keep a generic reference for subscribe_token compat
-            # Reset the subscribed set on each new connection so all known tokens
-            # are re-subscribed and subscribe_token() isn't blocked by stale entries.
+            self._ws_market = ws
             self._subscribed.clear()
-            logging.info(f"[WS/{channel}] Connected ✅")
+            logging.info("[WS] Connected ✅")
 
             if self.token_ids:
-                await self._send_subscribe(ws, self.token_ids, channel)
+                await self._send_subscribe(ws, self.token_ids)
                 self._subscribed.update(self.token_ids)
             else:
-                logging.info(f"[WS/{channel}] No token_ids yet — awaiting first trade signal.")
+                logging.info("[WS] No token_ids yet — awaiting first trade signal.")
 
             async for raw in ws:
                 if not self._running:
@@ -413,21 +393,17 @@ class PolymarketWSListener:
                 try:
                     await self._handle_message(raw)
                 except Exception as e:
-                    logging.debug(f"[WS/{channel}] Message parse error: {e}")
-        if channel == "market":
-            self._ws_market = None
-        else:
-            self._ws_trade  = None
-        self._ws = None
+                    logging.debug(f"[WS] Message parse error: {e}")
+        self._ws_market = None
 
-    async def _send_subscribe(self, ws, token_ids: Set[str], channel: str):
+    async def _send_subscribe(self, ws, token_ids: Set[str]):
         payload = {
             "type":      "subscribe",
-            "channel":   channel,
+            "channel":   "market",
             "asset_ids": list(token_ids),
         }
         await ws.send(json.dumps(payload))
-        logging.info(f"[WS/{channel}] Subscribed {len(token_ids)} token(s)")
+        logging.info(f"[WS] Subscribed {len(token_ids)} token(s)")
 
     async def _handle_message(self, raw: str):
         try:

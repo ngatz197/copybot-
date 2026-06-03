@@ -100,7 +100,7 @@ class CopyTrader:
                 ws_price_queue     = self._ws_price_queue,
                 on_trade_callback  = self._on_ws_event,
             )
-            logging.info("PolymarketWSListener initialised with unified trade callback")
+            logging.info("PolymarketWSListener initialised — market channel only")
         else:
             logging.warning("WebSocket listener inactive — install websockets to enable")
 
