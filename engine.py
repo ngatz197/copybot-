@@ -49,7 +49,7 @@ def _calc_size(config: dict, price: float, source_value: float = 0.0) -> float:
 
     tiered = _price_based_size(price)
 
-    if tiered < 1.0 and config.get("copy_sub_dollar", False) and source_value > 0:
+    if tiered < 1.0 and config.get("copy_sub_dollar", False) and 0 < source_value < 1.0:
         return source_value
 
     return tiered
@@ -184,14 +184,38 @@ class CopyTrader:
                 logging.warning(f"[WS BUY] Position limit reached — skipping {config['name']} signal.")
                 return
 
-            if best_ask <= 0:
-                actual_price = mid_price
+            current_bal = self.balance.get_balance()
+            if current_bal is not None and my_size > current_bal:
+                logging.warning(f"[WS BUY] Order size ${my_size:.2f} exceeds balance ${current_bal:.2f} — skipping {config['name']}.")
+                return
+
+            signal_price = float(ev.get("price", 0.0))
+            if signal_price > 0:
+                # Use the actual price the source paid as reference
+                if best_ask > 0:
+                    premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                    actual_price = min(best_ask, signal_price * (1.0 + premium))
+                else:
+                    # Orderbook failed — use source price with small premium
+                    premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                    actual_price = signal_price * (1.0 + premium)
             else:
-                premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-                actual_price = min(best_ask, mid_price * (1.0 + premium))
+                if best_ask <= 0:
+                    actual_price = mid_price
+                else:
+                    premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                    actual_price = min(best_ask, mid_price * (1.0 + premium))
 
             if actual_price <= 0 or actual_price >= 1.0:
                 logging.error(f"[WS BUY] Invalid price {actual_price} for {token_id[:12]} — aborting.")
+                return
+
+            # Guard: if we used source price but market is now way higher, skip
+            if signal_price > 0 and actual_price > signal_price * 1.50:
+                logging.warning(
+                    f"[WS BUY] Market moved too far from source price "
+                    f"(source={signal_price:.4f}, market={actual_price:.4f}) — skipping {config['name']}."
+                )
                 return
 
             source_value = float(ev.get("size", 0.0)) * actual_price
@@ -413,7 +437,7 @@ class CopyTrader:
                     mid      = (
                         (best_bid + best_ask) / 2
                         if best_bid and best_ask
-                        else (best_bid or best_ask or 0.50)
+                        else (best_bid or best_ask or 0.0)
                     )
                     return best_ask, mid
             except Exception as e:
@@ -609,14 +633,38 @@ class CopyTrader:
                         logging.warning(f"[REST] Position limit reached — skipping REST fallback.")
                         continue
 
-                    if best_ask <= 0:
-                        actual_price = mid_price
+                    current_bal = self.balance.get_balance()
+                    if current_bal is not None and my_size > current_bal:
+                        logging.warning(f"[REST] Order size ${my_size:.2f} exceeds balance ${current_bal:.2f} — skipping.")
+                        continue
+
+                    source_price = float(pos.get("avgPrice", pos.get("price", 0.0)))
+                    if source_price > 0:
+                        # Use the actual price the source paid as reference
+                        if best_ask > 0:
+                            premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                            actual_price = min(best_ask, source_price * (1.0 + premium))
+                        else:
+                            # Orderbook failed — use source price with small premium
+                            premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                            actual_price = source_price * (1.0 + premium)
                     else:
-                        premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-                        actual_price = min(best_ask, mid_price * (1.0 + premium))
+                        if best_ask <= 0:
+                            actual_price = mid_price
+                        else:
+                            premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                            actual_price = min(best_ask, mid_price * (1.0 + premium))
 
                     if actual_price <= 0 or actual_price >= 1.0:
                         logging.error(f"[REST] Invalid price {actual_price} — skipping.")
+                        continue
+
+                    # Guard: if we used source price but market is now way higher, skip
+                    if source_price > 0 and actual_price > source_price * 1.50:
+                        logging.warning(
+                            f"[REST] Market moved too far from source price "
+                            f"(source={source_price:.4f}, market={actual_price:.4f}) — skipping."
+                        )
                         continue
 
                     source_value = float(pos.get("initialValue", pos.get("value", 0.0)))
@@ -878,7 +926,7 @@ def build_dashboard(bot) -> dict:
     def _cls(v):  return "pos" if v > 0 else ("neg" if v < 0 else "neu")
 
     bankroll  = bot.balance.cached_balance or 0.0
-    drawdown  = ((cfg.peak_bankroll - bankroll) / cfg.peak_bankroll * 100) if cfg.peak_bankroll > 0 else 0.0
+    drawdown  = min(((cfg.peak_bankroll - bankroll) / cfg.peak_bankroll * 100), 100.0) if cfg.peak_bankroll > 0 else 0.0
     is_paused = bool(cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until)
 
     status_label = "Paused" if is_paused else "Running"

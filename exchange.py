@@ -123,7 +123,8 @@ class RobustBalanceManager:
     def apply_dry_run_buy(self, amount_usd: float):
         if self.dry_run and self.cached_balance is not None:
             self.cached_balance -= amount_usd
-            cfg.compounding_bankroll = self.cached_balance
+            # Do NOT touch cfg.compounding_bankroll here — it is the sizing base
+            # and should only grow via realised profits on sells (mirrors live mode).
             logging.info(f"[DRY RUN] Deducted virtual funds: ${amount_usd:.2f} | Balance: ${self.cached_balance:.2f}")
 
     def apply_dry_run_sell(self, return_usd: float, realised_pnl: float):
