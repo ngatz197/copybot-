@@ -11,7 +11,7 @@ import html
 import config as cfg
 
 from models import Position, PendingLimitBuy, SeenTradesStore
-from exchange import RobustBalanceManager, PolymarketExecutor, PolymarketWSListener
+from exchange import RobustBalanceManager, PolymarketExecutor, PolymarketWSListener, PolymarketUserChannelListener
 
 # ==================== ENVIRONMENT / CONSTANTS ====================
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "8"))
@@ -105,32 +105,49 @@ class CopyTrader:
                 ws_price_queue     = self._ws_price_queue,
                 on_trade_callback  = self._on_ws_event,
             )
-            logging.info("PolymarketWSListener initialised — market channel only")
+            # User channel listener: one connection covers all tracked wallets.
+            # Delivers unambiguous order-level events (direction + outcome already
+            # resolved) so _on_ws_event can skip maker/taker inference entirely.
+            self._user_listener = PolymarketUserChannelListener(
+                wallet_addrs       = set(cfg.WALLETS.keys()),
+                on_trade_callback  = self._on_ws_event,
+            )
+            logging.info("PolymarketWSListener initialised — market + user channels")
         else:
             logging.warning("WebSocket listener inactive — install websockets to enable")
+            self._user_listener = None
 
         logging.info(f"CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
 
     async def _on_ws_event(self, ev: dict):
         """
-        Unified WS trade callback.  The WS layer no longer infers buy vs sell
-        from unreliable fields like `trade_side`.  Instead:
+        Unified WS trade callback.  Resolves the source wallet's actual trade
+        direction (BUY or SELL) from the maker/taker side fields in the fill
+        event, then mirrors that action exactly:
 
-        - If we hold an open position for this wallet + token → treat as a sell
-          signal and mirror proportionally.
-        - If we do NOT hold a position → treat as a buy signal.
+        - Source BUY  → we open / add to a position (buy path).
+        - Source SELL → we close / reduce a position (sell path).
 
-        This means a single trade event is always routed correctly regardless of
-        which direction field (if any) the exchange happens to include.
+        This correctly handles binary YES/NO markets as well as over/under
+        markets, and mirrors opens, closes, and partial adjustments regardless
+        of which leg the source wallet was on.
         """
         if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until:
             return
 
         tracked_wallets = {addr.lower(): addr for addr in cfg.WALLETS}
-        maker, taker    = ev.get("maker_addr", ""), ev.get("taker_addr", "")
-        matched_lower   = next(
-            (w for w in tracked_wallets if w in (maker, taker)), None
-        )
+
+        # User channel events carry source_wallet directly; market channel
+        # events carry maker_addr / taker_addr and require a scan to match.
+        if ev.get("kind") == "user_trade":
+            sw = ev.get("source_wallet", "").lower()
+            matched_lower = sw if sw in tracked_wallets else None
+        else:
+            maker, taker  = ev.get("maker_addr", ""), ev.get("taker_addr", "")
+            matched_lower = next(
+                (w for w in tracked_wallets if w in (maker, taker)), None
+            )
+
         if not matched_lower:
             return
 
@@ -141,21 +158,86 @@ class CopyTrader:
 
         copy_mode = config.get("copy_mode", "new_only")
         if copy_mode != "new_only":
-            logging.warning(f"[WS BUY] {config['name']} copy_mode='{copy_mode}' not supported — skipping.")
+            logging.warning(f"[WS] {config['name']} copy_mode='{copy_mode}' not supported — skipping.")
             return
 
         token_id = ev["token_id"]
-        side     = ev["side"].upper()
-        pos_key  = f"{matched_lower}_{token_id}_{side}"
 
-        # ── Sell path: we already hold this position ──────────────────────────
-        position = self.positions.get(pos_key)
-        if position and position.status == "open":
-            await self._on_ws_sell_event(ev, pos_key, position)
-            return
+        # ── User channel fast-path ────────────────────────────────────────────
+        # Events from PolymarketUserChannelListener carry kind="user_trade" and
+        # have already resolved trade_side (BUY/SELL) and outcome (YES/NO/…)
+        # directly from the wallet's own order.  No inference needed.
+        if ev.get("kind") == "user_trade":
+            outcome           = ev.get("outcome", "").upper()
+            source_trade_side = ev.get("trade_side", "").upper()
+            if not outcome:
+                logging.debug(
+                    f"[USER-WS] Missing outcome for {token_id[:12]}… — skipping."
+                )
+                return
+            if source_trade_side not in ("BUY", "SELL"):
+                logging.debug(
+                    f"[USER-WS] Unrecognised trade_side '{source_trade_side}' "
+                    f"for {token_id[:12]}… — skipping."
+                )
+                return
+        else:
+            # ── Market channel: resolve direction from maker/taker side fields ─
+            outcome     = ev.get("outcome", "").upper()
+            maker_side  = ev.get("maker_side", "")   # "BUY" or "SELL"
+            taker_side  = ev.get("taker_side", "")   # "BUY" or "SELL"
 
-        # ── Buy path: no open position for this wallet + token ────────────────
-        await self._on_ws_buy_event(ev, matched_lower, matched_addr, config, token_id, side, pos_key)
+            if not outcome:
+                # Missing outcome — skip rather than defaulting to YES and
+                # mislabelling the position.
+                logging.debug(
+                    f"[WS] Missing outcome for {token_id[:12]}… — skipping to avoid "
+                    f"mislabelling position."
+                )
+                return
+
+            if matched_lower == maker and maker_side:
+                source_trade_side = maker_side
+            elif matched_lower == taker and taker_side:
+                source_trade_side = taker_side
+            else:
+                # maker_side / taker_side absent — cannot determine direction.
+                # Inferring from local position state is unsafe:
+                #   • has_open=True  → infer SELL → we close while source is
+                #                      actually adding to their position.
+                #   • has_open=False → infer BUY  → we open while source is
+                #                      actually exiting.
+                # Either mistake executes a real order in the wrong direction.
+                # Skip and let the next REST poll — which reads the authoritative
+                # share count from the data-API — handle the signal correctly.
+                logging.warning(
+                    f"[WS] maker_side/taker_side absent for {config['name']} "
+                    f"token {token_id[:12]}\u2026 — cannot resolve direction; "
+                    f"deferring to REST poll."
+                )
+                return
+
+        pos_key = f"{matched_lower}_{token_id}_{outcome}"
+
+        if source_trade_side == "SELL":
+            # ── Sell path ──────────────────────────────────────────────────────
+            open_pos_key = next(
+                (k for k, p in self.positions.items()
+                 if p.source_wallet == matched_addr
+                 and p.token_id == token_id
+                 and p.status == "open"),
+                None,
+            )
+            if open_pos_key is None:
+                logging.debug(
+                    f"[WS SELL] {config['name']} sold token {token_id[:12]}… "
+                    f"but we hold no matching position — ignoring."
+                )
+                return
+            await self._on_ws_sell_event(ev, open_pos_key, self.positions[open_pos_key])
+        else:
+            # ── Buy path ───────────────────────────────────────────────────────
+            await self._on_ws_buy_event(ev, matched_lower, matched_addr, config, token_id, outcome, pos_key)
 
     async def _on_ws_buy_event(
         self,
@@ -164,7 +246,7 @@ class CopyTrader:
         matched_addr:  str,
         config:        dict,
         token_id:      str,
-        side:          str,
+        outcome:       str,   # market outcome: YES / NO / OVER / UNDER etc.
         pos_key:       str,
     ):
         is_broken, _ = self.balance.check_drawdown()
@@ -226,7 +308,7 @@ class CopyTrader:
                 return
 
             logging.info(
-                f"⚡ [WS INSTANT BUY] {config['name']} | {side} "
+                f"⚡ [WS INSTANT BUY] {config['name']} | {outcome} "
                 f"token {token_id[:12]}… @ {actual_price:.4f} "
                 f"(${my_size:.2f}) [signal_source=ws]"
             )
@@ -246,7 +328,7 @@ class CopyTrader:
                 token_id      = token_id,
                 market_id     = "pending-ws",
                 question      = f"WS signal — {token_id[:16]}…",
-                outcome       = side,
+                outcome       = outcome,
                 source_wallet = matched_addr,
                 source_name   = config["name"],
                 limit_price   = actual_price,

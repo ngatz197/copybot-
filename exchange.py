@@ -452,19 +452,211 @@ class PolymarketWSListener:
                 token_id   = ev.get("asset_id") or ev.get("market") or ""
                 price      = float(ev.get("price", 0))
                 size       = float(ev.get("size", 0))
-                side       = (ev.get("outcome") or ev.get("side") or "YES").upper()
+                outcome    = (ev.get("outcome") or "YES").upper()
                 maker_addr = (ev.get("maker_address") or ev.get("maker") or "").lower()
                 taker_addr = (ev.get("taker_address") or ev.get("taker") or "").lower()
+                # maker_side / taker_side: "BUY" or "SELL" for each leg of the fill.
+                # These let the engine resolve the source wallet's actual trade
+                # direction without relying on the ambiguous top-level `side` field.
+                maker_side = (ev.get("maker_side") or "").upper()
+                taker_side = (ev.get("taker_side") or "").upper()
 
-                # Direction is NOT inferred here — the engine disambiguates by
-                # checking whether it holds an open position for this token+wallet.
                 if token_id and price and self.on_trade_callback:
                     await self.on_trade_callback({
                         "kind":       "trade",
                         "token_id":   token_id,
                         "price":      price,
                         "size":       size,
-                        "side":       side,
+                        "outcome":    outcome,
                         "maker_addr": maker_addr,
                         "taker_addr": taker_addr,
+                        "maker_side": maker_side,
+                        "taker_side": taker_side,
                     })
+
+# ==================== USER CHANNEL LISTENER ====================
+class PolymarketUserChannelListener:
+    """
+    Subscribes to the Polymarket user channel for each tracked source wallet.
+
+    The user channel delivers order-level events (placements, fills, cancels)
+    scoped to a specific wallet address.  Unlike the market channel, every
+    event carries the wallet's own unambiguous trade direction (side=BUY/SELL)
+    and market outcome (YES/NO/OVER/UNDER) directly — no counterparty inference
+    needed.
+
+    One persistent connection is maintained per tracked wallet.  On reconnect
+    all wallets are re-subscribed automatically.
+
+    The subscribe message requires no credentials for public read-only tracking:
+
+        { "type": "subscribe", "channel": "user", "markets": ["<wallet_addr>"] }
+
+    Events are normalised to the same dict schema used by PolymarketWSListener
+    so the engine's _on_ws_event callback needs no changes.
+    """
+
+    WS_URL_USER    = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+    PING_INTERVAL  = 20
+    RECONNECT_BASE =  2
+    RECONNECT_MAX  = 60
+
+    def __init__(
+        self,
+        wallet_addrs:      Set[str],                               # source wallets to track
+        on_trade_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ):
+        # wallet_addrs is the live set from cfg.WALLETS — mutations are reflected
+        # automatically on the next reconnect.
+        self.wallet_addrs      = wallet_addrs
+        self.on_trade_callback = on_trade_callback
+        self._running          = False
+        self._ws:   Optional[object] = None
+
+    async def run(self):
+        if not WEBSOCKETS_AVAILABLE:
+            logging.warning("[USER-WS] websockets not installed — user channel inactive.")
+            return
+        self._running = True
+        await self._run_channel()
+
+    def stop(self):
+        self._running = False
+
+    async def _run_channel(self):
+        delay = self.RECONNECT_BASE
+        while self._running:
+            try:
+                await self._connect_and_listen()
+                delay = self.RECONNECT_BASE
+            except Exception as e:
+                logging.warning(f"[USER-WS] Disconnected: {e} — reconnecting in {delay}s")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self.RECONNECT_MAX)
+
+    async def _connect_and_listen(self):
+        if not self.wallet_addrs:
+            logging.info("[USER-WS] No wallets configured — waiting 30s before retry.")
+            await asyncio.sleep(30)
+            return
+
+        logging.info(f"[USER-WS] Connecting to {self.WS_URL_USER} …")
+        async with websockets.connect(
+            self.WS_URL_USER,
+            ping_interval = self.PING_INTERVAL,
+            ping_timeout  = 30,
+            close_timeout = 10,
+        ) as ws:
+            self._ws = ws
+            logging.info("[USER-WS] Connected ✅")
+
+            # Subscribe all tracked wallets in a single message.
+            await ws.send(json.dumps({
+                "type":    "subscribe",
+                "channel": "user",
+                "markets": list(self.wallet_addrs),
+            }))
+            logging.info(f"[USER-WS] Subscribed {len(self.wallet_addrs)} wallet(s)")
+
+            async for raw in ws:
+                if not self._running:
+                    break
+                try:
+                    await self._handle_message(raw)
+                except Exception as e:
+                    logging.debug(f"[USER-WS] Message parse error: {e}")
+        self._ws = None
+
+    async def _handle_message(self, raw: str):
+        try:
+            events = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+
+        if not isinstance(events, list):
+            events = [events]
+
+        for ev in events:
+            ev_type = (ev.get("event_type") or ev.get("type") or "").lower()
+
+            # We care about fills — placements and cancels carry no fill price
+            # and do not represent a completed position change.
+            if ev_type not in ("order_fill", "order_filled", "trade"):
+                continue
+
+            token_id = ev.get("asset_id") or ev.get("market") or ""
+            price    = float(ev.get("price", 0))
+            size     = float(ev.get("size", 0))
+
+            if not token_id or not price:
+                continue
+
+            # `side` on the user channel is the wallet's own order direction —
+            # BUY or SELL — not a fill leg.  This is the unambiguous signal.
+            side    = (ev.get("side") or "").upper()
+            outcome = (ev.get("outcome") or "").upper()
+
+            # `owner` / `maker` / `address` — whichever field carries the
+            # wallet address that generated this event.  Try every known alias;
+            # also check `user` and `trader` which appear in some API versions.
+            wallet = (
+                ev.get("owner")
+                or ev.get("maker_address")
+                or ev.get("maker")
+                or ev.get("address")
+                or ev.get("user")
+                or ev.get("trader")
+                or ""
+            ).lower()
+
+            if not wallet:
+                # The connection is scoped to self.wallet_addrs by the subscribe
+                # message, so the event must belong to one of those wallets.
+                # If there is exactly one subscribed wallet we can resolve
+                # unambiguously; otherwise we cannot safely attribute the event
+                # and must skip with a warning so the field name is diagnosable.
+                if len(self.wallet_addrs) == 1:
+                    wallet = next(iter(self.wallet_addrs)).lower()
+                    logging.debug(
+                        f"[USER-WS] wallet field absent for {token_id[:12]}\u2026 \u2014 "
+                        f"resolved from sole subscription address {wallet[:10]}\u2026"
+                    )
+                else:
+                    logging.warning(
+                        f"[USER-WS] wallet field absent for {token_id[:12]}\u2026 and "
+                        f"{len(self.wallet_addrs)} wallets subscribed \u2014 cannot attribute "
+                        f"event; skipping.  Raw keys: {list(ev.keys())}"
+                    )
+                    continue
+
+            if not side:
+                logging.debug(f"[USER-WS] Fill event missing side — skipping {token_id[:12]}…")
+                continue
+
+            if not outcome:
+                logging.debug(
+                    f"[USER-WS] Fill event missing outcome for {token_id[:12]}… — skipping "
+                    f"rather than defaulting, to avoid mislabelling position."
+                )
+                continue
+
+            logging.debug(
+                f"[USER-WS] {wallet[:10]}… {side} {outcome} {size} @ {price} "
+                f"token={token_id[:12]}…"
+            )
+
+            if self.on_trade_callback:
+                await self.on_trade_callback({
+                    # Use "user_trade" kind so the engine knows direction is
+                    # already resolved and can skip the maker/taker inference.
+                    "kind":         "user_trade",
+                    "token_id":     token_id,
+                    "price":        price,
+                    "size":         size,
+                    "outcome":      outcome,
+                    # source_wallet lets _on_ws_event match directly without
+                    # scanning maker_addr / taker_addr.
+                    "source_wallet": wallet,
+                    # trade_side is the wallet's own direction — no ambiguity.
+                    "trade_side":   side,
+                })
