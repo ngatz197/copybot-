@@ -10,13 +10,22 @@ from engine import CopyTrader, run_health_server
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 def keep_neon_alive():
+    conn = None
     while True:
         try:
-            conn = psycopg2.connect(cfg.DATABASE_URL, sslmode="require")
-            conn.close()
+            if conn is None or conn.closed:
+                conn = psycopg2.connect(cfg.DATABASE_URL, sslmode="require")
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
             logging.info("🟢 Neon keep-alive ping sent")
         except Exception as e:
             logging.warning(f"Neon keep-alive failed: {e}")
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
         time.sleep(180)  # every 3 minutes
 
 async def main():

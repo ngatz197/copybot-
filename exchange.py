@@ -142,6 +142,15 @@ class RobustBalanceManager:
                 f"balance=${self.cached_balance:.2f}"
             )
 
+    def apply_dry_run_cancel(self, amount_usd: float):
+        if self.dry_run and self.cached_balance is not None:
+            self.cached_balance += amount_usd
+            cfg.compounding_bankroll = self.cached_balance
+            logging.info(
+                f"[DRY RUN] Cancel refund=${amount_usd:.2f} | "
+                f"balance=${self.cached_balance:.2f}"
+            )
+
 # ==================== EXECUTOR (V2) ====================
 class PolymarketExecutor:
     def __init__(self, dry_run: bool):

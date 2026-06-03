@@ -7,6 +7,7 @@ import requests
 from datetime import datetime, timedelta
 from typing import Dict, Set, Tuple, Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import html
 import config as cfg
 
 from models import Position, PendingLimitBuy, SeenTradesStore
@@ -134,6 +135,11 @@ class CopyTrader:
         if not config:
             return
 
+        copy_mode = config.get("copy_mode", "new_only")
+        if copy_mode != "new_only":
+            logging.warning(f"[WS BUY] {config['name']} copy_mode='{copy_mode}' not supported — skipping.")
+            return
+
         token_id = ev["token_id"]
         side     = ev["side"].upper()
         pos_key  = f"{matched_lower}_{token_id}_{side}"
@@ -174,7 +180,7 @@ class CopyTrader:
             if self.seen.is_seen(pos_key) or pos_key in self.pending:
                 return
 
-            if len(self.positions) >= MAX_POSITIONS:
+            if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
                 logging.warning(f"[WS BUY] Position limit reached — skipping {config['name']} signal.")
                 return
 
@@ -190,10 +196,6 @@ class CopyTrader:
 
             source_value = float(ev.get("size", 0.0)) * actual_price
             my_size = _calc_size(config, actual_price, source_value)
-
-            if my_size < 1.0 and not config.get("copy_sub_dollar", False):
-                logging.info(f"[WS BUY] Sub-dollar size (${my_size:.2f}) rejected for {config['name']}.")
-                return
 
             logging.info(
                 f"⚡ [WS INSTANT BUY] {config['name']} | {side} "
@@ -463,6 +465,8 @@ class CopyTrader:
                     f"[signal_source={p.signal_source}] — cancelling…"
                 )
                 if self.executor.cancel_order(p.order_id):
+                    if self.dry_run:
+                        self.balance.apply_dry_run_cancel(p.size_usd)
                     del self.pending[k]
 
     def process_pending_fills(self):
@@ -543,6 +547,11 @@ class CopyTrader:
         loop = asyncio.get_running_loop()
 
         for wallet_addr, config in cfg.WALLETS.items():
+            copy_mode = config.get("copy_mode", "new_only")
+            if copy_mode != "new_only":
+                logging.warning(f"[REST] {config['name']} copy_mode='{copy_mode}' not supported — skipping.")
+                continue
+
             raw = all_wallet_data.get(wallet_addr)
             if raw is None:
                 logging.warning(f"[REST] Failed to fetch positions for {config['name']}.")
@@ -596,7 +605,7 @@ class CopyTrader:
                     if self.seen.is_seen(pos_key) or pos_key in self.pending:
                         continue
 
-                    if len(self.positions) >= MAX_POSITIONS:
+                    if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
                         logging.warning(f"[REST] Position limit reached — skipping REST fallback.")
                         continue
 
@@ -612,10 +621,6 @@ class CopyTrader:
 
                     source_value = float(pos.get("initialValue", pos.get("value", 0.0)))
                     my_size = _calc_size(config, actual_price, source_value)
-
-                    if my_size < 1.0 and not config.get("copy_sub_dollar", False):
-                        logging.info(f"[REST] Sub-dollar size (${my_size:.2f}) rejected.")
-                        continue
 
                     # Offload blocking HTTP call (#11)
                     question_str = await loop.run_in_executor(
@@ -922,10 +927,12 @@ def build_dashboard(bot) -> dict:
     for p in reversed(closed_list):
         outcome_cls = "outcome-yes" if p.outcome.upper() == "YES" else "outcome-no"
         pnl_str     = f"{_sign(p.pnl)}${abs(p.pnl):.2f}"
+        _src_name   = html.escape(p.source_name)
+        _question   = html.escape(p.question[:55])
         closed_rows += f"""
         <tr>
-            <td><span class="source-tag">{p.source_name}</span>&nbsp;{_signal_badge(p.signal_source)}</td>
-            <td class="market-name">{p.question[:55]}</td>
+            <td><span class="source-tag">{_src_name}</span>&nbsp;{_signal_badge(p.signal_source)}</td>
+            <td class="market-name">{_question}</td>
             <td><span class="outcome-pill {outcome_cls}">{p.outcome}</span></td>
             <td class="price-mono">{p.entry_price:.3f}</td>
             <td class="price-mono">{p.exit_price:.3f}</td>

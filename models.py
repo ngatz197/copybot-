@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import asyncio
 import logging
 import json
 from dataclasses import dataclass, field
@@ -146,11 +147,18 @@ class SeenTradesStore:
         self.backend = "local-file"
 
     def _save_file(self):
+        def _sync_write():
+            try:
+                with open(self.filepath, "w") as f:
+                    json.dump(sorted(self._seen), f)
+            except Exception as e:
+                logging.warning(f"Could not save seen trades file: {e}")
+
         try:
-            with open(self.filepath, "w") as f:
-                json.dump(sorted(self._seen), f)
-        except Exception as e:
-            logging.warning(f"Could not save seen trades file: {e}")
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, _sync_write)
+        except RuntimeError:
+            _sync_write()
 
     def is_seen(self, pos_key: str) -> bool:
         return pos_key in self._seen
