@@ -157,6 +157,7 @@ class PolymarketExecutor:
     def __init__(self, dry_run: bool):
         self.dry_run = dry_run
         self.client  = None
+        self._dry_run_fill_counter: dict = {}
         if not dry_run and CLOB_AVAILABLE and YOUR_PRIVATE_KEY:
             try:
                 creds = ApiCreds(
@@ -206,9 +207,6 @@ class PolymarketExecutor:
         except Exception as e:
             logging.warning(f"Cancel failed for {order_id}: {e}")
             return False
-
-    # Tracks dry-run order placement counts: order_id -> poll-cycle count
-    _dry_run_fill_counter: dict = {}
 
     def is_order_filled(self, order_id: str) -> bool:
         if self.dry_run or self.client is None:

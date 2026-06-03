@@ -287,7 +287,7 @@ class CopyTrader:
         if our_shares_to_sell <= 0:
             return
 
-        dedup_key = f"{pos_key}_{sell_fraction:.2f}"
+        dedup_key = f"{pos_key}_{sell_fraction:.6f}"
         if dedup_key in self._ws_sell_executed:
             return
         self._ws_sell_executed.add(dedup_key)
@@ -495,6 +495,11 @@ class CopyTrader:
                     if self.dry_run:
                         self.balance.apply_dry_run_cancel(p.size_usd)
                     del self.pending[k]
+                else:
+                    logging.warning(
+                        f"[EXPIRY] Cancel failed for {p.source_name} order {p.order_id} — "
+                        f"retaining in pending to retry next cycle."
+                    )
 
     def process_pending_fills(self):
         for k, p in list(self.pending.items()):
@@ -769,7 +774,7 @@ class CopyTrader:
                     effective_fraction = position.pending_reduction
 
                     if effective_fraction >= PARTIAL_SELL_THRESHOLD:
-                        dedup_key = f"{pos_key}_{effective_fraction:.2f}"
+                        dedup_key = f"{pos_key}_{effective_fraction:.6f}"
                         if dedup_key in self._ws_sell_executed:
                             logging.debug(
                                 f"[REST] Partial sell for {pos_key} already handled "
