@@ -63,8 +63,13 @@ class CopyTrader:
         try:
             logging.info("Initializing bankroll allocation from live wallet balance...")
             initial_balance = self.balance.fetch_with_retry(retries=5, delay=5)
-            cfg.compounding_bankroll = initial_balance
-            cfg.peak_bankroll        = initial_balance
+            cfg.compounding_bankroll      = initial_balance
+            cfg.peak_bankroll             = initial_balance
+            # Seed dry-run virtual balance from the real on-chain balance so
+            # deductions and drawdown checks start from the correct baseline.
+            self.balance.cached_balance   = initial_balance
+            self.balance.peak_balance     = initial_balance
+            logging.info(f"Dry-run virtual balance seeded at ${initial_balance:.2f}")
         except Exception as e:
             logging.error(f"Critical initialization failure: {e}")
             raise SystemExit("Exiting bot: Unable to ascertain initial balance configuration.")
@@ -319,7 +324,7 @@ class CopyTrader:
             position.pnl        = realised_pnl
 
             if self.dry_run:
-                self.balance.apply_dry_run_sell(shares_to_sell * exit_price)
+                self.balance.apply_dry_run_sell(shares_to_sell * exit_price, realised_pnl)
             else:
                 cfg.compounding_bankroll += realised_pnl * cfg.COMPOUNDING_RATE
                 cfg.compounding_bankroll  = max(cfg.compounding_bankroll, 0.0)
@@ -340,7 +345,7 @@ class CopyTrader:
             position.pnl      += realised_pnl
 
             if self.dry_run:
-                self.balance.apply_dry_run_sell(shares_to_sell * exit_price)
+                self.balance.apply_dry_run_sell(shares_to_sell * exit_price, realised_pnl)
             else:
                 cfg.compounding_bankroll += realised_pnl * cfg.COMPOUNDING_RATE
                 cfg.compounding_bankroll  = max(cfg.compounding_bankroll, 0.0)
@@ -556,15 +561,10 @@ class CopyTrader:
                     size  = float(pos.get("size", pos.get("shares", 0)))
                     if not asset or size <= 0:
                         continue
-                    raw_side = pos.get("side")
-                    if not raw_side:
-                        logging.warning(
-                            f"[SNAPSHOT] Position for {asset[:12]}… has no 'side' field "
-                            f"— skipping snapshot entry to avoid miskeying."
-                        )
-                        continue
+                    # Use the same fallback as the scan loop so keys always match.
+                    raw_side = pos.get("side", "YES").upper()
                     pre_existing.append(
-                        f"{wallet_addr.lower()}_{asset}_{raw_side.upper()}"
+                        f"{wallet_addr.lower()}_{asset}_{raw_side}"
                     )
                 self.seen.snapshot_existing(pre_existing)
                 self._first_scan_done.add(wallet_addr)

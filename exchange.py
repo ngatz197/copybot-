@@ -126,14 +126,21 @@ class RobustBalanceManager:
             cfg.compounding_bankroll = self.cached_balance
             logging.info(f"[DRY RUN] Deducted virtual funds: ${amount_usd:.2f} | Balance: ${self.cached_balance:.2f}")
 
-    def apply_dry_run_sell(self, return_usd: float):
+    def apply_dry_run_sell(self, return_usd: float, realised_pnl: float):
         if self.dry_run and self.cached_balance is not None:
             self.cached_balance += return_usd
-            cfg.compounding_bankroll = self.cached_balance
+            # Mirror live compounding: only reinvest a fraction of net profit.
+            cfg.compounding_bankroll += realised_pnl * cfg.COMPOUNDING_RATE
+            cfg.compounding_bankroll  = max(cfg.compounding_bankroll, 0.0)
             if self.cached_balance > self.peak_balance:
                 self.peak_balance = self.cached_balance
                 cfg.peak_bankroll = self.cached_balance
-            logging.info(f"[DRY RUN] Credited virtual return: ${return_usd:.2f} | Balance: ${self.cached_balance:.2f}")
+            logging.info(
+                f"[DRY RUN] Sell return=${return_usd:.2f} | "
+                f"pnl={realised_pnl:+.4f} | "
+                f"compounding_bankroll=${cfg.compounding_bankroll:.2f} | "
+                f"balance=${self.cached_balance:.2f}"
+            )
 
 # ==================== EXECUTOR (V2) ====================
 class PolymarketExecutor:
