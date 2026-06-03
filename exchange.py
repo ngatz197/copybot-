@@ -453,7 +453,7 @@ class PolymarketWSListener:
                 token_id   = ev.get("asset_id") or ev.get("market") or ""
                 price      = float(ev.get("price", 0))
                 size       = float(ev.get("size", 0))
-                side       = (ev.get("side") or ev.get("outcome") or "YES").upper()
+                side       = (ev.get("outcome") or ev.get("side") or "YES").upper()
                 maker_addr = (ev.get("maker_address") or ev.get("maker") or "").lower()
                 taker_addr = (ev.get("taker_address") or ev.get("taker") or "").lower()
 

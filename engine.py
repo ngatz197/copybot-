@@ -575,7 +575,7 @@ class CopyTrader:
                     if not asset or size <= 0:
                         continue
                     # Use the same fallback as the scan loop so keys always match.
-                    raw_side = pos.get("side", "YES").upper()
+                    raw_side = (pos.get("outcome") or pos.get("side") or "YES").upper()
                     pre_existing.append(
                         f"{wallet_addr.lower()}_{asset}_{raw_side}"
                     )
@@ -585,7 +585,7 @@ class CopyTrader:
             for pos in raw:
                 token_id  = pos.get("asset")
                 shares    = float(pos.get("size", pos.get("shares", 0)))
-                side      = pos.get("side", "YES").upper()
+                side      = (pos.get("outcome") or pos.get("side") or "YES").upper()
                 market_id = pos.get("conditionId", "unknown")
 
                 if not token_id or shares <= 0:
