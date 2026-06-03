@@ -38,7 +38,7 @@ WALLETS: Dict[str, dict] = {
         "name": "Coniyr",
         "risk_type": "fixed",
         "fixed_risk": 0.025,
-        "copy_mode": "copy_all",
+        "copy_mode": "new_only",
     },
 }
 
@@ -56,10 +56,19 @@ PAUSE_HOURS           = 48
 MAX_RETRIES           = 3
 RETRY_DELAY           = 5
 
-LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
-LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
-SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
-PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+LIMIT_BUY_MAX_PREMIUM   = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
+LIMIT_EXPIRY_SECONDS    = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
+SEEN_TRADES_FILE        = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
+PUSD_CONTRACT_ADDRESS   = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+
+# Minimum fractional reduction in source-wallet shares that triggers a partial
+# copy-sell on our side.  Default 0.20 = copy any sell ≥ 20 % of their position.
+PARTIAL_SELL_THRESHOLD  = float(os.getenv("PARTIAL_SELL_THRESHOLD", "0.20"))
+
+# When placing a limit sell, we post at best_bid.  This is the maximum discount
+# we will accept below mid-price (e.g. 0.05 = will not sell more than 5 % below
+# mid).  If best_bid is worse than this floor we fall back to mid × (1 - discount).
+SELL_LIMIT_MAX_DISCOUNT = float(os.getenv("SELL_LIMIT_MAX_DISCOUNT", "0.05"))
 
 # ==================== RUNTIME SYSTEM HOOKS ====================
 bot_paused_until:     Optional[datetime] = None

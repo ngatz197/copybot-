@@ -31,6 +31,12 @@ class Position:
     order_id:      str   = ""
     current_price: float = 0.0
     signal_source: str   = "rest"   # "ws" | "rest"
+    # Last-known share count of the *source* wallet for this position.
+    # Updated on every REST poll so we can detect partial sells.
+    source_shares: float = 0.0
+    # Accumulated sub-threshold sell fractions.  When this crosses
+    # PARTIAL_SELL_THRESHOLD the combined reduction is acted upon and reset.
+    pending_reduction: float = 0.0
 
 @dataclass
 class PendingLimitBuy:

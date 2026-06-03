@@ -22,6 +22,8 @@ LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
 LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 DATABASE_URL          = os.getenv("DATABASE_URL", "")
+PARTIAL_SELL_THRESHOLD  = float(os.getenv("PARTIAL_SELL_THRESHOLD", "0.20"))
+SELL_LIMIT_MAX_DISCOUNT = float(os.getenv("SELL_LIMIT_MAX_DISCOUNT", "0.05"))
 
 try:
     import websockets
@@ -83,34 +85,40 @@ class CopyTrader:
         self._ws_price_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._ws_tracked:     Set[str]      = set()
         self._ws_listener:    Optional[PolymarketWSListener] = None
+        # Tracks (pos_key, sell_fraction_str) pairs that have already been acted
+        # on via WS so the REST fallback knows not to re-fire them.
+        self._ws_sell_executed: Set[str] = set()
 
         if WEBSOCKETS_AVAILABLE:
             self._ws_listener = PolymarketWSListener(
                 token_ids          = self._ws_tracked,
                 ws_price_queue     = self._ws_price_queue,
-                on_trade_callback  = self._on_ws_signal,   
+                on_trade_callback  = self._on_ws_event,
             )
-            logging.info("PolymarketWSListener initialised with trade callback")
+            logging.info("PolymarketWSListener initialised with unified trade callback")
         else:
             logging.warning("WebSocket listener inactive — install websockets to enable")
 
         logging.info(f"CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
 
-    async def _on_ws_signal(self, ev: dict):
+    async def _on_ws_event(self, ev: dict):
+        """
+        Unified WS trade callback.  The WS layer no longer infers buy vs sell
+        from unreliable fields like `trade_side`.  Instead:
+
+        - If we hold an open position for this wallet + token → treat as a sell
+          signal and mirror proportionally.
+        - If we do NOT hold a position → treat as a buy signal.
+
+        This means a single trade event is always routed correctly regardless of
+        which direction field (if any) the exchange happens to include.
+        """
         if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until:
-            return
-        is_broken, _ = self.balance.check_drawdown()
-        if is_broken is None:
-            # Balance unknown — refuse to trade rather than silently proceeding (#5)
-            logging.warning("[WS] Balance unknown — skipping signal until balance is confirmed.")
-            return
-        if is_broken:
             return
 
         tracked_wallets = {addr.lower(): addr for addr in cfg.WALLETS}
         maker, taker    = ev.get("maker_addr", ""), ev.get("taker_addr", "")
-
-        matched_lower = next(
+        matched_lower   = next(
             (w for w in tracked_wallets if w in (maker, taker)), None
         )
         if not matched_lower:
@@ -122,24 +130,49 @@ class CopyTrader:
             return
 
         token_id = ev["token_id"]
-        side     = ev["side"]
+        side     = ev["side"].upper()
         pos_key  = f"{matched_lower}_{token_id}_{side}"
 
-        # Acquire lock before the seen-check so a concurrent REST poll for the
-        # same pos_key cannot also pass through (#14).
+        # ── Sell path: we already hold this position ──────────────────────────
+        position = self.positions.get(pos_key)
+        if position and position.status == "open":
+            await self._on_ws_sell_event(ev, pos_key, position)
+            return
+
+        # ── Buy path: no open position for this wallet + token ────────────────
+        await self._on_ws_buy_event(ev, matched_lower, matched_addr, config, token_id, side, pos_key)
+
+    async def _on_ws_buy_event(
+        self,
+        ev:           dict,
+        matched_lower: str,
+        matched_addr:  str,
+        config:        dict,
+        token_id:      str,
+        side:          str,
+        pos_key:       str,
+    ):
+        is_broken, _ = self.balance.check_drawdown()
+        if is_broken is None:
+            logging.warning("[WS BUY] Balance unknown — skipping signal until balance is confirmed.")
+            return
+        if is_broken:
+            return
+
+        # Fetch orderbook BEFORE acquiring the lock — slow HTTP call.
+        loop = asyncio.get_running_loop()
+        best_ask, mid_price = await loop.run_in_executor(
+            None, self.get_orderbook_prices, token_id
+        )
+
         async with self._pending_lock:
             if self.seen.is_seen(pos_key) or pos_key in self.pending:
                 return
 
             if len(self.positions) >= MAX_POSITIONS:
-                logging.warning(f"[WS] Position limit reached — skipping {config['name']} signal.")
+                logging.warning(f"[WS BUY] Position limit reached — skipping {config['name']} signal.")
                 return
 
-            # Offload blocking HTTP call to thread pool (#11/#12)
-            loop = asyncio.get_event_loop()
-            best_ask, mid_price = await loop.run_in_executor(
-                None, self.get_orderbook_prices, token_id
-            )
             if best_ask <= 0:
                 actual_price = mid_price
             else:
@@ -147,25 +180,25 @@ class CopyTrader:
                 actual_price = min(best_ask, mid_price * (1.0 + premium))
 
             if actual_price <= 0 or actual_price >= 1.0:
-                logging.error(f"[WS] Invalid price {actual_price} for {token_id[:12]} — aborting.")
+                logging.error(f"[WS BUY] Invalid price {actual_price} for {token_id[:12]} — aborting.")
                 return
 
             source_value = float(ev.get("size", 0.0)) * actual_price
             my_size = _calc_size(config, actual_price, source_value)
 
             if my_size < 1.0 and not config.get("copy_sub_dollar", False):
-                logging.info(f"[WS] Sub-dollar size (${my_size:.2f}) rejected for {config['name']}.")
+                logging.info(f"[WS BUY] Sub-dollar size (${my_size:.2f}) rejected for {config['name']}.")
                 return
 
             logging.info(
-                f"⚡ [WS INSTANT] {config['name']} | {side} "
+                f"⚡ [WS INSTANT BUY] {config['name']} | {side} "
                 f"token {token_id[:12]}… @ {actual_price:.4f} "
                 f"(${my_size:.2f}) [signal_source=ws]"
             )
 
             ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
             if not ok:
-                logging.warning(f"[WS] Order placement failed for {config['name']} — REST poll will retry.")
+                logging.warning(f"[WS BUY] Order placement failed for {config['name']} — REST poll will retry.")
                 return
 
             if self.dry_run:
@@ -190,6 +223,137 @@ class CopyTrader:
         if self._ws_listener and token_id not in self._ws_tracked:
             asyncio.create_task(self._ws_listener.subscribe_token(token_id))
 
+    async def _on_ws_sell_event(self, ev: dict, pos_key: str, position: "Position"):
+        """
+        Mirror a sell detected via WS.  We use the source wallet's share count
+        already stored on the position to compute the sell fraction.
+        """
+        ws_sold_shares = float(ev.get("size", 0.0))
+        if ws_sold_shares <= 0:
+            return
+
+        source_total  = position.source_shares if position.source_shares > 0 else ws_sold_shares
+        sell_fraction = min(ws_sold_shares / source_total, 1.0)
+
+        if sell_fraction < PARTIAL_SELL_THRESHOLD:
+            # Accumulate sub-threshold reductions; fire when total crosses threshold.
+            position.pending_reduction += sell_fraction
+            logging.info(
+                f"[WS SELL] {position.source_name} sold {sell_fraction:.1%} "
+                f"(accumulated={position.pending_reduction:.1%}) — below threshold, accumulating."
+            )
+            if position.pending_reduction < PARTIAL_SELL_THRESHOLD:
+                return
+            # Accumulated total now crosses the threshold — fire and reset.
+            sell_fraction              = position.pending_reduction
+            position.pending_reduction = 0.0
+
+        our_shares_to_sell = round(position.shares * sell_fraction, 4)
+        if our_shares_to_sell <= 0:
+            return
+
+        dedup_key = f"{pos_key}_{sell_fraction:.2f}"
+        if dedup_key in self._ws_sell_executed:
+            return
+        self._ws_sell_executed.add(dedup_key)
+        if len(self._ws_sell_executed) > 2000:
+            self._ws_sell_executed.clear()
+
+        signal_price = float(ev.get("price", 0.0))
+        logging.info(
+            f"⚡ [WS INSTANT SELL] {position.source_name} | {position.outcome} | "
+            f"fraction={sell_fraction:.1%} | our_shares={our_shares_to_sell:.4f} | "
+            f"ref_price={signal_price:.4f}"
+        )
+
+        await self._execute_sell(
+            pos_key         = pos_key,
+            position        = position,
+            shares_to_sell  = our_shares_to_sell,
+            reference_price = signal_price,
+            trigger         = "[WS SELL]",
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Sell helpers                                                        #
+    # ------------------------------------------------------------------ #
+
+    async def _execute_sell(
+        self,
+        pos_key:       str,
+        position:      "Position",
+        shares_to_sell: float,
+        reference_price: float,
+        trigger:       str,
+    ):
+        """
+        Sell *shares_to_sell* of *position*, update internal state, and
+        record PnL.  Works for both full and partial exits.
+
+        *trigger* is a short label for log lines, e.g. "[WS SELL]" or
+        "[REST EXIT]".
+
+        Returns True if the sell order was accepted, False otherwise.
+        """
+        loop = asyncio.get_running_loop()
+
+        # Fetch a fresh orderbook price for PnL accounting (non-blocking).
+        exit_ask, exit_mid = await loop.run_in_executor(
+            None, self.get_orderbook_prices, position.token_id
+        )
+        exit_price = exit_mid if exit_mid > 0 else reference_price
+
+        ok, _ = self.executor.place_sell(
+            position.token_id, shares_to_sell, reference_price=reference_price
+        )
+        if not ok:
+            logging.warning(f"{trigger} Sell order failed for {pos_key} — will retry on next poll.")
+            return False
+
+        realised_pnl = (exit_price - position.entry_price) * shares_to_sell
+        is_full_exit = abs(shares_to_sell - position.shares) < 1e-6
+
+        if is_full_exit:
+            position.status     = "closed"
+            position.exit_price = exit_price
+            position.pnl        = realised_pnl
+
+            if self.dry_run:
+                self.balance.apply_dry_run_sell(shares_to_sell * exit_price)
+            else:
+                cfg.compounding_bankroll += realised_pnl * cfg.COMPOUNDING_RATE
+                cfg.compounding_bankroll  = max(cfg.compounding_bankroll, 0.0)
+
+            self.closed_positions.append(position)
+            if len(self.closed_positions) > 500:
+                self.closed_positions = self.closed_positions[-500:]
+            del self.positions[pos_key]
+            logging.info(
+                f"📉 {trigger} FULL EXIT {position.source_name} | "
+                f"{position.outcome} | exit={exit_price:.4f} | "
+                f"pnl={realised_pnl:+.4f} | signal={position.signal_source}"
+            )
+        else:
+            # Partial sell — shrink our position proportionally.
+            position.shares   -= shares_to_sell
+            position.size_usd  = position.shares * position.entry_price
+            position.pnl      += realised_pnl
+
+            if self.dry_run:
+                self.balance.apply_dry_run_sell(shares_to_sell * exit_price)
+            else:
+                cfg.compounding_bankroll += realised_pnl * cfg.COMPOUNDING_RATE
+                cfg.compounding_bankroll  = max(cfg.compounding_bankroll, 0.0)
+
+            logging.info(
+                f"✂️  {trigger} PARTIAL EXIT {position.source_name} | "
+                f"{position.outcome} | sold={shares_to_sell:.4f} shares | "
+                f"remaining={position.shares:.4f} | exit={exit_price:.4f} | "
+                f"pnl={realised_pnl:+.4f}"
+            )
+
+        return True
+
     def _get_positions_sync(self, wallet_addr: str) -> Optional[list]:
         url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50"
         for attempt in range(MAX_RETRIES):
@@ -207,7 +371,7 @@ class CopyTrader:
         return None
 
     async def _fetch_all_wallets(self) -> Dict[str, Optional[list]]:
-        loop         = asyncio.get_event_loop()
+        loop         = asyncio.get_running_loop()
         wallet_addrs = list(cfg.WALLETS.keys())
         tasks        = [
             loop.run_in_executor(None, self._get_positions_sync, addr)
@@ -261,7 +425,7 @@ class CopyTrader:
         return "Polymarket Asset"
 
     async def _reconcile_ws_pending(self, raw_by_wallet: Dict[str, Optional[list]]):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for pos_key, pending in self.pending.items():
             if pending.market_id != "pending-ws":
                 continue
@@ -312,6 +476,7 @@ class CopyTrader:
                     order_id      = p.order_id,
                     current_price = p.limit_price,
                     signal_source = p.signal_source,
+                    source_shares = 0.0,   # populated on the next REST poll
                 )
                 del self.pending[k]
 
@@ -366,7 +531,7 @@ class CopyTrader:
 
         await self._reconcile_ws_pending(all_wallet_data)  # now async (#10)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         for wallet_addr, config in cfg.WALLETS.items():
             raw = all_wallet_data.get(wallet_addr)
@@ -385,13 +550,23 @@ class CopyTrader:
             )
 
             if wallet_addr not in self._first_scan_done:
-                if config.get("copy_mode") == "new_only":
-                    pre_existing = [
-                        f"{wallet_addr.lower()}_{pos.get('asset')}_{pos.get('side','YES').upper()}"
-                        for pos in raw
-                        if pos.get("asset") and float(pos.get("size", pos.get("shares", 0))) > 0
-                    ]
-                    self.seen.snapshot_existing(pre_existing)
+                pre_existing = []
+                for pos in raw:
+                    asset = pos.get("asset")
+                    size  = float(pos.get("size", pos.get("shares", 0)))
+                    if not asset or size <= 0:
+                        continue
+                    raw_side = pos.get("side")
+                    if not raw_side:
+                        logging.warning(
+                            f"[SNAPSHOT] Position for {asset[:12]}… has no 'side' field "
+                            f"— skipping snapshot entry to avoid miskeying."
+                        )
+                        continue
+                    pre_existing.append(
+                        f"{wallet_addr.lower()}_{asset}_{raw_side.upper()}"
+                    )
+                self.seen.snapshot_existing(pre_existing)
                 self._first_scan_done.add(wallet_addr)
 
             for pos in raw:
@@ -405,6 +580,12 @@ class CopyTrader:
 
                 pos_key = f"{wallet_addr.lower()}_{token_id}_{side}"
 
+                # Fetch orderbook BEFORE acquiring the lock so we don't hold
+                # the lock during a blocking HTTP call.
+                best_ask, mid_price = await loop.run_in_executor(
+                    None, self.get_orderbook_prices, token_id
+                )
+
                 # Acquire lock before the seen-check so a concurrent WS signal
                 # for the same pos_key cannot also slip through (#14).
                 async with self._pending_lock:
@@ -415,10 +596,6 @@ class CopyTrader:
                         logging.warning(f"[REST] Position limit reached — skipping REST fallback.")
                         continue
 
-                    # Offload blocking HTTP calls to thread pool (#11)
-                    best_ask, mid_price = await loop.run_in_executor(
-                        None, self.get_orderbook_prices, token_id
-                    )
                     if best_ask <= 0:
                         actual_price = mid_price
                     else:
@@ -470,6 +647,14 @@ class CopyTrader:
                             signal_source = "rest",
                         )
 
+            # ── Build a shares map from the REST response ──────────────────────
+            # Maps token_id → current source-wallet share count (0 if closed).
+            source_shares_map: Dict[str, float] = {
+                pos.get("asset"): float(pos.get("size", pos.get("shares", 0)))
+                for pos in raw
+                if pos.get("asset")
+            }
+
             cur_price_map = {
                 pos.get("asset"): float(pos.get("curPrice", 0))
                 for pos in raw
@@ -484,35 +669,79 @@ class CopyTrader:
             for pos_key, position in list(self.positions.items()):
                 if position.source_wallet != wallet_addr:
                     continue
-                if position.token_id not in source_token_ids and position.status == "open":
-                    logging.info(
-                        f"📉 [EXIT] {position.source_name} closed position — "
-                        f"syncing sell [signal_source={position.signal_source}]"
-                    )
-                    # Offload blocking orderbook fetch (#11)
-                    exit_price, _ = await loop.run_in_executor(
-                        None, self.get_orderbook_prices, position.token_id
-                    )
-                    ok, _         = self.executor.place_sell(position.token_id, position.shares)
-                    if ok:
-                        pnl                 = (exit_price - position.entry_price) * position.shares
-                        position.status     = "closed"
-                        position.exit_price = exit_price
-                        position.pnl        = pnl
-                        
-                        if self.dry_run:
-                            estimated_return = position.shares * exit_price
-                            self.balance.apply_dry_run_sell(estimated_return)
-                        else:
-                            if pnl > 0:
-                                cfg.compounding_bankroll += pnl * cfg.COMPOUNDING_RATE
+                if position.status != "open":
+                    continue
 
-                        self.closed_positions.append(position)
-                        # Cap to the most recent 500 entries to prevent unbounded
-                        # memory growth in long-running deployments (#16).
-                        if len(self.closed_positions) > 500:
-                            self.closed_positions = self.closed_positions[-500:]
-                        del self.positions[pos_key]
+                current_source_shares = source_shares_map.get(position.token_id, 0.0)
+
+                # ── Update source_shares baseline on first poll after fill ──
+                if position.source_shares <= 0 and current_source_shares > 0:
+                    position.source_shares = current_source_shares
+                    logging.debug(
+                        f"[REST] source_shares initialised for {pos_key}: "
+                        f"{current_source_shares:.4f}"
+                    )
+
+                # ── Full exit: source closed the position entirely ───────────
+                if position.token_id not in source_token_ids:
+                    logging.info(
+                        f"📉 [REST EXIT] {position.source_name} fully closed — "
+                        f"mirroring full sell [signal={position.signal_source}]"
+                    )
+                    await self._execute_sell(
+                        pos_key         = pos_key,
+                        position        = position,
+                        shares_to_sell  = position.shares,
+                        reference_price = position.current_price or position.entry_price,
+                        trigger         = "[REST EXIT]",
+                    )
+                    continue
+
+                # ── Partial sell: source reduced shares ──────────────────────
+                prev_shares = position.source_shares
+                if prev_shares > 0 and current_source_shares < prev_shares:
+                    reduction = prev_shares - current_source_shares
+                    fraction  = reduction / prev_shares
+
+                    # Accumulate sub-threshold reductions so a series of small
+                    # cuts that together exceed the threshold still triggers a sell.
+                    position.pending_reduction += fraction
+                    effective_fraction = position.pending_reduction
+
+                    if effective_fraction >= PARTIAL_SELL_THRESHOLD:
+                        dedup_key = f"{pos_key}_{effective_fraction:.2f}"
+                        if dedup_key in self._ws_sell_executed:
+                            logging.debug(
+                                f"[REST] Partial sell for {pos_key} already handled "
+                                f"by WS ({effective_fraction:.1%}) — skipping REST duplicate."
+                            )
+                            position.source_shares     = current_source_shares
+                            position.pending_reduction = 0.0
+                            continue
+
+                        our_shares_to_sell = round(position.shares * effective_fraction, 4)
+                        logging.info(
+                            f"✂️  [REST PARTIAL] {position.source_name} reduced "
+                            f"{effective_fraction:.1%} of position (accumulated) — selling "
+                            f"{our_shares_to_sell:.4f} of our "
+                            f"{position.shares:.4f} shares"
+                        )
+                        await self._execute_sell(
+                            pos_key         = pos_key,
+                            position        = position,
+                            shares_to_sell  = our_shares_to_sell,
+                            reference_price = position.current_price or position.entry_price,
+                            trigger         = "[REST PARTIAL]",
+                        )
+                        position.pending_reduction = 0.0
+                    else:
+                        logging.info(
+                            f"[REST PARTIAL] {position.source_name} reduced {fraction:.1%} "
+                            f"(accumulated={effective_fraction:.1%}) — below threshold, accumulating."
+                        )
+
+                    # Update baseline regardless of whether we acted.
+                    position.source_shares = current_source_shares
 
 # ==================== WEB DASHBOARD ====================
 HTML_TEMPLATE = """<!DOCTYPE html>

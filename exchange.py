@@ -190,9 +190,18 @@ class PolymarketExecutor:
             logging.warning(f"Cancel failed for {order_id}: {e}")
             return False
 
+    # Tracks dry-run order placement counts: order_id -> poll-cycle count
+    _dry_run_fill_counter: dict = {}
+
     def is_order_filled(self, order_id: str) -> bool:
         if self.dry_run or self.client is None:
-            return True
+            # Simulate a 2-cycle fill delay for more realistic dry-run behaviour.
+            count = self._dry_run_fill_counter.get(order_id, 0) + 1
+            self._dry_run_fill_counter[order_id] = count
+            if count >= 2:
+                self._dry_run_fill_counter.pop(order_id, None)
+                return True
+            return False
         try:
             status = self.client.get_order(order_id).get("status", "").lower()
             return status in ("matched", "filled")
@@ -200,39 +209,83 @@ class PolymarketExecutor:
             logging.warning(f"Could not check order status for {order_id}: {e}")
             return False
 
-    def place_sell(self, token_id: str, shares: float) -> Tuple[bool, str]:
+    def place_sell(self, token_id: str, shares: float, reference_price: float = 0.0) -> Tuple[bool, str]:
+        """
+        Sell *shares* of token_id.
+
+        Slippage control
+        ----------------
+        We fetch the live orderbook before placing so we know the best bid.
+        We then clamp the limit price to:
+
+            limit_px = max(best_bid, mid * (1 - SELL_LIMIT_MAX_DISCOUNT))
+
+        This means we will never post a sell more than SELL_LIMIT_MAX_DISCOUNT
+        below mid-price.  If reference_price > 0 it is used as the mid fallback
+        when the orderbook fetch fails (typically the WS signal price).
+
+        Execution sequence
+        ------------------
+        1. Try a FOK market sell (instant fill at best available bid).
+        2. If FOK fails, post a GTC limit sell at the clamped limit price.
+        """
+        import config as cfg  # imported here to avoid circular at module level
+
         if self.dry_run or self.client is None:
-            logging.info(f"[DRY RUN] MARKET SELL {shares:.4f} shares")
+            logging.info(f"[DRY RUN] SELL {shares:.4f} shares (ref={reference_price:.4f})")
             return True, "dry-run-sell"
 
-        # --- Attempt 1: FOK market sell (fast fill) ---
-        for attempt in range(MAX_RETRIES):
-            try:
-                result   = self.client.create_and_post_market_order(
-                    order_args = MarketOrderArgs(token_id=token_id, amount=shares, side=Side.SELL),
-                    options    = PartialCreateOrderOptions(tick_size="0.01"),
-                    order_type = OrderType.FOK,
-                )
-                order_id = result.get("orderID", result.get("id", "unknown"))
-                logging.info(f"MARKET SELL placed (FOK V2): {order_id}")
-                return True, order_id
-            except Exception as e:
-                logging.warning(f"FOK SELL attempt {attempt+1} failed: {e}")
-                time.sleep(RETRY_DELAY)
+        # ── Fetch live orderbook to derive a slippage-safe limit price ──────
+        best_bid = 0.0
+        mid      = reference_price  # fallback if orderbook unavailable
+        try:
+            book     = requests.get(
+                f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8
+            ).json()
+            bids     = book.get("bids", [])
+            asks     = book.get("asks", [])
+            best_bid = float(bids[0]["price"]) if bids else 0.0
+            best_ask = float(asks[0]["price"]) if asks else 0.0
+            if best_bid and best_ask:
+                mid = (best_bid + best_ask) / 2
+            elif best_bid or best_ask:
+                mid = best_bid or best_ask
+            # else keep reference_price as mid
+        except Exception as e:
+            logging.warning(f"Orderbook fetch before sell failed: {e} — using reference price")
 
-        # --- Fallback: GTC limit sell at best available bid ---
-        logging.critical(
-            f"⚠️  FOK sell exhausted for token {token_id[:12]}… — "
-            f"falling back to GTC limit sell.  Manual review recommended."
+        if mid <= 0:
+            mid = 0.50  # last-resort fallback; should rarely trigger
+        floor_px  = round(mid * (1.0 - cfg.SELL_LIMIT_MAX_DISCOUNT), 4)
+        limit_px  = max(best_bid, floor_px) if best_bid > 0 else floor_px
+        limit_px  = max(limit_px, 0.01)   # never post below 1¢
+
+        logging.info(
+            f"[SELL] token={token_id[:12]}… shares={shares:.4f} "
+            f"best_bid={best_bid:.4f} mid={mid:.4f} "
+            f"floor={floor_px:.4f} limit_px={limit_px:.4f}"
+        )
+
+        # --- Attempt 1: FOK market sell (single attempt — fast fill or immediate fallback) ---
+        try:
+            result   = self.client.create_and_post_market_order(
+                order_args = MarketOrderArgs(token_id=token_id, amount=shares, side=Side.SELL),
+                options    = PartialCreateOrderOptions(tick_size="0.01"),
+                order_type = OrderType.FOK,
+            )
+            order_id = result.get("orderID", result.get("id", "unknown"))
+            logging.info(f"MARKET SELL placed (FOK): {order_id}")
+            return True, order_id
+        except Exception as e:
+            logging.warning(f"FOK SELL failed: {e} — falling through to GTC limit sell")
+
+        # --- Fallback: GTC limit sell at the slippage-clamped price -----------
+        logging.warning(
+            f"⚠️  FOK sell failed for token {token_id[:12]}… — "
+            f"posting GTC limit sell @ {limit_px:.4f}"
         )
         for attempt in range(MAX_RETRIES):
             try:
-                # Place at a penny below mid; adjust tick as needed.
-                book     = requests.get(
-                    f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8
-                ).json()
-                bids     = book.get("bids", [])
-                limit_px = float(bids[0]["price"]) if bids else 0.01
                 result   = self.client.create_and_post_order(
                     order_args = OrderArgs(
                         token_id = token_id,
@@ -244,7 +297,7 @@ class PolymarketExecutor:
                     order_type = OrderType.GTC,
                 )
                 order_id = result.get("orderID", result.get("id", "unknown"))
-                logging.info(f"GTC limit SELL placed as fallback: {order_id} @ {limit_px}")
+                logging.info(f"GTC limit SELL placed @ {limit_px:.4f}: {order_id}")
                 return True, order_id
             except Exception as e:
                 logging.warning(f"GTC SELL fallback attempt {attempt+1} failed: {e}")
@@ -258,15 +311,16 @@ class PolymarketExecutor:
 
 # ==================== WEBSOCKET LISTENER ====================
 class PolymarketWSListener:
-    WS_URL         = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    WS_URL_MARKET  = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    WS_URL_TRADE   = "wss://ws-subscriptions-clob.polymarket.com/ws/trade"
     PING_INTERVAL  = 20
     RECONNECT_BASE =  2
     RECONNECT_MAX  = 60
 
     def __init__(
         self,
-        token_ids:       Set[str],
-        ws_price_queue:  asyncio.Queue,
+        token_ids:         Set[str],
+        ws_price_queue:    asyncio.Queue,
         on_trade_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
     ):
         self.token_ids          = token_ids          
@@ -274,55 +328,77 @@ class PolymarketWSListener:
         self.on_trade_callback  = on_trade_callback  
         self._running           = False
         self._ws                = None
+        self._ws_market         = None
+        self._ws_trade          = None
         self._subscribed: Set[str] = set()
 
     async def subscribe_token(self, token_id: str):
         if token_id in self._subscribed:
             return
         self.token_ids.add(token_id)
-        if self._ws is not None:
-            try:
-                await self._send_subscribe(self._ws, {token_id})
-                self._subscribed.add(token_id)
-                logging.info(f"[WS] Live-subscribed token {token_id[:12]}…")
-            except Exception as e:
-                logging.warning(f"[WS] Live subscribe failed for {token_id[:12]}: {e}")
+        errors = []
+        for channel, ws in (("market", getattr(self, "_ws_market", None)),
+                             ("trade",  getattr(self, "_ws_trade",  None))):
+            if ws is not None:
+                try:
+                    await self._send_subscribe(ws, {token_id}, channel)
+                    logging.info(f"[WS/{channel}] Live-subscribed token {token_id[:12]}…")
+                except Exception as e:
+                    errors.append(f"{channel}: {e}")
+                    logging.warning(f"[WS/{channel}] Live subscribe failed for {token_id[:12]}: {e}")
+        if not errors:
+            self._subscribed.add(token_id)
 
     async def run(self):
         if not WEBSOCKETS_AVAILABLE:
             logging.warning("[WS] websockets not installed — listener inactive.")
             return
         self._running = True
+        # Run both channel connections concurrently; each reconnects independently.
+        await asyncio.gather(
+            self._run_channel("market", self.WS_URL_MARKET),
+            self._run_channel("trade",  self.WS_URL_TRADE),
+        )
+
+    async def _run_channel(self, channel: str, url: str):
         delay = self.RECONNECT_BASE
         while self._running:
             try:
-                await self._connect_and_listen()
+                await self._connect_and_listen(channel, url)
                 delay = self.RECONNECT_BASE
             except Exception as e:
-                logging.warning(f"[WS] Disconnected: {e} — reconnecting in {delay}s")
+                logging.warning(f"[WS/{channel}] Disconnected: {e} — reconnecting in {delay}s")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self.RECONNECT_MAX)
 
     def stop(self):
         self._running = False
 
-    async def _connect_and_listen(self):
-        logging.info(f"[WS] Connecting to {self.WS_URL} …")
+    async def _connect_and_listen(self, channel: str, url: str):
+        logging.info(f"[WS/{channel}] Connecting to {url} …")
         async with websockets.connect(
-            self.WS_URL,
+            url,
             ping_interval = self.PING_INTERVAL,
             ping_timeout  = 30,
             close_timeout = 10,
         ) as ws:
-            self._ws = ws
+            # Each connection owns only its channel's _ws reference and subscribed set.
+            # Use per-channel attributes so the two connections don't clobber each other.
+            if channel == "market":
+                self._ws_market = ws
+            else:
+                self._ws_trade  = ws
+            self._ws = ws   # keep a generic reference for subscribe_token compat
+            # Reset the subscribed set on each new connection so all known tokens
+            # are re-subscribed and subscribe_token() isn't blocked by stale entries.
             self._subscribed.clear()
-            logging.info("[WS] Connected ✅")
+            logging.info(f"[WS/{channel}] Connected ✅")
 
             if self.token_ids:
-                await self._send_subscribe(ws, self.token_ids)
+                await self._send_subscribe(ws, self.token_ids, channel)
                 self._subscribed.update(self.token_ids)
             else:
-                logging.info("[WS] No token_ids yet — awaiting first trade signal.")
+                logging.info(f"[WS/{channel}] No token_ids yet — awaiting first trade signal.")
 
             async for raw in ws:
                 if not self._running:
@@ -330,18 +406,21 @@ class PolymarketWSListener:
                 try:
                     await self._handle_message(raw)
                 except Exception as e:
-                    logging.debug(f"[WS] Message parse error: {e}")
+                    logging.debug(f"[WS/{channel}] Message parse error: {e}")
+        if channel == "market":
+            self._ws_market = None
+        else:
+            self._ws_trade  = None
         self._ws = None
 
-    async def _send_subscribe(self, ws, token_ids: Set[str]):
-        for channel in ("market", "trade"):
-            payload = {
-                "type":      "subscribe",
-                "channel":   channel,
-                "asset_ids": list(token_ids),
-            }
-            await ws.send(json.dumps(payload))
-        logging.info(f"[WS] Subscribed {len(token_ids)} token(s) on market+trade channels")
+    async def _send_subscribe(self, ws, token_ids: Set[str], channel: str):
+        payload = {
+            "type":      "subscribe",
+            "channel":   channel,
+            "asset_ids": list(token_ids),
+        }
+        await ws.send(json.dumps(payload))
+        logging.info(f"[WS/{channel}] Subscribed {len(token_ids)} token(s)")
 
     async def _handle_message(self, raw: str):
         try:
@@ -386,6 +465,8 @@ class PolymarketWSListener:
                 maker_addr = (ev.get("maker_address") or ev.get("maker") or "").lower()
                 taker_addr = (ev.get("taker_address") or ev.get("taker") or "").lower()
 
+                # Direction is NOT inferred here — the engine disambiguates by
+                # checking whether it holds an open position for this token+wallet.
                 if token_id and price and self.on_trade_callback:
                     await self.on_trade_callback({
                         "kind":       "trade",
