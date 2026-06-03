@@ -237,6 +237,10 @@ class CopyTrader:
         if ws_sold_shares <= 0:
             return
 
+        if position.source_shares <= 0:
+            logging.info("[WS SELL] source_shares not yet initialized — deferring to REST")
+            return
+
         source_total  = position.source_shares if position.source_shares > 0 else ws_sold_shares
         sell_fraction = min(ws_sold_shares / source_total, 1.0)
 
@@ -332,7 +336,7 @@ class CopyTrader:
             self.closed_positions.append(position)
             if len(self.closed_positions) > 500:
                 self.closed_positions = self.closed_positions[-500:]
-            del self.positions[pos_key]
+            self.positions.pop(pos_key, None)
             logging.info(
                 f"📉 {trigger} FULL EXIT {position.source_name} | "
                 f"{position.outcome} | exit={exit_price:.4f} | "
@@ -726,14 +730,15 @@ class CopyTrader:
                             f"{our_shares_to_sell:.4f} of our "
                             f"{position.shares:.4f} shares"
                         )
-                        await self._execute_sell(
+                        sold_ok = await self._execute_sell(
                             pos_key         = pos_key,
                             position        = position,
                             shares_to_sell  = our_shares_to_sell,
                             reference_price = position.current_price or position.entry_price,
                             trigger         = "[REST PARTIAL]",
                         )
-                        position.pending_reduction = 0.0
+                        if sold_ok:
+                            position.pending_reduction = 0.0
                     else:
                         logging.info(
                             f"[REST PARTIAL] {position.source_name} reduced {fraction:.1%} "
@@ -876,9 +881,12 @@ def build_dashboard(bot) -> dict:
     mode_label   = "Dry Run" if bot.dry_run else "Live"
     mode_badge   = "badge-dry" if bot.dry_run else "badge-live"
 
+    positions_snapshot = list(bot.positions.values())
+    closed_list = list(getattr(bot, "closed_positions", []))
+
     unrealised = 0.0
     pos_rows   = ""
-    for p in bot.positions.values():
+    for p in positions_snapshot:
         mid    = p.current_price if p.current_price > 0 else p.entry_price
         unreal = (mid - p.entry_price) * p.shares
         unrealised += unreal
@@ -909,7 +917,6 @@ def build_dashboard(bot) -> dict:
         '<div class="empty"><div class="empty-icon">📭</div>No open positions</div>'
     )
 
-    closed_list = getattr(bot, "closed_positions", [])
     realised    = sum(p.pnl for p in closed_list)
     closed_rows = ""
     for p in reversed(closed_list):
