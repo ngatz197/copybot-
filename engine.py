@@ -184,11 +184,6 @@ class CopyTrader:
                 logging.warning(f"[WS BUY] Position limit reached — skipping {config['name']} signal.")
                 return
 
-            current_bal = self.balance.get_balance()
-            if current_bal is not None and my_size > current_bal:
-                logging.warning(f"[WS BUY] Order size ${my_size:.2f} exceeds balance ${current_bal:.2f} — skipping {config['name']}.")
-                return
-
             signal_price = float(ev.get("price", 0.0))
             if signal_price > 0:
                 # Use the actual price the source paid as reference
@@ -220,6 +215,11 @@ class CopyTrader:
 
             source_value = float(ev.get("size", 0.0)) * actual_price
             my_size = _calc_size(config, actual_price, source_value)
+
+            current_bal = self.balance.get_balance()
+            if current_bal is not None and my_size > current_bal:
+                logging.warning(f"[WS BUY] Order size ${my_size:.2f} exceeds balance ${current_bal:.2f} — skipping {config['name']}.")
+                return
 
             logging.info(
                 f"⚡ [WS INSTANT BUY] {config['name']} | {side} "
@@ -338,8 +338,11 @@ class CopyTrader:
         )
         exit_price = exit_mid if exit_mid > 0 else reference_price
 
-        ok, _ = self.executor.place_sell(
-            position.token_id, shares_to_sell, reference_price=reference_price
+        ok, _ = await loop.run_in_executor(
+            None,
+            lambda: self.executor.place_sell(
+                position.token_id, shares_to_sell, reference_price=reference_price
+            ),
         )
         if not ok:
             logging.warning(f"{trigger} Sell order failed for {pos_key} — will retry on next poll.")
@@ -633,11 +636,6 @@ class CopyTrader:
                         logging.warning(f"[REST] Position limit reached — skipping REST fallback.")
                         continue
 
-                    current_bal = self.balance.get_balance()
-                    if current_bal is not None and my_size > current_bal:
-                        logging.warning(f"[REST] Order size ${my_size:.2f} exceeds balance ${current_bal:.2f} — skipping.")
-                        continue
-
                     source_price = float(pos.get("avgPrice", pos.get("price", 0.0)))
                     if source_price > 0:
                         # Use the actual price the source paid as reference
@@ -669,6 +667,11 @@ class CopyTrader:
 
                     source_value = float(pos.get("initialValue", pos.get("value", 0.0)))
                     my_size = _calc_size(config, actual_price, source_value)
+
+                    current_bal = self.balance.get_balance()
+                    if current_bal is not None and my_size > current_bal:
+                        logging.warning(f"[REST] Order size ${my_size:.2f} exceeds balance ${current_bal:.2f} — skipping.")
+                        continue
 
                     # Offload blocking HTTP call (#11)
                     question_str = await loop.run_in_executor(
