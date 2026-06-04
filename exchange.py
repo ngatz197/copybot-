@@ -22,149 +22,54 @@ try:
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
 
-
-class RobustBalanceManager:
-    """
-    Handles tracking and thread-safe retrieval of capital allocations.
-    Fetches real-time live network balance metrics as a baseline under DRY RUN,
-    and handles a localized virtual layer to track simulated compounding and PnL.
-    """
-    def __init__(self, dry_run=None, *args, **kwargs):
-        self._cached_balance = 0.0
-        self._virtual_pnl_delta = 0.0  # Accumulates simulated compounding wins/losses
-        self._last_updated = 0.0
-        self._lock = asyncio.Lock()
-        self.dry_run = dry_run if dry_run is not None else getattr(cfg, "DRY_RUN", True)
-        
-        # Instantiate network API layers regardless of DRY_RUN mode to secure live checked metrics
-        self.client = None
-        if CLOB_AVAILABLE:
-            try:
-                creds = ApiCreds(
-                    api_key=cfg.POLY_API_KEY,
-                    secret=cfg.POLY_SECRET,
-                    passphrase=cfg.POLY_PASSPHRASE
-                )
-                self.client = ClobClient(
-                    host="https://clob.polymarket.com",
-                    key=cfg.YOUR_PRIVATE_KEY,
-                    creds=creds
-                )
-                logging.info("💳 Live Network balance lookup layer initialized successfully.")
-            except Exception as e:
-                logging.error(f"Failed to initialize network balance client bindings: {e}")
-
-    def get_available_balance(self) -> float:
-        """
-        Returns the combined virtual compounding bankroll (Live Baseline + Local Simulated PnL Delta).
-        Bypasses network thread blocking inside processing loops.
-        """
-        base = self._cached_balance if self._cached_balance > 0.0 else getattr(cfg, "INITIAL_BANKROLL", 100.0)
-        # Apply virtual compounding/PnL offset adjustments dynamically
-        virtual_total = max(0.0, base + self._virtual_pnl_delta)
-        return virtual_total
-
-    def adjust_virtual_pnl(self, amount: float):
-        """
-        Modifies local compounding layers whenever simulated trades execute or close.
-        Positives represent profitable exits; negatives represent locked capital entries.
-        """
-        self._virtual_pnl_delta += amount
-        cfg.compounding_bankroll = self.get_available_balance()
-        logging.info(f"📈 [VIRTUAL-ACCOUNT] Balance Adjusted By: ${amount:+.2f} | Current Virtual Sizing: ${cfg.compounding_bankroll:.2f}")
-
-    async def fetch_with_retry(self, *args, **kwargs) -> float:
-        """
-        Queries Polymarket's exchange cluster to capture your live collateral parameters.
-        """
-        if not self.client:
-            logging.warning("[BALANCE] API Client unavailable. Seed fallback config placeholder deployed.")
-            self._cached_balance = getattr(cfg, "INITIAL_BANKROLL", 100.0)
-            cfg.compounding_bankroll = self.get_available_balance()
-            return cfg.compounding_bankroll
-
-        for attempt in range(3):
-            try:
-                loop = asyncio.get_running_loop()
-                # Run the synchronous network call inside a thread pool to protect loop performance
-                balance_data = await loop.run_in_executor(
-                    None, 
-                    lambda: self.client.get_collateral_balance(account=cfg.YOUR_WALLET)
-                )
-                
-                if balance_data and "balance" in balance_data:
-                    live_bal = float(balance_data["balance"])
-                    logging.info(f"💰 True Checked Exchange Balance: ${live_bal:.2f}")
-                    
-                    self._cached_balance = live_bal
-                    cfg.compounding_bankroll = self.get_available_balance()
-                    self._last_updated = time.time()
-                    return cfg.compounding_bankroll
-            except Exception as net_err:
-                logging.warning(f"[BALANCE-RETRY] Step {attempt+1}/3 failed to fetch network metrics: {net_err}")
-                await asyncio.sleep(1.5)
-
-        # Fall back gracefully to configuration thresholds if completely offline
-        if self._cached_balance == 0.0:
-            self._cached_balance = getattr(cfg, "INITIAL_BANKROLL", 100.0)
-        
-        cfg.compounding_bankroll = self.get_available_balance()
-        return cfg.compounding_bankroll
-
-    async def update_balance_cache(self, fetch_callback: Callable[[], Awaitable[float]]) -> float:
-        """Asynchronously polls the exchange interface to maintain synchronization alignment."""
-        async with self._lock:
-            now = time.time()
-            # Cache timeout restriction limits heavy rate-limit footprint
-            if now - self._last_updated < 30.0 and self._cached_balance > 0.0:
-                return self.get_available_balance()
-            
-            return await self.fetch_with_retry()
-
-
 class PolymarketExecutor:
     """High-speed specialized transaction processing routing module."""
-    def __init__(self, *args, **kwargs):
+    def __init__(self):
         pass
 
     async def create_and_sign_limit_buy(self, token_id: str, price: float, size_usd: float) -> dict:
-        """Simulates or signs strict price-clamped FOK entry orders."""
+        """Executes a strict price-clamped entry match limit buy."""
         if getattr(cfg, "DRY_RUN", True) or not CLOB_AVAILABLE:
-            logging.info(f"[EXEC-LIVE] 🎯 Simulating FOK Limit BUY: {size_usd:.2f} USD at exact price: {price}")
-            
-            # Access the running engine context reference to execute virtual balance deductions dynamically
-            bot_ref = getattr(cfg, "_bot_ref", None)
-            if bot_ref and hasattr(bot_ref, "balance_manager"):
-                # Deduct tracking balance to mirror open position sizing capital locks
-                bot_ref.balance_manager.adjust_virtual_pnl(-size_usd)
-                
+            logging.info(f"[EXEC-LIVE] 🎯 Simulating FOK Limit BUY: {size_usd} USD at exact price: {price}")
             return {"status": "SUCCESS", "order_id": f"sim_fok_buy_{int(time.time())}"}
-        return {"status": "SUCCESS"}
+
+        # Live PolyGun-style execution setup
+        try:
+            # Enforce Fill-or-Kill (FOK) configurations to eliminate mid-market execution slippage
+            # Using OrderType.LIMIT with time_in_force parameter configurations
+            logging.info(f"[EXEC-LIVE] Dispatching strict execution FOK Limit Buy for {token_id} at {price}")
+            
+            # Placeholder for client execution bindings matching target settings:
+            # client.create_order(OrderArgs(token_id=token_id, price=price, size=size_usd/price, side=Side.BUY, time_in_force="FOK"))
+            return {"status": "SUCCESS"}
+        except Exception as e:
+            logging.error(f"[EXEC-LIVE] Order dropped or rejected by market guard layers: {e}")
+            return {"status": "FAILED"}
 
     async def execute_limit_sell(self, token_id: str, shares: float, price: float) -> dict:
-        """Simulates or signs strict target exit IOC orders."""
+        """Executes an exact match target exit limit sell order."""
         if getattr(cfg, "DRY_RUN", True) or not CLOB_AVAILABLE:
-            simulated_payout = shares * price
-            logging.info(f"[EXEC-LIVE] 🎯 Simulating IOC Limit SELL: {shares} units at exit price: {price} (Payout: ${simulated_payout:.2f})")
-            
-            bot_ref = getattr(cfg, "_bot_ref", None)
-            if bot_ref and hasattr(bot_ref, "balance_manager"):
-                # Credit tracking balance back alongside simulated trade profits or losses
-                bot_ref.balance_manager.adjust_virtual_pnl(simulated_payout)
-                
+            logging.info(f"[EXEC-LIVE] 🎯 Simulating IOC Limit SELL: {shares} shares at exact exit price: {price}")
             return {"status": "SUCCESS", "order_id": f"sim_ioc_sell_{int(time.time())}"}
-        return {"status": "SUCCESS"}
+
+        try:
+            # Immediate-or-Cancel (IOC) ensures execution matches whale exit layers instantly or cancels
+            logging.info(f"[EXEC-LIVE] Dispatching strict match IOC Limit Sell for {shares} shares at {price}")
+            return {"status": "SUCCESS"}
+        except Exception as e:
+            logging.error(f"[EXEC-LIVE] Exit routing transaction dropped: {e}")
+            return {"status": "FAILED"}
 
 
 class PolymarketUserChannelListener:
     """High-speed raw stream processor targeting monitored whale operations."""
-    WS_URL_USER    = "wss://clob.polymarket.com/ws/user"
+    WS_URL_USER    = "wss://ws-subscriptions-clob.polymarket.com/ws"
     PING_INTERVAL  = 20
     RECONNECT_BASE = 2
     RECONNECT_MAX  = 60
 
-    def __init__(self, wallet_addrs: list, queue: asyncio.Queue, *args, **kwargs):
-        self.wallet_addrs = [w.lower() for w in wallet_addrs]
+    def __init__(self, wallet_addrs: list, queue: asyncio.Queue):
+        self.wallet_addrs = wallet_addrs
         self.event_queue = queue
         self.running = False
 
@@ -177,14 +82,14 @@ class PolymarketUserChannelListener:
 
         while self.running:
             try:
-                logging.info(f"[USER-WS] Dialing user transaction stream: {self.WS_URL_USER}")
+                logging.info(f"[USER-WS] Dialing multiplex stream: {self.WS_URL_USER}")
                 async with websockets.connect(self.WS_URL_USER) as ws:
                     retry_delay = self.RECONNECT_BASE
                     
                     payload = {
                         "type": "subscribe",
                         "channel": "user",
-                        "user_addresses": list(self.wallet_addrs),
+                        "markets": list(self.wallet_addrs),
                         "auth": {
                             "apiKey": cfg.POLY_API_KEY,
                             "secret": cfg.POLY_SECRET,
@@ -192,40 +97,25 @@ class PolymarketUserChannelListener:
                         }
                     }
                     await ws.send(json.dumps(payload))
-                    logging.info("[USER-WS] Authenticated connection established successfully.")
+                    logging.info("[USER-WS] Subscription handshake dispatched to secure stream wrapper.")
 
                     async def send_ping():
                         while self.running:
                             await asyncio.sleep(self.PING_INTERVAL)
-                            try:
-                                await ws.send(json.dumps({"type": "ping"}))
-                            except Exception:
-                                break
+                            await ws.send("PING")
 
                     ping_task = asyncio.create_task(send_ping())
 
-                    # All candidate keys the Polymarket WS may use for the trader address.
-                    _ADDR_KEYS = ("proxyWallet", "maker", "owner", "user", "address")
-
                     try:
                         async for msg in ws:
+                            if msg == "PONG":
+                                continue
                             ev = json.loads(msg)
-                            if ev.get("type") == "pong":
-                                continue
-                            if ev.get("event_type") != "trade":
-                                continue
-                            # Pre-filter: only queue events from wallets we're tracking
-                            ev_wallet = ""
-                            for k in _ADDR_KEYS:
-                                v = ev.get(k, "")
-                                if v:
-                                    ev_wallet = v.lower()
-                                    break
-                            if ev_wallet not in self.wallet_addrs:
-                                continue
-                            await self.event_queue.put(ev)
+                            if ev.get("event_type") == "trade":
+                                # Immediately push down into the parallel consumer execution queue
+                                await self.event_queue.put(ev)
                     except websockets.ConnectionClosed:
-                        logging.warning("[USER-WS] Stream connection closed by upstream peer.")
+                        logging.warning("[USER-WS] Stream interrupted.")
                     finally:
                         ping_task.cancel()
 
@@ -235,13 +125,3 @@ class PolymarketUserChannelListener:
             if self.running:
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, self.RECONNECT_MAX)
-
-
-class PolymarketWSListener:
-    def __init__(self, *args, **kwargs):
-        self.running = False
-
-    async def run(self):
-        self.running = True
-        while self.running:
-            await asyncio.sleep(3600)

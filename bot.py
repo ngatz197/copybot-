@@ -41,42 +41,6 @@ def handle_task_exception(task: asyncio.Task):
         logging.critical(f"💥 Background task worker loop failed: {task.get_name()} -> {e}", exc_info=True)
 
 
-_WALLET_KEYS = ("proxyWallet", "maker", "owner", "user", "address")
-
-def _extract_wallet(ev: dict) -> str:
-    """
-    Try all known Polymarket WS field names that carry the trader's wallet address.
-    Logs a warning on the first event where none of the expected keys are found so
-    the correct field name can be identified from live traffic and added here.
-    """
-    for key in _WALLET_KEYS:
-        val = ev.get(key, "")
-        if val:
-            return val.lower()
-    logging.warning(f"[EVENT] Could not extract wallet address from event keys: {list(ev.keys())}")
-    return ""
-
-
-def _drawdown_breached(bot_engine: CopyTrader) -> bool:
-    """
-    Returns True and logs a warning if the current balance has fallen more than
-    MAX_DRAWDOWN below the recorded peak.  Trading is blocked when True.
-    """
-    peak = cfg.peak_bankroll
-    if peak <= 0:
-        return False
-    current = bot_engine.balance_manager.get_available_balance()
-    drawdown = (peak - current) / peak
-    if drawdown >= cfg.MAX_DRAWDOWN:
-        logging.warning(
-            f"🛑 [DRAWDOWN] Current drawdown {drawdown:.1%} exceeds limit "
-            f"{cfg.MAX_DRAWDOWN:.1%} (peak=${peak:.2f}, now=${current:.2f}). "
-            f"BUY blocked."
-        )
-        return True
-    return False
-
-
 async def execution_queue_consumer(queue: asyncio.Queue, bot_engine: CopyTrader):
     """
     PolyGun Event-Driven Consumer Hub.
@@ -86,57 +50,31 @@ async def execution_queue_consumer(queue: asyncio.Queue, bot_engine: CopyTrader)
     while True:
         ev = await queue.get()
         try:
-            wallet = _extract_wallet(ev)
+            wallet = ev.get("proxyWallet")
             token_id = ev.get("asset")
-            side = ev.get("side")   # "BUY" or "SELL"
+            side = ev.get("side") # "BUY" or "SELL"
             price = float(ev.get("price", 0.0))
             size = float(ev.get("size", 0.0))
+            outcome = ev.get("outcome")
 
-            # Fetch wallet profile directly from matrix definitions
-            wallet_cfg = cfg.WALLETS.get(wallet)
-            if not wallet_cfg:
-                continue
+            logging.info(f"⚡ [EVENT-MATCH] Intercepted Whale Action from {wallet}: {side} {token_id} @ {price}")
 
-            logging.info(f"⚡ [EVENT-MATCH] Intercepted Whale Action from {wallet_cfg['name']}: {side} {token_id} @ {price}")
-
+            # Routing order directly through to specialized execution parameters
             if side == "BUY":
-                # Enforce drawdown circuit-breaker before placing any new entry
-                if _drawdown_breached(bot_engine):
-                    continue
-
+                # Compute fractional copy allocations instantly
                 usd_allocation = bot_engine.balance_manager.get_available_balance() * cfg.COMPOUNDING_RATE
-                logging.info(f"🛒 Processing BUY event (Mode: {wallet_cfg['copy_mode']}) for {token_id}")
-
-                result = await bot_engine.executor.create_and_sign_limit_buy(
-                    token_id=token_id,
-                    price=price,
-                    size_usd=usd_allocation,
+                await bot_engine.executor.create_and_sign_limit_buy(
+                    token_id=token_id, 
+                    price=price, # Pin to the exact target entry price execution tier
+                    size_usd=usd_allocation
                 )
-
-                if result.get("status") == "SUCCESS":
-                    bot_engine.record_buy(
-                        token_id=token_id,
-                        wallet=wallet,
-                        wallet_name=wallet_cfg["name"],
-                        price=price,
-                        size_usd=usd_allocation,
-                        order_id=result.get("order_id", ""),
-                    )
-
             elif side == "SELL":
-                result = await bot_engine.executor.execute_limit_sell(
-                    token_id=token_id,
-                    shares=size,
-                    price=price,
+                # Match positions and close or trim matching token units instantly
+                await bot_engine.executor.execute_limit_sell(
+                    token_id=token_id, 
+                    shares=size, 
+                    price=price # Pin to exact target exit price execution tier
                 )
-
-                if result.get("status") == "SUCCESS":
-                    bot_engine.record_sell(
-                        token_id=token_id,
-                        wallet=wallet,
-                        price=price,
-                        shares=size,
-                    )
 
         except Exception as worker_err:
             logging.error(f"Error executing queued trade frame: {worker_err}", exc_info=True)
@@ -164,23 +102,24 @@ async def main():
 
     # 5. Spin Up Event Consumer Worker Pool
     consumer_task = asyncio.create_task(
-        execution_queue_consumer(shared_execution_queue, bot),
+        execution_queue_consumer(shared_execution_queue, bot), 
         name="ExecutionConsumer"
     )
     consumer_task.add_done_callback(handle_task_exception)
 
-    # 6. Initialize listener explicitly configured to clear out the old URL
+    # 6. Override default listener configuration to point to high-speed queue pipeline topology
     high_speed_user_ws = PolymarketUserChannelListener(
-        wallet_addrs=list(cfg.WALLETS.keys()),
+        wallet_addrs=list(cfg.WALLETS.keys()), 
         queue=shared_execution_queue
     )
 
     ws_user_task = asyncio.create_task(high_speed_user_ws.run(), name="HighSpeedUserWS")
     ws_user_task.add_done_callback(handle_task_exception)
 
-    # 7. Passive Reconciliation Engine Poller
+    # 7. Slow Background Reconciliation Engine Poller (Acts as passive validation fallback)
     while True:
         try:
+            # Scan-and-copy now handles passive accounting corrections only, leaving execution to WebSockets
             await bot.scan_and_copy()
         except (OSError, asyncio.TimeoutError) as transient_err:
             logging.warning(f"Transient polling error in validation handler: {transient_err}")
