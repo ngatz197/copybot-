@@ -131,9 +131,11 @@ class CopyTrader:
 
         if WEBSOCKETS_AVAILABLE:
             self._ws_listener = PolymarketWSListener(
-                token_ids          = self._ws_tracked,
-                ws_price_queue     = self._ws_price_queue,
-                on_trade_callback  = self._on_ws_event,
+                token_ids                = self._ws_tracked,
+                wallet_addrs             = set(cfg.WALLETS.keys()),
+                ws_price_queue           = self._ws_price_queue,
+                on_trade_callback        = self._on_ws_event,
+                on_order_placed_callback = self._on_ws_order_placed,
             )
             # User channel listener: monitors OUR OWN wallet's fills only.
             # Source-wallet detection (whale buy/sell signals) is handled
@@ -143,7 +145,7 @@ class CopyTrader:
             self._user_listener = PolymarketUserChannelListener(
                 on_fill_callback = self._on_own_fill,
             )
-            logging.info("PolymarketWSListener initialised — market channel (whale detection) + user channel (own fills)")
+            logging.info("PolymarketWSListener initialised — market channel (whale detection + new-token order_placed) + user channel (own fills)")
         else:
             logging.warning("WebSocket listener inactive — install websockets to enable")
             self._user_listener = None
@@ -178,6 +180,134 @@ class CopyTrader:
             f"[COMPOUND] pnl={realised_pnl:+.4f} | rate={cfg.COMPOUNDING_RATE:.0%} | "
             f"delta={delta:+.4f} | sizing_base=${cfg.compounding_bankroll:.2f}"
         )
+
+    async def _on_ws_order_placed(self, ev: dict):
+        """
+        Fires when a tracked wallet posts a NEW resting order on a token we
+        have not seen before.
+
+        At this point the order is placed but not yet filled — the whale has
+        declared intent.  We use this window to:
+
+        1. Self-subscribe the token on the market channel so the fill event
+           arrives in real time (the listener already does this before calling
+           here, but we record it in _ws_tracked to survive reconnects).
+
+        2. Fetch the orderbook and place our own limit buy at best_ask,
+           capped at the whale's order price + premium.  This gets us in at
+           or near the same price the whale is targeting, before the fill
+           moves the market.
+
+        If outcome is missing we cannot build a valid pos_key — we skip the
+        order placement but still keep the token subscribed so the fill event
+        (which should carry outcome) triggers _on_ws_event normally.
+        """
+        if cfg.bot_paused_until and datetime.now() < cfg.bot_paused_until:
+            return
+
+        token_id   = ev.get("token_id", "")
+        maker_addr = ev.get("maker_addr", "").lower()
+        price      = float(ev.get("price", 0))
+        outcome    = ev.get("outcome", "").upper()
+
+        if not token_id or not maker_addr or price <= 0:
+            return
+
+        tracked_wallets = {addr.lower(): addr for addr in cfg.WALLETS}
+        if maker_addr not in tracked_wallets:
+            return
+
+        matched_addr = tracked_wallets[maker_addr]
+        config       = cfg.WALLETS.get(matched_addr) or cfg.WALLETS.get(maker_addr)
+        if not config:
+            return
+
+        # Always ensure the token is tracked for the subsequent fill event.
+        if token_id not in self._ws_tracked:
+            if self._ws_listener:
+                asyncio.create_task(self._ws_listener.subscribe_token(token_id))
+
+        if not outcome:
+            # Can't place an order without outcome — wait for the fill event
+            # which should carry it.  Token is already subscribed above.
+            logging.info(
+                f"[WS ORDER_PLACED] {config['name']} placed order on "
+                f"{token_id[:12]}… — outcome unknown, token subscribed, "
+                f"deferring entry to fill event."
+            )
+            return
+
+        is_broken, _ = self.balance.check_drawdown()
+        if is_broken is None or is_broken:
+            return
+
+        pos_key = f"{maker_addr}_{token_id}_{outcome}"
+
+        # Fetch orderbook before acquiring lock — slow HTTP call outside lock.
+        loop = asyncio.get_running_loop()
+        best_ask, _ = await loop.run_in_executor(
+            None, self.get_orderbook_prices, token_id
+        )
+
+        async with self._pending_lock:
+            if self.seen.is_seen(pos_key) or pos_key in self.pending:
+                return
+
+            if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
+                logging.warning(
+                    f"[WS ORDER_PLACED] Position limit reached — "
+                    f"skipping {config['name']} pre-signal."
+                )
+                return
+
+            premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+            # Cap at whale's order price + premium — never pay more than we
+            # would have on a fill signal.
+            price_cap    = price * (1.0 + premium)
+            actual_price = min(best_ask, price_cap) if best_ask > 0 else price_cap
+
+            if actual_price <= 0 or actual_price >= 1.0:
+                return
+
+            source_value = 0.0  # unknown at order-placement time
+            my_size = _calc_size(config, actual_price, source_value)
+
+            current_bal = self.balance.get_balance()
+            if current_bal is not None and my_size > current_bal:
+                return
+
+            logging.info(
+                f"⚡ [WS PRE-FILL BUY] {config['name']} | {outcome} "
+                f"token {token_id[:12]}… @ {actual_price:.4f} "
+                f"(${my_size:.2f}) — placed ahead of fill [signal_source=ws]"
+            )
+
+            ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
+            if not ok:
+                logging.warning(
+                    f"[WS ORDER_PLACED] Pre-fill order placement failed for "
+                    f"{config['name']} — fill event will retry via _on_ws_event."
+                )
+                return
+
+            if self.dry_run:
+                self.balance.apply_dry_run_buy(my_size)
+
+            self.seen.mark_seen(pos_key)
+
+            self.pending[pos_key] = PendingLimitBuy(
+                pos_key       = pos_key,
+                token_id      = token_id,
+                market_id     = "pending-ws",
+                question      = f"WS pre-fill — {token_id[:16]}…",
+                outcome       = outcome,
+                source_wallet = matched_addr,
+                source_name   = config["name"],
+                limit_price   = actual_price,
+                size_usd      = my_size,
+                order_id      = order_id,
+                signal_source = "ws",
+            )
 
     async def _on_own_fill(self, ev: dict):
         """
@@ -832,20 +962,14 @@ class CopyTrader:
                     )
                 self.seen.snapshot_existing(pre_existing)
 
-                # Pre-subscribe all active tokens for this wallet to the market
-                # channel immediately so any new trade on an existing position is
-                # caught by WS rather than waiting for the next REST poll.
-                if self._ws_listener:
-                    for pos in raw:
-                        asset = pos.get("asset")
-                        size  = float(pos.get("size", pos.get("shares", 0)))
-                        if asset and size > 0 and asset not in self._ws_tracked:
-                            asyncio.create_task(self._ws_listener.subscribe_token(asset))
-                    logging.info(
-                        f"[WS] Pre-subscribed {len(source_token_ids)} active token(s) "
-                        f"for {config['name']} on first scan."
-                    )
-
+                # Token subscriptions are NOT done here.
+                # The bot only subscribes tokens it has actually placed an order
+                # on — handled in _on_ws_buy_event, _on_ws_order_placed, and the
+                # REST buy path.  Bulk-subscribing all source wallet tokens floods
+                # the WS stream with events for positions the bot never copied.
+                # New tokens are discovered via wallet-address order_placed events
+                # on the market channel, which fires before the fill and
+                # self-subscribes the token in time to catch it.
                 self._first_scan_done.add(wallet_addr)
 
             for pos in raw:
