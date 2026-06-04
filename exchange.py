@@ -22,6 +22,47 @@ try:
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
 
+
+class RobustBalanceManager:
+    """
+    Handles tracking and thread-safe retrieval of available capital allocations.
+    Required by engine.py to compute proportional sizing models.
+    """
+    def __init__(self):
+        self._cached_balance = 0.0
+        self._last_updated = 0.0
+        self._lock = asyncio.Lock()
+
+    def get_available_balance(self) -> float:
+        """
+        Synchronous fallback getter used inside execution loops. 
+        Returns compounding bankroll baseline if local cache isn't initialized yet.
+        """
+        if self._cached_balance > 0.0:
+            return self._cached_balance
+        return getattr(cfg, "compounding_bankroll", 0.0)
+
+    async def update_balance_cache(self, fetch_callback: Callable[[], Awaitable[float]]) -> float:
+        """Asynchronously updates the internal balance tracking using a provided network callback."""
+        async with self._lock:
+            try:
+                now = time.time()
+                # Throttles API requests if updated less than 5 seconds ago
+                if now - self._last_updated < 5.0 and self._cached_balance > 0.0:
+                    return self._cached_balance
+                
+                new_balance = await fetch_callback()
+                if new_balance >= 0.0:
+                    self._cached_balance = new_balance
+                    self._last_updated = now
+                    # Keep config parameters synchronized
+                    cfg.compounding_bankroll = new_balance
+                return self._cached_balance
+            except Exception as e:
+                logging.error(f"[BALANCE] Failed to update balance cache: {e}")
+                return self.get_available_balance()
+
+
 class PolymarketExecutor:
     """High-speed specialized transaction processing routing module."""
     def __init__(self):
