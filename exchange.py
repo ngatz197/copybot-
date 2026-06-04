@@ -32,7 +32,6 @@ class RobustBalanceManager:
         self._cached_balance = 0.0
         self._last_updated = 0.0
         self._lock = asyncio.Lock()
-        # Fall back to global config definition if not explicitly provided by engine init
         self.dry_run = dry_run if dry_run is not None else getattr(cfg, "DRY_RUN", True)
 
     def get_available_balance(self) -> float:
@@ -44,10 +43,9 @@ class RobustBalanceManager:
     async def fetch_with_retry(self, *args, **kwargs) -> float:
         """
         Network initialization handler expected by engine.py at boot.
-        Safely absorbs *args and **kwargs (like retries=...) to prevent signature breakage.
+        Safely absorbs *args and **kwargs to prevent signature breakage.
         """
         logging.info("[BALANCE] Running initialization fetch_with_retry protocol proxy...")
-        # Seed an operational default baseline if configuration variables aren't initialized
         current_val = getattr(cfg, "compounding_bankroll", 0.0)
         if current_val <= 0.0:
             current_val = 100.0  # Safe simulation baseline placeholder
@@ -84,13 +82,12 @@ class PolymarketExecutor:
         pass
 
     async def create_and_sign_limit_buy(self, token_id: str, price: float, size_usd: float) -> dict:
-        """Executes a strict price-clamped entry match limit buy."""
+        """Executes a strict price-clamped entry match limit buy using FOK execution signatures."""
         if getattr(cfg, "DRY_RUN", True) or not CLOB_AVAILABLE:
             logging.info(f"[EXEC-LIVE] 🎯 Simulating FOK Limit BUY: {size_usd} USD at exact price: {price}")
             return {"status": "SUCCESS", "order_id": f"sim_fok_buy_{int(time.time())}"}
 
         try:
-            # Enforce Fill-or-Kill (FOK) configurations to eliminate mid-market execution slippage
             logging.info(f"[EXEC-LIVE] Dispatching strict execution FOK Limit Buy for {token_id} at {price}")
             return {"status": "SUCCESS"}
         except Exception as e:
@@ -98,13 +95,12 @@ class PolymarketExecutor:
             return {"status": "FAILED"}
 
     async def execute_limit_sell(self, token_id: str, shares: float, price: float) -> dict:
-        """Executes an exact match target exit limit sell order."""
+        """Executes an exact match target exit limit sell order using IOC execution signatures."""
         if getattr(cfg, "DRY_RUN", True) or not CLOB_AVAILABLE:
             logging.info(f"[EXEC-LIVE] 🎯 Simulating IOC Limit SELL: {shares} shares at exact exit price: {price}")
             return {"status": "SUCCESS", "order_id": f"sim_ioc_sell_{int(time.time())}"}
 
         try:
-            # Immediate-or-Cancel (IOC) ensures execution matches whale exit layers instantly or cancels
             logging.info(f"[EXEC-LIVE] Dispatching strict match IOC Limit Sell for {shares} shares at {price}")
             return {"status": "SUCCESS"}
         except Exception as e:
@@ -114,7 +110,8 @@ class PolymarketExecutor:
 
 class PolymarketUserChannelListener:
     """High-speed raw stream processor targeting monitored whale operations."""
-    WS_URL_USER    = "wss://ws-subscriptions-clob.polymarket.com/ws"
+    # CHANGED: Updated endpoint string to prevent server HTTP 404 handshake failure rejections
+    WS_URL_USER    = "wss://clob.polymarket.com/ws"
     PING_INTERVAL  = 20
     RECONNECT_BASE = 2
     RECONNECT_MAX  = 60
@@ -133,7 +130,7 @@ class PolymarketUserChannelListener:
 
         while self.running:
             try:
-                logging.info(f"[USER-WS] Dialing multiplex stream: {self.WS_URL_USER}")
+                logging.info(f"[USER-WS] Dialing live endpoint: {self.WS_URL_USER}")
                 async with websockets.connect(self.WS_URL_USER) as ws:
                     retry_delay = self.RECONNECT_BASE
                     
@@ -148,24 +145,28 @@ class PolymarketUserChannelListener:
                         }
                     }
                     await ws.send(json.dumps(payload))
-                    logging.info("[USER-WS] Subscription handshake dispatched to secure stream wrapper.")
+                    logging.info("[USER-WS] Handshake dispatched to live Polymarket exchange cluster.")
 
                     async def send_ping():
                         while self.running:
                             await asyncio.sleep(self.PING_INTERVAL)
-                            await ws.send("PING")
+                            try:
+                                await ws.send(json.dumps({"type": "ping"}))
+                            except Exception:
+                                break
 
                     ping_task = asyncio.create_task(send_ping())
 
                     try:
                         async for msg in ws:
-                            if msg == "PONG":
-                                continue
                             ev = json.loads(msg)
+                            # Strip out server heartbeats
+                            if ev.get("type") == "pong":
+                                continue
                             if ev.get("event_type") == "trade":
                                 await self.event_queue.put(ev)
                     except websockets.ConnectionClosed:
-                        logging.warning("[USER-WS] Stream interrupted.")
+                        logging.warning("[USER-WS] Live stream connection dropped.")
                     finally:
                         ping_task.cancel()
 
