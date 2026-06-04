@@ -12,6 +12,7 @@ try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import (
         OrderArgs, MarketOrderArgs, ApiCreds, PartialCreateOrderOptions,
+        BalanceAllowanceParams, AssetType,
     )
     from py_clob_client.constants import OrderType, Side
     CLOB_AVAILABLE = True
@@ -54,8 +55,34 @@ class RobustBalanceManager:
                     creds=creds
                 )
                 logging.info("💳 Live Network balance lookup layer initialized successfully.")
+                # Seed the cache synchronously at init time so get_available_balance()
+                # returns a real value immediately without needing an await.
+                self._seed_balance_sync()
             except Exception as e:
                 logging.error(f"Failed to initialize network balance client bindings: {e}")
+
+    def _seed_balance_sync(self):
+        """
+        Fetches the live USDC collateral balance once at startup using a blocking call.
+        Uses get_balance_allowance() — the correct py_clob_client method.
+        Called from __init__, which may run inside asyncio.run() → defers to the
+        async path via fetch_with_retry on the first reconciliation pass if it fails.
+        """
+        if not self.client:
+            return
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            data = self.client.get_balance_allowance(params=params)
+            # Response shape: {"balance": "123.45", "allowance": "123.45"}
+            if data and "balance" in data:
+                self._cached_balance = float(data["balance"])
+                cfg.compounding_bankroll = self.get_available_balance()
+                if self._cached_balance > cfg.peak_bankroll:
+                    cfg.peak_bankroll = self._cached_balance
+                self._last_updated = time.time()
+                logging.info(f"💰 Seeded balance at startup: ${self._cached_balance:.2f}")
+        except Exception as e:
+            logging.warning(f"[BALANCE-SEED] Startup balance fetch failed (will retry async): {e}")
 
     def get_available_balance(self) -> float:
         """
@@ -92,11 +119,11 @@ class RobustBalanceManager:
                 # Run the synchronous network call inside a thread pool to protect loop performance
                 balance_data = await loop.run_in_executor(
                     None, 
-                    lambda: self.client.get_collateral_balance(account=cfg.YOUR_WALLET)
+                    lambda: self.client.get_balance_allowance(params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
                 )
                 
                 if balance_data and "balance" in balance_data:
-                    live_bal = float(balance_data["balance"])
+                    live_bal = float(balance_data.get("balance", 0) or 0)
                     logging.info(f"💰 True Checked Exchange Balance: ${live_bal:.2f}")
                     
                     self._cached_balance = live_bal
