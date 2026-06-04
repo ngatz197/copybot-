@@ -49,7 +49,10 @@ def _calc_size(config: dict, price: float, source_value: float = 0.0) -> float:
 
     tiered = _price_based_size(price)
 
-    if tiered < 1.0 and config.get("copy_sub_dollar", False) and 0 < source_value < 1.0:
+    # If the source wallet spent under $1 and this wallet has copy_sub_dollar
+    # enabled, mirror their exact spend regardless of bankroll size.
+    # Only fall through to tiered sizing when source trade is $1 or above.
+    if config.get("copy_sub_dollar", False) and 0 < source_value < 1.0:
         return source_value
 
     return tiered
