@@ -4,6 +4,7 @@ import logging
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 
 # ==================== OPTIONAL DEPENDENCIES ====================
 try:
@@ -78,6 +79,12 @@ class SeenTradesStore:
                     CREATE TABLE IF NOT EXISTS seen_trades (
                         pos_key    TEXT PRIMARY KEY,
                         created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        key   TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
                     )
                 """)
             self._seen   = self._load_postgres()
@@ -196,3 +203,29 @@ class SeenTradesStore:
     @property
     def is_empty(self) -> bool:
         return len(self._seen) == 0
+
+
+# ==================== BANKROLL PERSISTENCE ====================
+def save_bankroll(conn, value: float):
+    """Persist compounding_bankroll to Postgres so it survives restarts."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO bot_state (key, value) VALUES ('compounding_bankroll', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (str(value),))
+        conn.commit()
+    except Exception as e:
+        logging.warning(f"Failed to save bankroll: {e}")
+
+
+def load_bankroll(conn) -> Optional[float]:
+    """Load persisted compounding_bankroll from Postgres. Returns None if not found."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_state WHERE key = 'compounding_bankroll'")
+            row = cur.fetchone()
+            return float(row[0]) if row else None
+    except Exception as e:
+        logging.warning(f"Failed to load bankroll: {e}")
+        return None

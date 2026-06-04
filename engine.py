@@ -10,7 +10,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import html
 import config as cfg
 
-from models import Position, PendingLimitBuy, SeenTradesStore
+from models import Position, PendingLimitBuy, SeenTradesStore, save_bankroll, load_bankroll
 from exchange import RobustBalanceManager, PolymarketExecutor, PolymarketWSListener, PolymarketUserChannelListener
 
 # ==================== ENVIRONMENT / CONSTANTS ====================
@@ -81,6 +81,18 @@ class CopyTrader:
         self.executor         = PolymarketExecutor(dry_run)
         self.seen             = SeenTradesStore(SEEN_TRADES_FILE, DATABASE_URL)
 
+        # Restore compounding_bankroll from Postgres if available so restarts
+        # don't reset sizing history.  Fall back to real wallet balance on first run.
+        saved_bankroll = load_bankroll(self.seen._conn) if self.seen._conn else None
+        if saved_bankroll is not None:
+            cfg.compounding_bankroll = saved_bankroll
+            cfg.peak_bankroll        = max(saved_bankroll, initial_balance)
+            logging.info(f"Compounding bankroll restored from DB: ${saved_bankroll:.2f}")
+        else:
+            cfg.compounding_bankroll = initial_balance
+            cfg.peak_bankroll        = initial_balance
+            logging.info(f"Compounding bankroll seeded from wallet: ${initial_balance:.2f}")
+
         self._first_scan_done: Set[str] = set()
 
         # Lock that serialises the "check-seen → place-order → mark-seen" critical
@@ -118,6 +130,35 @@ class CopyTrader:
             self._user_listener = None
 
         logging.info(f"CopyTrader V2 started | mode={'DRY RUN' if dry_run else 'LIVE'}")
+
+    def _update_compounding(self, realised_pnl: float):
+        """
+        Update the sizing base after every realised trade.
+
+        Wins:   grow by profit × COMPOUNDING_RATE (conservative reinvestment)
+        Losses: shrink by the full loss (losses are never dampened by the rate)
+
+        Persists to Postgres after every update so the value survives restarts.
+        Also mirrors into RobustBalanceManager for dry-run so sizing stays
+        consistent with virtual balance deductions.
+        """
+        if realised_pnl >= 0:
+            delta = realised_pnl * cfg.COMPOUNDING_RATE
+        else:
+            delta = realised_pnl  # full loss absorbed immediately
+
+        cfg.compounding_bankroll = max(cfg.compounding_bankroll + delta, 0.0)
+
+        if cfg.compounding_bankroll > cfg.peak_bankroll:
+            cfg.peak_bankroll = cfg.compounding_bankroll
+
+        if self.seen._conn:
+            save_bankroll(self.seen._conn, cfg.compounding_bankroll)
+
+        logging.info(
+            f"[COMPOUND] pnl={realised_pnl:+.4f} | rate={cfg.COMPOUNDING_RATE:.0%} | "
+            f"delta={delta:+.4f} | sizing_base=${cfg.compounding_bankroll:.2f}"
+        )
 
     async def _on_ws_event(self, ev: dict):
         """
@@ -451,8 +492,7 @@ class CopyTrader:
             if self.dry_run:
                 self.balance.apply_dry_run_sell(shares_to_sell * exit_price, realised_pnl)
             else:
-                cfg.compounding_bankroll += realised_pnl * cfg.COMPOUNDING_RATE
-                cfg.compounding_bankroll  = max(cfg.compounding_bankroll, 0.0)
+                self._update_compounding(realised_pnl)
 
             self.closed_positions.append(position)
             if len(self.closed_positions) > 500:
@@ -472,8 +512,7 @@ class CopyTrader:
             if self.dry_run:
                 self.balance.apply_dry_run_sell(shares_to_sell * exit_price, realised_pnl)
             else:
-                cfg.compounding_bankroll += realised_pnl * cfg.COMPOUNDING_RATE
-                cfg.compounding_bankroll  = max(cfg.compounding_bankroll, 0.0)
+                self._update_compounding(realised_pnl)
 
             logging.info(
                 f"✂️  {trigger} PARTIAL EXIT {position.source_name} | "

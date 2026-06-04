@@ -130,26 +130,37 @@ class RobustBalanceManager:
     def apply_dry_run_sell(self, return_usd: float, realised_pnl: float):
         if self.dry_run and self.cached_balance is not None:
             self.cached_balance += return_usd
-            # Mirror live compounding: only reinvest a fraction of net profit.
-            cfg.compounding_bankroll += realised_pnl * cfg.COMPOUNDING_RATE
-            cfg.compounding_bankroll  = max(cfg.compounding_bankroll, 0.0)
+            # Mirror live compounding logic exactly:
+            #   Wins:   reinvest only COMPOUNDING_RATE fraction of profit
+            #   Losses: absorb the full loss immediately (no dampening)
+            if realised_pnl >= 0:
+                delta = realised_pnl * cfg.COMPOUNDING_RATE
+            else:
+                delta = realised_pnl
+            cfg.compounding_bankroll = max(cfg.compounding_bankroll + delta, 0.0)
+            if cfg.compounding_bankroll > cfg.peak_bankroll:
+                cfg.peak_bankroll = cfg.compounding_bankroll
             if self.cached_balance > self.peak_balance:
                 self.peak_balance = self.cached_balance
-                cfg.peak_bankroll = self.cached_balance
+                cfg.peak_bankroll = max(cfg.peak_bankroll, self.cached_balance)
             logging.info(
                 f"[DRY RUN] Sell return=${return_usd:.2f} | "
-                f"pnl={realised_pnl:+.4f} | "
-                f"compounding_bankroll=${cfg.compounding_bankroll:.2f} | "
+                f"pnl={realised_pnl:+.4f} | delta={delta:+.4f} | "
+                f"sizing_base=${cfg.compounding_bankroll:.2f} | "
                 f"balance=${self.cached_balance:.2f}"
             )
 
     def apply_dry_run_cancel(self, amount_usd: float):
         if self.dry_run and self.cached_balance is not None:
             self.cached_balance += amount_usd
-            cfg.compounding_bankroll = self.cached_balance
+            # compounding_bankroll intentionally NOT touched here.
+            # A cancelled unfilled order has zero realised PnL — the sizing base
+            # must not change. Previously this hard-set compounding_bankroll to
+            # cached_balance which wiped accumulated compounding history.
             logging.info(
                 f"[DRY RUN] Cancel refund=${amount_usd:.2f} | "
-                f"balance=${self.cached_balance:.2f}"
+                f"balance=${self.cached_balance:.2f} | "
+                f"sizing_base=${cfg.compounding_bankroll:.2f} (unchanged)"
             )
 
 # ==================== EXECUTOR (V2) ====================
