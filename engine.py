@@ -216,7 +216,7 @@ class CopyTrader:
             return
 
         copy_mode = config.get("copy_mode", "new_only")
-        if copy_mode != "new_only":
+        if copy_mode not in ("new_only", "all"):
             logging.warning(f"[WS] {config['name']} copy_mode='{copy_mode}' not supported — skipping.")
             return
 
@@ -776,7 +776,7 @@ class CopyTrader:
 
         for wallet_addr, config in cfg.WALLETS.items():
             copy_mode = config.get("copy_mode", "new_only")
-            if copy_mode != "new_only":
+            if copy_mode not in ("new_only", "all"):
                 logging.warning(f"[REST] {config['name']} copy_mode='{copy_mode}' not supported — skipping.")
                 continue
 
