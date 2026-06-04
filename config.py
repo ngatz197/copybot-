@@ -57,7 +57,7 @@ POLY_SECRET      = os.getenv("POLY_SECRET", "")
 POLY_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 DATABASE_URL     = os.getenv("DATABASE_URL", "")
 
-INITIAL_BANKROLL      = 0.0   
+INITIAL_BANKROLL      = float(os.getenv("INITIAL_BANKROLL", "100.0"))  # Override via env; used as fallback until live balance is fetched
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS", "8"))
 PAUSE_HOURS           = 48
 MAX_RETRIES           = 3
