@@ -341,6 +341,24 @@ class PolymarketExecutor:
 
 # ==================== WEBSOCKET LISTENER (market channel — wallet trade detection) ====================
 class PolymarketWSListener:
+    """
+    Subscribes to the Polymarket /ws/market channel for two purposes:
+
+    1. Token-level trade events — fires when a tracked token is filled,
+       giving maker/taker addresses and direction for copy-trade mirroring.
+
+    2. Wallet-level order_placed events — fires when a tracked wallet posts
+       a NEW resting order on ANY token, including tokens we have never seen
+       before.  This is the fix for new-token signal latency: we learn about
+       a whale's new position at order-placement time (before the fill) and
+       immediately self-subscribe the token so the subsequent fill event is
+       caught in real time rather than discovered up to POLL_INTERVAL seconds
+       later via REST.
+
+    Both subscription types use the same /ws/market channel and the same
+    "asset_ids" field — Polymarket accepts wallet addresses there too.
+    """
+
     WS_URL_MARKET  = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     PING_INTERVAL  = 20
     RECONNECT_BASE =  2
@@ -348,16 +366,20 @@ class PolymarketWSListener:
 
     def __init__(
         self,
-        token_ids:         Set[str],
-        ws_price_queue:    asyncio.Queue,
-        on_trade_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
+        token_ids:              Set[str],
+        wallet_addrs:           Set[str],
+        ws_price_queue:         asyncio.Queue,
+        on_trade_callback:      Optional[Callable[[dict], Awaitable[None]]] = None,
+        on_order_placed_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
     ):
-        self.token_ids          = token_ids
-        self.ws_price_queue     = ws_price_queue
-        self.on_trade_callback  = on_trade_callback
-        self._running           = False
-        self._ws_market:  Optional[object] = None
-        self._subscribed: Set[str] = set()
+        self.token_ids               = token_ids
+        self.wallet_addrs            = wallet_addrs   # tracked source wallets
+        self.ws_price_queue          = ws_price_queue
+        self.on_trade_callback       = on_trade_callback
+        self.on_order_placed_callback = on_order_placed_callback
+        self._running                = False
+        self._ws_market: Optional[object] = None
+        self._subscribed: Set[str]   = set()
 
     async def subscribe_token(self, token_id: str):
         if token_id in self._subscribed:
@@ -404,11 +426,20 @@ class PolymarketWSListener:
             self._subscribed.clear()
             logging.info("[WS] Connected ✅")
 
+            # Subscribe existing known tokens for fill detection.
             if self.token_ids:
                 await self._send_subscribe(ws, self.token_ids)
                 self._subscribed.update(self.token_ids)
             else:
-                logging.info("[WS] No token_ids yet — awaiting first trade signal.")
+                logging.info("[WS] No token_ids yet — awaiting first REST poll.")
+
+            # Subscribe wallet addresses for order_placed detection on new tokens.
+            # This fires before the fill so we can self-subscribe the token in time
+            # to catch the fill event — eliminating new-token signal latency.
+            if self.wallet_addrs:
+                await self._send_subscribe(ws, self.wallet_addrs)
+                self._subscribed.update(self.wallet_addrs)
+                logging.info(f"[WS] Subscribed {len(self.wallet_addrs)} wallet address(es) for order_placed detection")
 
             async for raw in ws:
                 if not self._running:
@@ -419,14 +450,14 @@ class PolymarketWSListener:
                     logging.debug(f"[WS] Message parse error: {e}")
         self._ws_market = None
 
-    async def _send_subscribe(self, ws, token_ids: Set[str]):
+    async def _send_subscribe(self, ws, ids: Set[str]):
         payload = {
             "type":      "subscribe",
             "channel":   "market",
-            "asset_ids": list(token_ids),
+            "asset_ids": list(ids),
         }
         await ws.send(json.dumps(payload))
-        logging.info(f"[WS] Subscribed {len(token_ids)} token(s)")
+        logging.info(f"[WS] Subscribed {len(ids)} id(s)")
 
     async def _handle_message(self, raw: str):
         try:
@@ -440,6 +471,49 @@ class PolymarketWSListener:
         for ev in events:
             ev_type = ev.get("event_type") or ev.get("type") or ""
 
+            # ── Order placement on a new token (new-token latency fix) ──────────
+            # Fires when a tracked wallet posts a resting order on any token —
+            # including tokens we have never seen before.  We self-subscribe the
+            # token immediately so the subsequent fill event is caught in real
+            # time.  We also forward a pre-signal to the engine so it can
+            # prepare (fetch orderbook, check limits) before the fill arrives.
+            if ev_type in ("order_placed", "order_posted", "new_order"):
+                maker_addr = (
+                    ev.get("maker_address") or ev.get("maker") or ev.get("owner") or ""
+                ).lower()
+                token_id = ev.get("asset_id") or ev.get("market") or ""
+                price    = float(ev.get("price", 0))
+                side     = (ev.get("side") or "").upper()
+                outcome  = (ev.get("outcome") or "").upper()
+
+                if not token_id or not maker_addr:
+                    continue
+
+                # Only act if this wallet is one we track.
+                if maker_addr not in {w.lower() for w in self.wallet_addrs}:
+                    continue
+
+                # Self-subscribe the token immediately so we catch the fill.
+                if token_id not in self._subscribed:
+                    await self.subscribe_token(token_id)
+                    logging.info(
+                        f"[WS NEW TOKEN] {maker_addr[:10]}… placed order on "
+                        f"unseen token {token_id[:12]}… — subscribed ahead of fill"
+                    )
+
+                # Forward pre-signal to engine so it can prepare.
+                if self.on_order_placed_callback and side == "BUY":
+                    await self.on_order_placed_callback({
+                        "kind":        "order_placed",
+                        "token_id":    token_id,
+                        "price":       price,
+                        "side":        side,
+                        "outcome":     outcome,
+                        "maker_addr":  maker_addr,
+                    })
+                continue
+
+            # ── Price updates ────────────────────────────────────────────────────
             if ev_type in ("price_change", "book", "last_trade_price"):
                 token_id = ev.get("asset_id") or ev.get("market") or ""
                 price    = (
@@ -463,6 +537,7 @@ class PolymarketWSListener:
                         except Exception:
                             pass
 
+            # ── Fill events ──────────────────────────────────────────────────────
             elif ev_type in ("trade", "order_filled"):
                 token_id   = ev.get("asset_id") or ev.get("market") or ""
                 price      = float(ev.get("price", 0))
@@ -470,9 +545,6 @@ class PolymarketWSListener:
                 outcome    = (ev.get("outcome") or "").upper()
                 maker_addr = (ev.get("maker_address") or ev.get("maker") or "").lower()
                 taker_addr = (ev.get("taker_address") or ev.get("taker") or "").lower()
-                # maker_side / taker_side: "BUY" or "SELL" for each leg of the fill.
-                # These let the engine resolve the source wallet's actual trade
-                # direction without relying on the ambiguous top-level `side` field.
                 maker_side = (ev.get("maker_side") or "").upper()
                 taker_side = (ev.get("taker_side") or "").upper()
 
