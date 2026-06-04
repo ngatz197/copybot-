@@ -544,6 +544,15 @@ class PolymarketUserChannelListener:
             try:
                 await self._connect_and_listen()
                 delay = self.RECONNECT_BASE
+            except (
+                websockets.exceptions.ConnectionClosedError,
+                websockets.exceptions.ConnectionClosedOK,
+            ) as e:
+                # Server dropped the connection without a close frame (common with
+                # Polymarket's load balancer). Not a real error — reconnect fast.
+                logging.info(f"[USER-WS] Server closed connection ({e}) — reconnecting immediately.")
+                delay = self.RECONNECT_BASE
+                await asyncio.sleep(1)
             except Exception as e:
                 logging.warning(f"[USER-WS] Disconnected: {e} — reconnecting in {delay}s")
                 await asyncio.sleep(delay)
@@ -558,9 +567,11 @@ class PolymarketUserChannelListener:
         logging.info(f"[USER-WS] Connecting to {self.WS_URL_USER} …")
         async with websockets.connect(
             self.WS_URL_USER,
-            ping_interval = self.PING_INTERVAL,
-            ping_timeout  = 30,
-            close_timeout = 10,
+            ping_interval  = self.PING_INTERVAL,
+            ping_timeout   = 30,
+            close_timeout  = 5,    # don't wait long for a close frame the server won't send
+            max_size       = 2**23,  # 8 MB — guard against oversized frames
+            open_timeout   = 15,
         ) as ws:
             self._ws = ws
             logging.info("[USER-WS] Connected ✅")
