@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # ==================== OPERATIONAL FLAGS ====================
 DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
 # Background polling slowed down; main path is now pure event-driven WebSockets
-POLL_INTERVAL    = int(os.getenv("POLL_SECONDS", "300")) 
+POLL_INTERVAL    = int(os.getenv("POLL_SECONDS", "15")) 
 COMPOUNDING_RATE = float(os.getenv("COMPOUNDING_RATE", "0.10"))
 MAX_DRAWDOWN     = float(os.getenv("MAX_DRAWDOWN", "0.20"))
 HEALTH_PORT      = int(os.getenv("PORT", "8080"))
