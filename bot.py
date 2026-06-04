@@ -52,9 +52,16 @@ async def main():
     # live price updates) is permanently dead (fix B).
     if bot._ws_listener is not None:
         asyncio.create_task(bot._ws_listener.run())
-        logging.info("⚡ WebSocket listener task started")
+        logging.info("⚡ WebSocket market channel listener task started")
     else:
         logging.warning("WebSocket listener not available — running on REST polling only")
+
+    # User channel: delivers unambiguous order-level signals per tracked wallet.
+    # Started alongside the market channel; the engine handles both via the same
+    # _on_ws_event callback, distinguishing them by ev["kind"] == "user_trade".
+    if bot._user_listener is not None:
+        asyncio.create_task(bot._user_listener.run())
+        logging.info("⚡ WebSocket user channel listener task started")
 
     # 5. Fall into continuous automated execution polling loop
     while True:

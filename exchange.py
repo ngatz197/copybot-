@@ -463,7 +463,7 @@ class PolymarketWSListener:
                 token_id   = ev.get("asset_id") or ev.get("market") or ""
                 price      = float(ev.get("price", 0))
                 size       = float(ev.get("size", 0))
-                outcome    = (ev.get("outcome") or "").upper()
+                outcome    = (ev.get("outcome") or "YES").upper()
                 maker_addr = (ev.get("maker_address") or ev.get("maker") or "").lower()
                 taker_addr = (ev.get("taker_address") or ev.get("taker") or "").lower()
                 # maker_side / taker_side: "BUY" or "SELL" for each leg of the fill.

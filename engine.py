@@ -19,8 +19,8 @@ MAX_DRAWDOWN          = float(os.getenv("MAX_DRAWDOWN", "0.20"))
 HEALTH_PORT           = int(os.getenv("PORT", "8080"))
 MAX_RETRIES           = 3
 RETRY_DELAY           = 5
-LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.08"))
-LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "90"))
+LIMIT_BUY_MAX_PREMIUM = float(os.getenv("LIMIT_BUY_MAX_PREMIUM", "0.20"))
+LIMIT_EXPIRY_SECONDS  = int(os.getenv("LIMIT_EXPIRY_SECONDS", "300"))
 SEEN_TRADES_FILE      = os.getenv("SEEN_TRADES_FILE", "seen_trades.json")
 DATABASE_URL          = os.getenv("DATABASE_URL", "")
 PARTIAL_SELL_THRESHOLD  = float(os.getenv("PARTIAL_SELL_THRESHOLD", "0.20"))
@@ -302,7 +302,7 @@ class CopyTrader:
 
         # Fetch orderbook BEFORE acquiring the lock — slow HTTP call.
         loop = asyncio.get_running_loop()
-        best_ask, _ = await loop.run_in_executor(
+        best_ask, mid_price = await loop.run_in_executor(
             None, self.get_orderbook_prices, token_id
         )
 
@@ -315,28 +315,28 @@ class CopyTrader:
                 return
 
             signal_price = float(ev.get("price", 0.0))
-            premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-            if signal_price <= 0:
-                # Source price required for both steps — nothing to anchor on; skip.
-                logging.warning(
-                    f"[WS BUY] No signal price for {token_id[:12]}… "
-                    f"— skipping {config['name']}."
-                )
-                return
-            if best_ask > 0:
-                # Step 1 — orderbook available: post at best_ask, capped so we never
-                # overpay above what the source wallet paid + premium.
-                actual_price = min(best_ask, signal_price * (1.0 + premium))
+            if signal_price > 0:
+                # Use the actual price the source paid as reference
+                if best_ask > 0:
+                    premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                    actual_price = min(best_ask, signal_price * (1.0 + premium))
+                else:
+                    # Orderbook failed — use source price with small premium
+                    premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                    actual_price = signal_price * (1.0 + premium)
             else:
-                # Step 2 — orderbook unavailable: use source price + premium as proxy.
-                actual_price = signal_price * (1.0 + premium)
+                if best_ask <= 0:
+                    actual_price = mid_price
+                else:
+                    premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                    actual_price = min(best_ask, mid_price * (1.0 + premium))
 
             if actual_price <= 0 or actual_price >= 1.0:
                 logging.error(f"[WS BUY] Invalid price {actual_price} for {token_id[:12]} — aborting.")
                 return
 
-            # Guard: skip if market has moved more than 50% above the source fill.
-            if actual_price > signal_price * 1.50:
+            # Guard: if we used source price but market is now way higher, skip
+            if signal_price > 0 and actual_price > signal_price * 1.50:
                 logging.warning(
                     f"[WS BUY] Market moved too far from source price "
                     f"(source={signal_price:.4f}, market={actual_price:.4f}) — skipping {config['name']}."
@@ -469,12 +469,10 @@ class CopyTrader:
         loop = asyncio.get_running_loop()
 
         # Fetch a fresh orderbook price for PnL accounting (non-blocking).
-        # Use best_ask when available; fall back to reference_price (last known
-        # position price) rather than a potentially fabricated mid.
-        exit_ask, _ = await loop.run_in_executor(
+        exit_ask, exit_mid = await loop.run_in_executor(
             None, self.get_orderbook_prices, position.token_id
         )
-        exit_price = exit_ask if exit_ask > 0 else reference_price
+        exit_price = exit_mid if exit_mid > 0 else reference_price
 
         ok, _ = await loop.run_in_executor(
             None,
@@ -627,60 +625,20 @@ class CopyTrader:
     def clean_expired_limit_orders(self):
         now = datetime.now()
         for k, p in list(self.pending.items()):
-            if (now - p.placed_at).total_seconds() < LIMIT_EXPIRY_SECONDS:
-                continue
-
-            logging.info(
-                f"[EXPIRY] Limit order expired for {p.source_name} "
-                f"[signal_source={p.signal_source}] — cancelling and repricing…"
-            )
-
-            if not self.executor.cancel_order(p.order_id):
-                logging.warning(
-                    f"[EXPIRY] Cancel failed for {p.source_name} order {p.order_id} — "
-                    f"retaining in pending to retry next cycle."
+            if (now - p.placed_at).total_seconds() >= LIMIT_EXPIRY_SECONDS:
+                logging.info(
+                    f"[EXPIRY] Limit order expired for {p.source_name} "
+                    f"[signal_source={p.signal_source}] — cancelling…"
                 )
-                continue
-
-            if self.dry_run:
-                self.balance.apply_dry_run_cancel(p.size_usd)
-
-            # Fetch a fresh orderbook price and repost at the live best_ask.
-            # If the orderbook call fails we drop the order rather than posting
-            # at a potentially stale price.
-            try:
-                best_ask, _ = self.get_orderbook_prices(p.token_id)
-                if best_ask <= 0 or best_ask >= 1.0:
-                    logging.warning(
-                        f"[EXPIRY] No valid best_ask for {p.source_name} "
-                        f"— dropping order."
-                    )
-                    del self.pending[k]
-                    continue
-                new_price = best_ask
-
-                ok, new_order_id, _ = self.executor.place_limit_buy(
-                    p.token_id, p.size_usd, new_price
-                )
-                if ok:
+                if self.executor.cancel_order(p.order_id):
                     if self.dry_run:
-                        self.balance.apply_dry_run_buy(p.size_usd)
-                    p.order_id   = new_order_id
-                    p.limit_price = new_price
-                    p.placed_at  = datetime.now()
-                    logging.info(
-                        f"[EXPIRY] Repriced {p.source_name} order → {new_price:.4f} "
-                        f"(was {p.limit_price:.4f})"
-                    )
+                        self.balance.apply_dry_run_cancel(p.size_usd)
+                    del self.pending[k]
                 else:
                     logging.warning(
-                        f"[EXPIRY] Reprice order placement failed for {p.source_name} "
-                        f"— dropping order."
+                        f"[EXPIRY] Cancel failed for {p.source_name} order {p.order_id} — "
+                        f"retaining in pending to retry next cycle."
                     )
-                    del self.pending[k]
-            except Exception as e:
-                logging.warning(f"[EXPIRY] Reprice failed for {p.source_name}: {e} — dropping order.")
-                del self.pending[k]
 
     def process_pending_fills(self):
         for k, p in list(self.pending.items()):
@@ -793,21 +751,6 @@ class CopyTrader:
                         f"{wallet_addr.lower()}_{asset}_{raw_side}"
                     )
                 self.seen.snapshot_existing(pre_existing)
-
-                # Pre-subscribe all active tokens for this wallet to the market
-                # channel immediately so any new trade on an existing position is
-                # caught by WS rather than waiting for the next REST poll.
-                if self._ws_listener:
-                    for pos in raw:
-                        asset = pos.get("asset")
-                        size  = float(pos.get("size", pos.get("shares", 0)))
-                        if asset and size > 0 and asset not in self._ws_tracked:
-                            asyncio.create_task(self._ws_listener.subscribe_token(asset))
-                    logging.info(
-                        f"[WS] Pre-subscribed {len(source_token_ids)} active token(s) "
-                        f"for {config['name']} on first scan."
-                    )
-
                 self._first_scan_done.add(wallet_addr)
 
             for pos in raw:
@@ -823,33 +766,30 @@ class CopyTrader:
 
                 # Both calls below are blocking HTTP — do them BEFORE acquiring
                 # the lock so we never hold _pending_lock across I/O (fix #8).
-                best_ask, _ = await loop.run_in_executor(
+                best_ask, mid_price = await loop.run_in_executor(
                     None, self.get_orderbook_prices, token_id
                 )
 
                 source_price = float(pos.get("avgPrice", pos.get("price", 0.0)))
-                premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
-                if source_price <= 0:
-                    # Source price required for both steps — nothing to anchor on; skip.
-                    logging.warning(
-                        f"[REST] No source price for {token_id[:12]}… "
-                        f"— skipping {config['name']}."
-                    )
-                    continue
-                if best_ask > 0:
-                    # Step 1 — orderbook available: post at best_ask, capped so we never
-                    # overpay above what the source wallet paid + premium.
-                    actual_price = min(best_ask, source_price * (1.0 + premium))
+                if source_price > 0:
+                    if best_ask > 0:
+                        premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                        actual_price = min(best_ask, source_price * (1.0 + premium))
+                    else:
+                        premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                        actual_price = source_price * (1.0 + premium)
                 else:
-                    # Step 2 — orderbook unavailable: use source price + premium as proxy.
-                    actual_price = source_price * (1.0 + premium)
+                    if best_ask <= 0:
+                        actual_price = mid_price
+                    else:
+                        premium      = config.get("limit_buy_max_premium", LIMIT_BUY_MAX_PREMIUM)
+                        actual_price = min(best_ask, mid_price * (1.0 + premium))
 
                 if actual_price <= 0 or actual_price >= 1.0:
                     logging.error(f"[REST] Invalid price {actual_price} — skipping.")
                     continue
 
-                # Guard: skip if market has moved more than 50% above the source fill.
-                if actual_price > source_price * 1.50:
+                if source_price > 0 and actual_price > source_price * 1.50:
                     logging.warning(
                         f"[REST] Market moved too far from source price "
                         f"(source={source_price:.4f}, market={actual_price:.4f}) — skipping."
@@ -873,37 +813,16 @@ class CopyTrader:
                 # section.  All blocking I/O has already completed above (fix #8).
                 async with self._pending_lock:
                     if self.seen.is_seen(pos_key) or pos_key in self.pending:
-                        # WS already handled this signal — REST is correctly suppressed.
-                        logging.debug(
-                            f"[REST] {config['name']} | {side} | {token_id[:12]}… "
-                            f"already seen or pending — WS path handled it ✓"
-                        )
                         continue
 
                     if len(self.positions) + len(self.pending) >= MAX_POSITIONS:
                         logging.warning(f"[REST] Position limit reached — skipping REST fallback.")
                         continue
-
-                    # WS did not catch this signal — REST is acting as fallback.
-                    # If the user channel is connected this may indicate a WS gap
-                    # (missing outcome/side fields, dropped event, or late subscription).
-                    ws_active = (
-                        self._user_listener is not None
-                        and getattr(self._user_listener, "_running", False)
+                    logging.info(
+                        f"🔁 [REST FALLBACK] {config['name']} | {side} | "
+                        f"'{question_str[:40]}' @ {actual_price:.4f} "
+                        f"[signal_source=rest]"
                     )
-                    if ws_active:
-                        logging.warning(
-                            f"[REST FALLBACK] {config['name']} | {side} | "
-                            f"'{question_str[:40]}' @ {actual_price:.4f} — "
-                            f"WS user channel active but missed this signal. "
-                            f"token={token_id[:12]}… [check WS event fields]"
-                        )
-                    else:
-                        logging.info(
-                            f"🔁 [REST FALLBACK] {config['name']} | {side} | "
-                            f"'{question_str[:40]}' @ {actual_price:.4f} "
-                            f"[signal_source=rest | WS inactive]"
-                        )
 
                     ok, order_id, _ = self.executor.place_limit_buy(token_id, my_size, actual_price)
                     if ok:
