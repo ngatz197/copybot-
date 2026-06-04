@@ -26,12 +26,14 @@ except ImportError:
 class RobustBalanceManager:
     """
     Handles tracking and thread-safe retrieval of available capital allocations.
-    Required by engine.py to compute proportional sizing models.
+    Accepts arbitrary construction arguments (*args, **kwargs) to prevent engine.py init breakage.
     """
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         self._cached_balance = 0.0
         self._last_updated = 0.0
         self._lock = asyncio.Lock()
+        # Accept dry_run property if engine logic queries it directly
+        self.dry_run = kwargs.get("dry_run", getattr(cfg, "DRY_RUN", True))
 
     def get_available_balance(self) -> float:
         """Synchronous fallback getter used inside execution loops."""
@@ -59,8 +61,11 @@ class RobustBalanceManager:
 
 
 class PolymarketExecutor:
-    """High-speed specialized transaction processing routing module."""
-    def __init__(self):
+    """
+    High-speed specialized transaction processing routing module.
+    Accepts arbitrary initialization arguments to seamlessly match engine setup patterns.
+    """
+    def __init__(self, *args, **kwargs):
         pass
 
     async def create_and_sign_limit_buy(self, token_id: str, price: float, size_usd: float) -> dict:
@@ -99,7 +104,7 @@ class PolymarketUserChannelListener:
     RECONNECT_BASE = 2
     RECONNECT_MAX  = 60
 
-    def __init__(self, wallet_addrs: list, queue: asyncio.Queue):
+    def __init__(self, wallet_addrs: list, queue: asyncio.Queue, *args, **kwargs):
         self.wallet_addrs = [w.lower() for w in wallet_addrs]
         self.event_queue = queue
         self.running = False
@@ -160,15 +165,15 @@ class PolymarketUserChannelListener:
 class PolymarketWSListener:
     """
     Lightweight fallback interface wrapper required by engine.py imports.
-    Public book tracking logic is entirely offloaded to high-speed User Channels.
+    Accepts arbitrary setup variables to align with background engine components safely.
     """
-    def __init__(self, asset_ids: list, callback: Callable[[dict], Awaitable[None]]):
-        self.asset_ids = asset_ids
-        self.callback = callback
+    def __init__(self, *args, **kwargs):
+        self.asset_ids = args[0] if len(args) > 0 else kwargs.get("asset_ids", [])
+        self.callback = args[1] if len(args) > 1 else kwargs.get("callback", None)
         self.running = False
 
     async def run(self):
         logging.info("[MARKET-WS] Interface initialized in passive execution routing fallback mode.")
         self.running = True
         while self.running:
-            await asyncio.sleep(3600) # Sleep harmlessly to preserve process concurrency resources
+            await asyncio.sleep(3600)
