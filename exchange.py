@@ -41,10 +41,10 @@ class RobustBalanceManager:
             return self._cached_balance
         return getattr(cfg, "compounding_bankroll", 0.0)
 
-    async def fetch_with_retry(self) -> float:
+    async def fetch_with_retry(self, *args, **kwargs) -> float:
         """
-        Mock network initialization handler expected by engine.py at boot.
-        Safely seeds structural tracking layers without throwing attribute errors.
+        Network initialization handler expected by engine.py at boot.
+        Safely absorbs *args and **kwargs (like retries=...) to prevent signature breakage.
         """
         logging.info("[BALANCE] Running initialization fetch_with_retry protocol proxy...")
         # Seed an operational default baseline if configuration variables aren't initialized
