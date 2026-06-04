@@ -63,10 +63,23 @@ class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run          = dry_run
         self.balance          = RobustBalanceManager(dry_run=self.dry_run)
-
+        
         try:
             logging.info("Initializing bankroll allocation from live wallet balance...")
             initial_balance = self.balance.fetch_with_retry(retries=5, delay=5)
+
+            # Guard: if fetch_with_retry is ever accidentally made async, calling
+            # it without await returns a coroutine object instead of a float,
+            # producing the cryptic "unsupported format string passed to coroutine"
+            # crash.  Detect and recover here rather than dying at the f-string.
+            if asyncio.iscoroutine(initial_balance):
+                logging.warning(
+                    "fetch_with_retry returned a coroutine — it must be a plain sync "
+                    "method. Awaiting as one-time fallback; fix the method signature."
+                )
+                initial_balance = asyncio.get_event_loop().run_until_complete(initial_balance)
+
+            initial_balance = float(initial_balance)  # hard cast — fails loudly if non-numeric
             cfg.compounding_bankroll      = initial_balance
             cfg.peak_bankroll             = initial_balance
             # Seed dry-run virtual balance from the real on-chain balance so
@@ -74,6 +87,8 @@ class CopyTrader:
             self.balance.cached_balance   = initial_balance
             self.balance.peak_balance     = initial_balance
             logging.info(f"Dry-run virtual balance seeded at ${initial_balance:.2f}")
+        except SystemExit:
+            raise  # don't swallow our own intentional exits
         except Exception as e:
             logging.error(f"Critical initialization failure: {e}")
             raise SystemExit("Exiting bot: Unable to ascertain initial balance configuration.")
@@ -503,7 +518,6 @@ class CopyTrader:
             if len(self.closed_positions) > 500:
                 self.closed_positions = self.closed_positions[-500:]
             self.positions.pop(pos_key, None)
-            self.seen.unmark_seen(pos_key)
             logging.info(
                 f"📉 {trigger} FULL EXIT {position.source_name} | "
                 f"{position.outcome} | exit={exit_price:.4f} | "
@@ -742,9 +756,8 @@ class CopyTrader:
         if current_bal is None:
             return
 
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.clean_expired_limit_orders)
-        await loop.run_in_executor(None, self.process_pending_fills)
+        self.clean_expired_limit_orders()
+        self.process_pending_fills()
 
         await self._drain_ws_price_queue()
 
@@ -758,6 +771,8 @@ class CopyTrader:
         all_wallet_data = await self._fetch_all_wallets()
 
         await self._reconcile_ws_pending(all_wallet_data)  # now async (#10)
+
+        loop = asyncio.get_running_loop()
 
         for wallet_addr, config in cfg.WALLETS.items():
             copy_mode = config.get("copy_mode", "new_only")
@@ -793,6 +808,20 @@ class CopyTrader:
                         f"{wallet_addr.lower()}_{asset}_{raw_side}"
                     )
                 self.seen.snapshot_existing(pre_existing)
+
+                # Pre-subscribe all active tokens for this wallet to the market
+                # channel immediately so any new trade on an existing position is
+                # caught by WS rather than waiting for the next REST poll.
+                if self._ws_listener:
+                    for pos in raw:
+                        asset = pos.get("asset")
+                        size  = float(pos.get("size", pos.get("shares", 0)))
+                        if asset and size > 0 and asset not in self._ws_tracked:
+                            asyncio.create_task(self._ws_listener.subscribe_token(asset))
+                    logging.info(
+                        f"[WS] Pre-subscribed {len(source_token_ids)} active token(s) "
+                        f"for {config['name']} on first scan."
+                    )
 
                 self._first_scan_done.add(wallet_addr)
 
