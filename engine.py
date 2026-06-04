@@ -63,7 +63,7 @@ class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run          = dry_run
         self.balance          = RobustBalanceManager(dry_run=self.dry_run)
-        
+
         try:
             logging.info("Initializing bankroll allocation from live wallet balance...")
             initial_balance = self.balance.fetch_with_retry(retries=5, delay=5)
@@ -793,20 +793,6 @@ class CopyTrader:
                         f"{wallet_addr.lower()}_{asset}_{raw_side}"
                     )
                 self.seen.snapshot_existing(pre_existing)
-
-                # Pre-subscribe all active tokens for this wallet to the market
-                # channel immediately so any new trade on an existing position is
-                # caught by WS rather than waiting for the next REST poll.
-                if self._ws_listener:
-                    for pos in raw:
-                        asset = pos.get("asset")
-                        size  = float(pos.get("size", pos.get("shares", 0)))
-                        if asset and size > 0 and asset not in self._ws_tracked:
-                            asyncio.create_task(self._ws_listener.subscribe_token(asset))
-                    logging.info(
-                        f"[WS] Pre-subscribed {len(source_token_ids)} active token(s) "
-                        f"for {config['name']} on first scan."
-                    )
 
                 self._first_scan_done.add(wallet_addr)
 
