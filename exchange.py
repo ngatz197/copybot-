@@ -26,14 +26,14 @@ except ImportError:
 class RobustBalanceManager:
     """
     Handles tracking and thread-safe retrieval of available capital allocations.
-    Accepts arbitrary construction arguments (*args, **kwargs) to prevent engine.py init breakage.
+    Explicitly accepts dry_run keyword arguments to match engine.py expectations perfectly.
     """
-    def __init__(self, *args, **kwargs):
+    def __init__(self, dry_run=None, *args, **kwargs):
         self._cached_balance = 0.0
         self._last_updated = 0.0
         self._lock = asyncio.Lock()
-        # Accept dry_run property if engine logic queries it directly
-        self.dry_run = kwargs.get("dry_run", getattr(cfg, "DRY_RUN", True))
+        # Fall back to global config definition if not explicitly provided by engine init
+        self.dry_run = dry_run if dry_run is not None else getattr(cfg, "DRY_RUN", True)
 
     def get_available_balance(self) -> float:
         """Synchronous fallback getter used inside execution loops."""
