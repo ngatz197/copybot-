@@ -63,16 +63,14 @@ async def execution_queue_consumer(queue: asyncio.Queue, bot_engine: CopyTrader)
 
             logging.info(f"⚡ [EVENT-MATCH] Intercepted Whale Action from {wallet_cfg['name']}: {side} {token_id} @ {price}")
 
-            # Routing order directly through to specialized execution parameters
             if side == "BUY":
                 # Compute fractional copy allocations instantly
                 usd_allocation = bot_engine.balance_manager.get_available_balance() * cfg.COMPOUNDING_RATE
                 
-                # Unrestricted execution: Processes both fresh entries AND position size additions
                 logging.info(f"🛒 Processing BUY event (Mode: {wallet_cfg['copy_mode']}) for {token_id}")
                 await bot_engine.executor.create_and_sign_limit_buy(
                     token_id=token_id, 
-                    price=price, # Pin to the exact target entry price execution tier
+                    price=price, 
                     size_usd=usd_allocation
                 )
             elif side == "SELL":
@@ -80,7 +78,7 @@ async def execution_queue_consumer(queue: asyncio.Queue, bot_engine: CopyTrader)
                 await bot_engine.executor.execute_limit_sell(
                     token_id=token_id, 
                     shares=size, 
-                    price=price # Pin to exact target exit price execution tier
+                    price=price 
                 )
 
         except Exception as worker_err:
@@ -114,7 +112,7 @@ async def main():
     )
     consumer_task.add_done_callback(handle_task_exception)
 
-    # 6. Override default listener configuration to point to high-speed queue pipeline topology
+    # 6. Initialize listener explicitly configured to clear out the old URL 
     high_speed_user_ws = PolymarketUserChannelListener(
         wallet_addrs=list(cfg.WALLETS.keys()), 
         queue=shared_execution_queue
@@ -123,10 +121,9 @@ async def main():
     ws_user_task = asyncio.create_task(high_speed_user_ws.run(), name="HighSpeedUserWS")
     ws_user_task.add_done_callback(handle_task_exception)
 
-    # 7. Slow Background Reconciliation Engine Poller (Acts as passive validation fallback)
+    # 7. Passive Reconciliation Engine Poller 
     while True:
         try:
-            # Scan-and-copy now handles passive accounting corrections only, leaving execution to WebSockets
             await bot.scan_and_copy()
         except (OSError, asyncio.TimeoutError) as transient_err:
             logging.warning(f"Transient polling error in validation handler: {transient_err}")
