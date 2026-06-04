@@ -361,11 +361,23 @@ class PolymarketWSListener:
         self.token_ids.add(token_id)
         if self._ws_market is not None:
             try:
-                await self._send_subscribe(self._ws_market, {token_id})
+                payload = {
+                    "assets_ids": [token_id],
+                    "operation": "subscribe",
+                }
+                await self._ws_market.send(json.dumps(payload))
                 logging.info(f"[WS] Live-subscribed token {token_id[:12]}…")
                 self._subscribed.add(token_id)
             except Exception as e:
                 logging.warning(f"[WS] Live subscribe failed for {token_id[:12]}: {e}")
+
+    async def _ping_loop(self, ws):
+        while self._running and ws.open:
+            try:
+                await ws.send("PING")
+                await asyncio.sleep(10)
+            except Exception:
+                break
 
     async def run(self):
         if not WEBSOCKETS_AVAILABLE:
@@ -406,6 +418,8 @@ class PolymarketWSListener:
             else:
                 logging.info("[WS] No token_ids yet — awaiting first trade signal.")
 
+            asyncio.create_task(self._ping_loop(ws))
+
             async for raw in ws:
                 if not self._running:
                     break
@@ -417,9 +431,9 @@ class PolymarketWSListener:
 
     async def _send_subscribe(self, ws, token_ids: Set[str]):
         payload = {
-            "type":      "subscribe",
-            "channel":   "market",
-            "asset_ids": list(token_ids),
+            "type": "market",
+            "assets_ids": list(token_ids),
+            "custom_feature_enabled": True,
         }
         await ws.send(json.dumps(payload))
         logging.info(f"[WS] Subscribed {len(token_ids)} token(s)")
@@ -463,7 +477,7 @@ class PolymarketWSListener:
                 token_id   = ev.get("asset_id") or ev.get("market") or ""
                 price      = float(ev.get("price", 0))
                 size       = float(ev.get("size", 0))
-                outcome    = (ev.get("outcome") or "YES").upper()
+                outcome    = (ev.get("outcome") or "").upper()
                 maker_addr = (ev.get("maker_address") or ev.get("maker") or "").lower()
                 taker_addr = (ev.get("taker_address") or ev.get("taker") or "").lower()
                 # maker_side / taker_side: "BUY" or "SELL" for each leg of the fill.
@@ -501,7 +515,7 @@ class PolymarketUserChannelListener:
 
     The subscribe message requires no credentials for public read-only tracking:
 
-        { "type": "subscribe", "channel": "user", "markets": ["<wallet_addr>"] }
+        { "type": "subscribe", "channel": "user", "markets": ["<<wallet_addr>"] }
 
     Events are normalised to the same dict schema used by PolymarketWSListener
     so the engine's _on_ws_event callback needs no changes.
@@ -534,6 +548,14 @@ class PolymarketUserChannelListener:
     def stop(self):
         self._running = False
 
+    async def _ping_loop(self, ws):
+        while self._running and ws.open:
+            try:
+                await ws.send("PING")
+                await asyncio.sleep(10)
+            except Exception:
+                break
+
     async def _run_channel(self):
         delay = self.RECONNECT_BASE
         while self._running:
@@ -563,11 +585,17 @@ class PolymarketUserChannelListener:
 
             # Subscribe all tracked wallets in a single message.
             await ws.send(json.dumps({
-                "type":    "subscribe",
-                "channel": "user",
+                "type": "user",
                 "markets": list(self.wallet_addrs),
+                "auth": {
+                    "apiKey": cfg.POLY_API_KEY,
+                    "secret": cfg.POLY_SECRET,
+                    "passphrase": cfg.POLY_PASSPHRASE,
+                }
             }))
             logging.info(f"[USER-WS] Subscribed {len(self.wallet_addrs)} wallet(s)")
+
+            asyncio.create_task(self._ping_loop(ws))
 
             async for raw in ws:
                 if not self._running:
@@ -592,7 +620,7 @@ class PolymarketUserChannelListener:
 
             # We care about fills — placements and cancels carry no fill price
             # and do not represent a completed position change.
-            if ev_type not in ("order_fill", "order_filled", "trade"):
+            if ev_type not in ("trade", "order"):
                 continue
 
             token_id = ev.get("asset_id") or ev.get("market") or ""
