@@ -659,39 +659,24 @@ class PolymarketUserChannelListener:
 
     def _build_auth_message(self) -> Optional[str]:
         """
-        Build the signed authentication payload required by Polymarket's user
-        channel.  Uses the CLOB client to produce the L1 signature.
-        Returns None if signing fails so the caller can skip the connection.
+        Build the authentication payload required by Polymarket's user
+        channel.  The user channel only needs L2 API credentials; no
+        L1 signature is required for the WebSocket subscription.
+        Returns None if credentials are missing.
         """
-        try:
-            creds = ApiCreds(
-                api_key        = POLY_API_KEY,
-                api_secret     = POLY_SECRET,
-                api_passphrase = POLY_PASSPHRASE,
-            )
-            client = ClobClient(
-                host     = "https://clob.polymarket.com",
-                chain_id = 137,
-                key      = YOUR_PRIVATE_KEY,
-                creds    = creds,
-            )
-            ts, nonce, sig = client.create_l1_headers()
-            return json.dumps({
-                "type":      "auth",
-                "channel":   "user",
-                "auth": {
-                    "apiKey":    POLY_API_KEY,
-                    "secret":    POLY_SECRET,
-                    "passphrase": POLY_PASSPHRASE,
-                    "timestamp": ts,
-                    "nonce":     nonce,
-                    "signature": sig,
-                },
-                "markets": [self._own_wallet],
-            })
-        except Exception as e:
-            logging.error(f"[USER-WS] Failed to build auth message: {e}")
+        if not POLY_API_KEY or not POLY_SECRET or not POLY_PASSPHRASE:
+            logging.error("[USER-WS] API credentials not fully configured — cannot build auth message")
             return None
+        return json.dumps({
+            "type":    "auth",
+            "channel": "user",
+            "auth": {
+                "apiKey":     POLY_API_KEY,
+                "secret":     POLY_SECRET,
+                "passphrase": POLY_PASSPHRASE,
+            },
+            "markets": [self._own_wallet],
+        })
 
     async def _connect_and_listen(self):
         loop        = asyncio.get_running_loop()
