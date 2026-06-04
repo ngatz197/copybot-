@@ -178,17 +178,6 @@ class SeenTradesStore:
         if not self._conn:
             self._save_file()
 
-    def unmark_seen(self, pos_key: str):
-        self._seen.discard(pos_key)
-        if self._conn:
-            try:
-                with self._conn.cursor() as cur:
-                    cur.execute("DELETE FROM seen_trades WHERE pos_key = %s", (pos_key,))
-            except Exception as e:
-                logging.warning(f"Postgres unmark failed: {e}")
-        else:
-            self._save_file()
-
     def snapshot_existing(self, pos_keys):
         new_keys = [k for k in pos_keys if k not in self._seen]
         if not new_keys: return

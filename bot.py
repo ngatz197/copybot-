@@ -4,14 +4,10 @@ import asyncio
 import logging
 import threading
 import psycopg2
-from concurrent.futures import ThreadPoolExecutor
 import config as cfg
 from engine import CopyTrader, run_health_server
-from exchange import PolymarketUserChannelListener
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-db_executor = ThreadPoolExecutor(max_workers=3)
 
 def keep_neon_alive():
     conn = None
@@ -30,101 +26,61 @@ def keep_neon_alive():
                 except Exception:
                     pass
                 conn = None
-        time.sleep(180)
-
-def handle_task_exception(task: asyncio.Task):
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logging.critical(f"💥 Background task worker loop failed: {task.get_name()} -> {e}", exc_info=True)
-
-
-async def execution_queue_consumer(queue: asyncio.Queue, bot_engine: CopyTrader):
-    """
-    PolyGun Event-Driven Consumer Hub.
-    Bypasses polling timers entirely to run trades concurrently the microsecond they appear.
-    """
-    logging.info("🚀 PolyGun High-Speed Execution Queue Consumer is active and monitoring...")
-    while True:
-        ev = await queue.get()
-        try:
-            wallet = ev.get("proxyWallet")
-            token_id = ev.get("asset")
-            side = ev.get("side") # "BUY" or "SELL"
-            price = float(ev.get("price", 0.0))
-            size = float(ev.get("size", 0.0))
-            outcome = ev.get("outcome")
-
-            logging.info(f"⚡ [EVENT-MATCH] Intercepted Whale Action from {wallet}: {side} {token_id} @ {price}")
-
-            # Routing order directly through to specialized execution parameters
-            if side == "BUY":
-                # Compute fractional copy allocations instantly
-                usd_allocation = bot_engine.balance_manager.get_available_balance() * cfg.COMPOUNDING_RATE
-                await bot_engine.executor.create_and_sign_limit_buy(
-                    token_id=token_id, 
-                    price=price, # Pin to the exact target entry price execution tier
-                    size_usd=usd_allocation
-                )
-            elif side == "SELL":
-                # Match positions and close or trim matching token units instantly
-                await bot_engine.executor.execute_limit_sell(
-                    token_id=token_id, 
-                    shares=size, 
-                    price=price # Pin to exact target exit price execution tier
-                )
-
-        except Exception as worker_err:
-            logging.error(f"Error executing queued trade frame: {worker_err}", exc_info=True)
-        finally:
-            queue.task_done()
-
+        time.sleep(180)  # every 3 minutes
 
 async def main():
-    logging.info("⚡ Booting PolyGun-Optimized Polymarket Pipeline Infrastructure Interface...")
+    logging.info("⚡ Booting Polymarket CopyBot Core Runtime Pipeline Interface...")
 
-    # 1. Threaded Health / UI Layer Container Boot
+    # 1. Start web interface dashboard container thread for infrastructure uptime validation
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
-    # 2. Database Session Maintenance Container Boot
+    # 2. Start Neon keep-alive thread
     neon_thread = threading.Thread(target=keep_neon_alive, daemon=True)
     neon_thread.start()
 
-    # 3. Instantiate Core Engine Configurations
-    bot = CopyTrader()
-    cfg._bot_ref = bot
+    # 3. Initialize bot — CopyTrader.__init__ already calls fetch_with_retry and
+    # sets cfg.compounding_bankroll / cfg.peak_bankroll, so no second fetch is
+    # needed here. A duplicate call would make two live RPC round-trips and
+    # silently overwrite the values set inside __init__ (fix A).
+    bot = CopyTrader(dry_run=cfg.DRY_RUN)
+    cfg._bot_ref = bot  # Connect tracking state pointer back globally to metric servers
 
-    # 4. Instantiate Lock-Free Asynchronous Priority Processing Queue
-    shared_execution_queue = asyncio.Queue()
+    # 4. Start WebSocket listener task so live trade signals are actually received.
+    # The listener is created in CopyTrader.__init__ but never scheduled — without
+    # this create_task the entire WS signal path (_on_ws_signal, instant copies,
+    # live price updates) is permanently dead (fix B).
+    if bot._ws_listener is not None:
+        asyncio.create_task(bot._ws_listener.run())
+        logging.info("⚡ WebSocket market channel listener task started")
+    else:
+        logging.warning("WebSocket listener not available — running on REST polling only")
 
-    # 5. Spin Up Event Consumer Worker Pool
-    consumer_task = asyncio.create_task(
-        execution_queue_consumer(shared_execution_queue, bot), 
-        name="ExecutionConsumer"
-    )
-    consumer_task.add_done_callback(handle_task_exception)
+    # User channel: delivers unambiguous order-level signals per tracked wallet.
+    # Started alongside the market channel; the engine handles both via the same
+    # _on_ws_event callback, distinguishing them by ev["kind"] == "user_trade".
+    if bot._user_listener is not None:
+        asyncio.create_task(bot._user_listener.run())
+        logging.info("⚡ WebSocket user channel listener task started")
 
-    # 6. Override default listener configuration to point to high-speed queue pipeline topology
-    high_speed_user_ws = PolymarketUserChannelListener(
-        wallet_addrs=list(cfg.WALLETS.keys()), 
-        queue=shared_execution_queue
-    )
-
-    ws_user_task = asyncio.create_task(high_speed_user_ws.run(), name="HighSpeedUserWS")
-    ws_user_task.add_done_callback(handle_task_exception)
-
-    # 7. Slow Background Reconciliation Engine Poller (Acts as passive validation fallback)
+    # 5. Fall into continuous automated execution polling loop
     while True:
         try:
-            # Scan-and-copy now handles passive accounting corrections only, leaving execution to WebSockets
             await bot.scan_and_copy()
-        except (OSError, asyncio.TimeoutError) as transient_err:
-            logging.warning(f"Transient polling error in validation handler: {transient_err}")
+        except (
+            # Transient network / IO failures — safe to retry on the next poll.
+            OSError,
+            asyncio.TimeoutError,
+        ) as transient_err:
+            logging.warning(
+                f"Transient error in scan loop — will retry in {cfg.POLL_INTERVAL}s: "
+                f"{transient_err}"
+            )
         except Exception:
-            logging.critical("Fatal breakdown in validation engine polling layer.", exc_info=True)
+            # Anything else (KeyError, TypeError, AttributeError, logic bugs …)
+            # is unexpected. Log the full traceback so it's diagnosable, then
+            # re-raise so the process exits rather than spinning in a broken state.
+            logging.critical("Fatal error in scan loop — shutting down.", exc_info=True)
             raise
 
         await asyncio.sleep(cfg.POLL_INTERVAL)
@@ -133,4 +89,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("🛑 Operations gracefully suspended via hardware interrupt signal.")
+        logging.info("🛑 Program gracefully stopped by operator command signal interrupt.")
