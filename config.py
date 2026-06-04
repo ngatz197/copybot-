@@ -22,6 +22,11 @@ WALLETS: Dict[str, dict] = {
         "risk_type": "price_based",
         "copy_mode": "new_only",
     },
+    "0x2005d16a84ceefa912d4e380cd32e7ff827875ea": {
+        "name": "RN",
+        "risk_type": "price_based",
+        "copy_mode": "new_only",
+    },
     "0xf903c4cd098184e67a06a04f9b8fdb36e7bbe028": {
         "name": "Viser",
         "risk_type": "price_based",
