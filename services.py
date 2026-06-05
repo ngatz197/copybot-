@@ -43,18 +43,46 @@ class OpenOrder:
     placed_at:   int               # unix timestamp
 
 @dataclass
+class ClosedTrade:
+    """A completed (sold) position used for PnL and win-rate tracking."""
+    outcome:     str
+    entry_price: float
+    exit_price:  float
+    pnl:         float             # positive = win, negative = loss
+
+@dataclass
+class WalletStats:
+    """Per-source-wallet performance counters."""
+    wins:         int   = 0
+    losses:       int   = 0
+    total_pnl:    float = 0.0
+    open:         int   = 0        # open positions attributed to this wallet
+    closed_trades: list = field(default_factory=list)   # list[ClosedTrade] (last 5)
+
+@dataclass
 class BotState:
     running:       bool  = False
     total_copied:  int   = 0
     total_skipped: int   = 0
-    # market_id:outcome → usdc size
+    # market_id:outcome → {"size": usdc, "entry_price": float, "wallet_label": str}
     positions:     dict  = field(default_factory=dict)
     # tx_hash dedup
     seen_txs:      set   = field(default_factory=set)
     # order_id → OpenOrder  (for TTL cancellation)
     open_orders:   dict  = field(default_factory=dict)
+    # wallet_label → WalletStats
+    wallet_stats:  dict  = field(default_factory=dict)
+    # [(timestamp, cumulative_pnl), ...] for chart
+    pnl_history:   list  = field(default_factory=list)
+    total_pnl:     float = 0.0
 
 state = BotState()
+
+def _wallet_stats(label: str) -> WalletStats:
+    """Return (creating if needed) the WalletStats for a wallet label."""
+    if label not in state.wallet_stats:
+        state.wallet_stats[label] = WalletStats()
+    return state.wallet_stats[label]
 
 # ── Wallet label lookup ───────────────────────────────────────────────────────
 
@@ -70,12 +98,15 @@ async def fetch_wallet_trades(
     wallet: str,
     since_ts: int,
 ) -> list[dict]:
-    url = f"{config.POLYMARKET_GAMMA_API}/trades"
-    params = {"maker": wallet, "after": since_ts, "limit": 50}
+    # CLOB API: GET /trades?user=<address>&after=<ts>
+    url = f"{config.POLYMARKET_CLOB_API}/trades"
+    params = {"user": wallet, "after": since_ts, "limit": 50}
     try:
         r = await client.get(url, params=params, timeout=10)
         r.raise_for_status()
-        return r.json().get("data", [])
+        data = r.json()
+        # CLOB returns either a list directly or {"data": [...]}
+        return data if isinstance(data, list) else data.get("data", [])
     except Exception as e:
         logger.warning("fetch_wallet_trades(%s): %s", label(wallet), e)
         return []
@@ -153,13 +184,14 @@ def fetch_wallet_usdc_balance() -> float:
 
 def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
     try:
-        side      = raw.get("side", "").upper()
-        size      = float(raw.get("usdcSize", 0))
+        # CLOB API field names
+        side      = raw.get("side", "").upper()                          # BUY / SELL
+        size      = float(raw.get("size", raw.get("usdcSize", 0)))       # shares or usdc
         price     = float(raw.get("price", 0))
-        token_id  = raw.get("asset", "")
-        market_id = raw.get("market", "")
+        token_id  = raw.get("asset_id", raw.get("asset", ""))            # outcome token ID
+        market_id = raw.get("market", raw.get("condition_id", ""))
         outcome   = raw.get("outcome", "")
-        tx_hash   = raw.get("transactionHash", "")
+        tx_hash   = raw.get("transaction_hash", raw.get("transactionHash", ""))
         timestamp = int(raw.get("timestamp", 0))
 
         if size < config.MIN_SOURCE_TRADE_USDC:
@@ -249,12 +281,12 @@ async def place_limit_order(
         return {"status": "dry_run", "order_id": order_id, "price": limit_price, "shares": shares}
 
     # ── LIVE (uncomment when DRY_RUN=false) ──────────────────────────────────
-    # from py_clob_client.client import ClobClient
-    # from py_clob_client.clob_types import OrderArgs, OrderType
+    # from py_clob_client_v2.client import ClobClient
+    # from py_clob_client_v2.clob_types import OrderArgs, OrderType
     #
     # clob = ClobClient(
     #     host=config.POLYMARKET_CLOB_API,
-    #     key=config.MY_WALLET_PRIVATE_KEY,
+    #     key=config.PRIVATE_KEY,
     #     chain_id=137,
     # )
     # order_args = OrderArgs(
@@ -278,9 +310,9 @@ async def cancel_order(client: httpx.AsyncClient, order_id: str) -> None:
         return
 
     # ── LIVE ─────────────────────────────────────────────────────────────────
-    # from py_clob_client.client import ClobClient
+    # from py_clob_client_v2.client import ClobClient
     # clob = ClobClient(host=config.POLYMARKET_CLOB_API,
-    #                   key=config.MY_WALLET_PRIVATE_KEY, chain_id=137)
+    #                   key=config.PRIVATE_KEY, chain_id=137)
     # clob.cancel(order_id)
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -314,13 +346,48 @@ async def ttl_watchdog(client: httpx.AsyncClient) -> None:
 
 def update_position(trade: PolyTrade, size_usdc: float) -> None:
     key = f"{trade.market_id}:{trade.outcome}"
-    cur = state.positions.get(key, 0.0)
+    ws = _wallet_stats(trade.wallet_label)
+
     if trade.side == "BUY":
-        state.positions[key] = cur + size_usdc
+        existing = state.positions.get(key)
+        if existing is None:
+            state.positions[key] = {
+                "size": size_usdc,
+                "entry_price": trade.price,
+                "wallet_label": trade.wallet_label,
+            }
+            ws.open += 1
+        else:
+            # Average into existing position
+            total = existing["size"] + size_usdc
+            existing["entry_price"] = (
+                existing["entry_price"] * existing["size"] + trade.price * size_usdc
+            ) / total
+            existing["size"] = total
     else:
-        state.positions[key] = max(0.0, cur - size_usdc)
-        if state.positions[key] == 0.0:
-            del state.positions[key]
+        existing = state.positions.pop(key, None)
+        if existing:
+            entry  = existing["entry_price"]
+            exit_p = trade.price
+            pnl    = (exit_p - entry) * (existing["size"] / entry) if entry else 0.0
+            state.total_pnl += pnl
+            state.pnl_history.append((int(time.time()), round(state.total_pnl, 2)))
+
+            ct = ClosedTrade(
+                outcome=trade.outcome,
+                entry_price=entry,
+                exit_price=exit_p,
+                pnl=round(pnl, 2),
+            )
+            wlabel = existing.get("wallet_label", trade.wallet_label)
+            ws_orig = _wallet_stats(wlabel)
+            if pnl >= 0:
+                ws_orig.wins += 1
+            else:
+                ws_orig.losses += 1
+            ws_orig.total_pnl = round(ws_orig.total_pnl + pnl, 2)
+            ws_orig.open = max(0, ws_orig.open - 1)
+            ws_orig.closed_trades = ([ct] + ws_orig.closed_trades)[:5]
 
 
 # ── Core copy-trade pipeline ──────────────────────────────────────────────────
