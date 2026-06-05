@@ -14,7 +14,6 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-import psycopg
 
 import config
 import services
@@ -25,7 +24,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     stream=sys.stdout,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Dashboard server port — Render sets PORT automatically
@@ -128,46 +126,6 @@ async def run_webserver() -> None:
     await server.serve()
 
 
-# ── Neon heartbeat ────────────────────────────────────────────────────────────
-
-async def neon_heartbeat() -> None:
-    """Insert a 🟢 heartbeat row into Neon every 3 minutes."""
-    if not config.DATABASE_URL:
-        logger.warning("DATABASE_URL not set — Neon heartbeat disabled.")
-        return
-
-    # Create table if it doesn't exist yet
-    try:
-        conn = await psycopg.AsyncConnection.connect(config.DATABASE_URL)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS bot_heartbeat (
-                id        SERIAL PRIMARY KEY,
-                status    TEXT        NOT NULL DEFAULT '🟢',
-                ts        TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        await conn.commit()
-        await conn.close()
-        logger.info("Neon heartbeat table ready.")
-    except Exception as e:
-        logger.error("Neon heartbeat setup failed: %s", e)
-        return
-
-    while state.running:
-        try:
-            conn = await psycopg.AsyncConnection.connect(config.DATABASE_URL)
-            await conn.execute(
-                "INSERT INTO bot_heartbeat (status, ts) VALUES (%s, now())",
-                ("🟢",),
-            )
-            await conn.commit()
-            await conn.close()
-            logger.info("Neon heartbeat 🟢 inserted.")
-        except Exception as e:
-            logger.warning("Neon heartbeat failed: %s", e)
-        await asyncio.sleep(180)  # 3 minutes
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -198,12 +156,13 @@ async def main() -> None:
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT,  handle_shutdown)
 
-    await asyncio.gather(
-        services.monitor_loop(),
-        status_printer(),
-        run_webserver(),
-        neon_heartbeat(),
-    )
+    # Schedule bot tasks as background tasks so uvicorn binds the port
+    # immediately — this ensures Render's health check passes on startup.
+    loop = asyncio.get_event_loop()
+    loop.create_task(services.monitor_loop())
+    loop.create_task(status_printer())
+
+    await run_webserver()  # blocks; bot tasks run concurrently
 
     logger.info("Bot stopped cleanly.")
 
