@@ -312,10 +312,9 @@ def compute_limit_price(side: str, book: dict) -> Optional[float]:
 
 
 def compute_order_size() -> float:
-    """1% of current virtual balance, clamped to min/max guardrails."""
+    """Exactly 1% of current virtual balance, no floor or ceiling."""
     balance = state.virtual_balance if state.virtual_balance > 0 else state.real_balance
-    raw  = balance * config.TRADE_PCT
-    size = max(config.MIN_ORDER_USDC, min(config.MAX_ORDER_USDC, raw))
+    size    = round(balance * config.TRADE_PCT, 2)
     logger.info("Order size: 1%% of $%.2f (virtual) = $%.2f", balance, size)
     return size
 
@@ -483,14 +482,6 @@ async def process_trade(client: httpx.AsyncClient, trade: PolyTrade) -> None:
             logger.info(
                 "Position cap reached (%d/%d) — skipping BUY %s",
                 len(state.positions), MAX_POSITIONS, trade.market_question,
-            )
-            state.total_skipped += 1
-            return
-        min_needed = config.MIN_ORDER_USDC
-        if state.virtual_balance < min_needed:
-            logger.warning(
-                "Insufficient virtual balance ($%.2f < $%.2f min) — skipping BUY %s",
-                state.virtual_balance, min_needed, trade.market_question,
             )
             state.total_skipped += 1
             return
