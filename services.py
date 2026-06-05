@@ -24,16 +24,31 @@ def get_clob_client():
     Return a module-level ClobClient, creating it once on first call.
     Reusing a single instance avoids repeated L1/L2 key-negotiation and
     prevents nonce collisions when orders are placed in quick succession.
+
+    Two-level auth required by Polymarket:
+      L1 — wallet (EIP-712) signature, supplied via ``key``.
+      L2 — HMAC API credentials (key/secret/passphrase), derived from the
+           wallet on first use via create_or_derive_api_creds().  Without L2
+           the CLOB rejects every order with a 401/403.
     """
     global _clob_client
     if _clob_client is None:
         from py_clob_client.client import ClobClient
-        _clob_client = ClobClient(
+        client = ClobClient(
             host=config.POLYMARKET_CLOB_API,
             key=config.PRIVATE_KEY,
             chain_id=137,
         )
-        logger.info("ClobClient initialised (singleton)")
+        # Derive (or retrieve cached) L2 HMAC credentials and attach them.
+        # This makes one authenticated call to the CLOB; subsequent order
+        # placements reuse the cached creds without hitting the auth endpoint.
+        try:
+            client.set_api_creds(client.create_or_derive_api_creds())
+            logger.info("ClobClient initialised (singleton) — L1+L2 auth OK")
+        except Exception as e:
+            logger.error("ClobClient L2 auth failed: %s", e)
+            raise
+        _clob_client = client
     return _clob_client
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -382,21 +397,41 @@ async def place_limit_order(
 
     # ── LIVE ─────────────────────────────────────────────────────────────────
     # Use the module-level singleton to avoid repeated auth/key-negotiation and
-    # nonce collisions.  The blocking CLOB call is offloaded to a thread-pool
-    # executor so it never stalls the event loop (which would cause Render's
+    # nonce collisions.  The blocking CLOB calls are offloaded to a thread-pool
+    # executor so they never stall the event loop (which would cause Render's
     # health check to time out and restart the process).
+    import functools
     from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY as CLOB_BUY, SELL as CLOB_SELL
+
+    # The library expects its own BUY/SELL sentinel constants, not raw strings.
+    clob_side = CLOB_BUY if trade.side == "BUY" else CLOB_SELL
 
     clob = get_clob_client()
     order_args = OrderArgs(
         token_id=trade.token_id,
         price=limit_price,
         size=shares,
-        side=trade.side,
-        order_type=OrderType.GTC,   # Good-Till-Cancelled limit order
+        side=clob_side,
+        # order_type does NOT belong in OrderArgs — passed to post_order() below
     )
     loop = asyncio.get_event_loop()
-    resp = await loop.run_in_executor(None, clob.create_and_post_order, order_args)
+    # Step 1: sign locally (no network).
+    signed = await loop.run_in_executor(None, clob.create_order, order_args)
+    # Step 2: submit to CLOB with GTC order type.
+    resp = await loop.run_in_executor(
+        None, functools.partial(clob.post_order, signed, OrderType.GTC)
+    )
+
+    # Normalise response: the live CLOB returns {"orderID": "...", ...} (capital ID).
+    # Map to the "order_id" key the rest of the bot expects.
+    if isinstance(resp, dict) and "order_id" not in resp:
+        resp["order_id"] = resp.get("orderID") or resp.get("id") or "unknown"
+
+    logger.info(
+        "[LIVE] Order submitted — id=%s status=%s",
+        resp.get("order_id"), resp.get("status"),
+    )
     return resp
     # ─────────────────────────────────────────────────────────────────────────
 
