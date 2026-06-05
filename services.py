@@ -269,6 +269,11 @@ def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
             return None
         if token_id in _dead_tokens:
             return None
+        # Reject trades older than 2× the poll interval — guards against the
+        # Data API returning stale history when tAfter is unreliable.
+        max_age = config.POLL_INTERVAL_SEC * 2
+        if timestamp and (int(time.time()) - timestamp) > max_age:
+            return None
 
         return PolyTrade(
             wallet=wallet,
@@ -571,8 +576,10 @@ async def monitor_loop() -> None:
         state.real_balance, state.virtual_balance,
     )
 
-    last_poll         = int(time.time()) - config.POLL_INTERVAL_SEC
-    last_balance_poll = 0   # force immediate real-balance refresh on first loop
+    # Set last_poll to NOW so we only pick up trades that happen after bot start.
+    # We intentionally do NOT look back — historical trades are not copied.
+    last_poll         = int(time.time())
+    last_balance_poll = 0
 
     async with httpx.AsyncClient() as client:
         asyncio.create_task(ttl_watchdog(client))
