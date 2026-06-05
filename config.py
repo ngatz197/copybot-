@@ -48,5 +48,8 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 # ── Polygon RPC ───────────────────────────────────────────────────────────────
 POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
 
+# ── Neon (Postgres) ───────────────────────────────────────────────────────────
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
