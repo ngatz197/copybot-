@@ -47,32 +47,16 @@ async def data():
     Returns data in the exact shape expected by the dashboard JS:
 
     {
-      "bankroll":      float,
-      "total_pnl":     float,
-      "win_rate":      float,        # 0–100
-      "open_count":    int,
-      "max_positions": int,
-      "pnl_history":   [[ts, cumulative_pnl], ...],
-      "wallets": {
-        "<label>": {
-          "total_pnl":     float,
-          "win_rate":      float,
-          "wins":          int,
-          "losses":        int,
-          "open":          int,
-          "closed_trades": [
-            {"outcome": str, "entry_price": float, "exit_price": float, "pnl": float},
-            ...
-          ]
-        }
-      }
+      "real_balance":    float,   # on-chain USDC (refreshed every 5 min)
+      "virtual_balance": float,   # simulated balance tracking buys/sells
+      "total_pnl":       float,
+      "win_rate":        float,   # 0–100
+      "open_count":      int,
+      "max_positions":   int,
+      "pnl_history":     [[ts, cumulative_pnl], ...],
+      "wallets": { ... }
     }
     """
-    try:
-        bankroll = services.fetch_wallet_usdc_balance()
-    except Exception:
-        bankroll = 0.0
-
     total_wins   = sum(ws.wins   for ws in state.wallet_stats.values())
     total_losses = sum(ws.losses for ws in state.wallet_stats.values())
     total_closed = total_wins + total_losses
@@ -100,13 +84,14 @@ async def data():
         }
 
     return JSONResponse({
-        "bankroll":      round(bankroll, 2),
-        "total_pnl":     round(state.total_pnl, 2),
-        "win_rate":      win_rate,
-        "open_count":    len(state.positions),
-        "max_positions": 8,
-        "pnl_history":   state.pnl_history[-100:],
-        "wallets":       wallets_payload,
+        "real_balance":    state.real_balance,
+        "virtual_balance": round(state.virtual_balance, 2),
+        "total_pnl":       round(state.total_pnl, 2),
+        "win_rate":        win_rate,
+        "open_count":      len(state.positions),
+        "max_positions":   services.MAX_POSITIONS,
+        "pnl_history":     state.pnl_history[-100:],
+        "wallets":         wallets_payload,
     })
 
 
