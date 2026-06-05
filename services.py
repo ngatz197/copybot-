@@ -15,6 +15,27 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# ── Singleton CLOB client (live mode only) ────────────────────────────────────
+
+_clob_client = None
+
+def get_clob_client():
+    """
+    Return a module-level ClobClient, creating it once on first call.
+    Reusing a single instance avoids repeated L1/L2 key-negotiation and
+    prevents nonce collisions when orders are placed in quick succession.
+    """
+    global _clob_client
+    if _clob_client is None:
+        from py_clob_client.client import ClobClient
+        _clob_client = ClobClient(
+            host=config.POLYMARKET_CLOB_API,
+            key=config.PRIVATE_KEY,
+            chain_id=137,
+        )
+        logger.info("ClobClient initialised (singleton)")
+    return _clob_client
+
 # ── Data models ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -356,14 +377,13 @@ async def place_limit_order(
         return {"status": "dry_run", "order_id": order_id, "price": limit_price, "shares": shares}
 
     # ── LIVE ─────────────────────────────────────────────────────────────────
-    from py_clob_client.client import ClobClient
+    # Use the module-level singleton to avoid repeated auth/key-negotiation and
+    # nonce collisions.  The blocking CLOB call is offloaded to a thread-pool
+    # executor so it never stalls the event loop (which would cause Render's
+    # health check to time out and restart the process).
     from py_clob_client.clob_types import OrderArgs, OrderType
 
-    clob = ClobClient(
-        host=config.POLYMARKET_CLOB_API,
-        key=config.PRIVATE_KEY,
-        chain_id=137,
-    )
+    clob = get_clob_client()
     order_args = OrderArgs(
         token_id=trade.token_id,
         price=limit_price,
@@ -371,7 +391,8 @@ async def place_limit_order(
         side=trade.side,
         order_type=OrderType.GTC,   # Good-Till-Cancelled limit order
     )
-    resp = clob.create_and_post_order(order_args)
+    loop = asyncio.get_event_loop()
+    resp = await loop.run_in_executor(None, clob.create_and_post_order, order_args)
     return resp
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -383,10 +404,11 @@ async def cancel_order(client: httpx.AsyncClient, order_id: str) -> None:
         return
 
     # ── LIVE ─────────────────────────────────────────────────────────────────
-    # from py_clob_client_v2.client import ClobClient
-    # clob = ClobClient(host=config.POLYMARKET_CLOB_API,
-    #                   key=config.PRIVATE_KEY, chain_id=137)
-    # clob.cancel(order_id)
+    # Offload to executor — same reasoning as place_limit_order.
+    clob = get_clob_client()
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, clob.cancel, order_id)
+    logger.info("Cancelled order %s", order_id)
     # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -654,7 +676,7 @@ def get_status_text() -> str:
         f"=== Polymarket Copy Bot ({status} | {mode}) ===",
         f"Wallets: {', '.join(config.SOURCE_WALLETS.keys())}",
         f"Poll:    every {config.POLL_INTERVAL_SEC}s",
-        f"Size:    1% of wallet balance (${config.MIN_ORDER_USDC}–${config.MAX_ORDER_USDC})",
+        f"Size:    1% of wallet balance (no floor/ceiling)",
         f"Orders:  GTC limit  |  TTL: {config.LIMIT_ORDER_TTL_SEC}s  |  offset: {config.LIMIT_TICK_OFFSET}",
         f"Copied:  {state.total_copied}  |  Skipped: {state.total_skipped}",
         f"Open orders: {len(state.open_orders)}",
