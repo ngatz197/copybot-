@@ -59,22 +59,31 @@ class WalletStats:
     open:         int   = 0        # open positions attributed to this wallet
     closed_trades: list = field(default_factory=list)   # list[ClosedTrade] (last 5)
 
+MAX_POSITIONS = 8   # hard cap on concurrent open positions
+
 @dataclass
 class BotState:
-    running:       bool  = False
-    total_copied:  int   = 0
-    total_skipped: int   = 0
+    running:         bool  = False
+    total_copied:    int   = 0
+    total_skipped:   int   = 0
     # market_id:outcome → {"size": usdc, "entry_price": float, "wallet_label": str}
-    positions:     dict  = field(default_factory=dict)
+    positions:       dict  = field(default_factory=dict)
     # tx_hash dedup
-    seen_txs:      set   = field(default_factory=set)
+    seen_txs:        set   = field(default_factory=set)
     # order_id → OpenOrder  (for TTL cancellation)
-    open_orders:   dict  = field(default_factory=dict)
+    open_orders:     dict  = field(default_factory=dict)
     # wallet_label → WalletStats
-    wallet_stats:  dict  = field(default_factory=dict)
+    wallet_stats:    dict  = field(default_factory=dict)
     # [(timestamp, cumulative_pnl), ...] for chart
-    pnl_history:   list  = field(default_factory=list)
-    total_pnl:     float = 0.0
+    pnl_history:     list  = field(default_factory=list)
+    total_pnl:       float = 0.0
+    # Real on-chain USDC balance (refreshed every poll cycle)
+    real_balance:    float = 0.0
+    # Virtual balance: starts equal to real balance at boot, then tracks
+    # spending (BUYs deduct) and receipts (SELLs credit) in-memory.
+    virtual_balance: float = 0.0
+    # Set to True once virtual_balance has been seeded from real_balance
+    balance_seeded:  bool  = False
 
 state = BotState()
 
@@ -182,10 +191,12 @@ def best_bid(book: dict) -> Optional[float]:
     return float(bids[0]["price"]) if bids else None
 
 
-# ── Wallet USDC balance ───────────────────────────────────────────────────────
+# ── Wallet pUSD balance ───────────────────────────────────────────────────────
 
-USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-USDC_ABI = [{
+# Polymarket migrated to pUSD (Polymarket USD) on April 28 2026.
+# pUSD is an ERC-20 on Polygon backed 1:1 by USDC.
+PUSD_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+PUSD_ABI = [{
     "inputs": [{"name": "account", "type": "address"}],
     "name": "balanceOf",
     "outputs": [{"name": "", "type": "uint256"}],
@@ -194,25 +205,33 @@ USDC_ABI = [{
 }]
 
 def fetch_wallet_usdc_balance() -> float:
-    """Read USDC balance of DEPOSIT_WALLET_ADDRESS from Polygon. Falls back to MIN_ORDER_USDC."""
+    """
+    Read pUSD balance of DEPOSIT_WALLET_ADDRESS from Polygon.
+    pUSD is Polymarket's native collateral token (1:1 USDC-backed) since April 28 2026.
+    Falls back to the last known real_balance if the RPC call fails.
+    """
     if not config.DEPOSIT_WALLET_ADDRESS:
-        logger.warning("DEPOSIT_WALLET_ADDRESS not set — using MIN_ORDER_USDC fallback")
-        return config.MIN_ORDER_USDC
+        logger.warning("DEPOSIT_WALLET_ADDRESS not set — balance unavailable")
+        return state.real_balance or 0.0
     try:
-        w3 = Web3(Web3.HTTPProvider(config.POLYGON_RPC_URL))
+        w3 = Web3(Web3.HTTPProvider(config.POLYGON_RPC_URL, request_kwargs={"timeout": 10}))
+        addr = Web3.to_checksum_address(config.DEPOSIT_WALLET_ADDRESS)
         contract = w3.eth.contract(
-            address=Web3.to_checksum_address(USDC_CONTRACT),
-            abi=USDC_ABI,
+            address=Web3.to_checksum_address(PUSD_CONTRACT),
+            abi=PUSD_ABI,
         )
-        raw = contract.functions.balanceOf(
-            Web3.to_checksum_address(config.DEPOSIT_WALLET_ADDRESS)
-        ).call()
-        balance = raw / 1e6
-        logger.debug("Wallet USDC balance: $%.2f", balance)
+        raw = contract.functions.balanceOf(addr).call()
+        balance = raw / 1_000_000   # pUSD uses 6 decimals like USDC
+        if balance == 0.0:
+            logger.warning(
+                "pUSD balance is 0 for %s — wallet may be empty or RPC unreachable",
+                config.DEPOSIT_WALLET_ADDRESS[:10],
+            )
+        logger.debug("Wallet pUSD balance: $%.2f", balance)
         return balance
     except Exception as e:
-        logger.warning("fetch_wallet_usdc_balance: %s — fallback to MIN_ORDER_USDC", e)
-        return config.MIN_ORDER_USDC
+        logger.warning("fetch_wallet_usdc_balance (pUSD): %s — using last known balance", e)
+        return state.real_balance or 0.0
 
 
 # ── Trade parsing ─────────────────────────────────────────────────────────────
@@ -293,11 +312,11 @@ def compute_limit_price(side: str, book: dict) -> Optional[float]:
 
 
 def compute_order_size() -> float:
-    """1% of current USDC balance, clamped to min/max guardrails."""
-    balance = fetch_wallet_usdc_balance()
+    """1% of current virtual balance, clamped to min/max guardrails."""
+    balance = state.virtual_balance if state.virtual_balance > 0 else state.real_balance
     raw  = balance * config.TRADE_PCT
     size = max(config.MIN_ORDER_USDC, min(config.MAX_ORDER_USDC, raw))
-    logger.info("Order size: 1%% of $%.2f = $%.2f", balance, size)
+    logger.info("Order size: 1%% of $%.2f (virtual) = $%.2f", balance, size)
     return size
 
 
@@ -414,12 +433,19 @@ def update_position(trade: PolyTrade, size_usdc: float) -> None:
                 existing["entry_price"] * existing["size"] + trade.price * size_usdc
             ) / total
             existing["size"] = total
+        # Deduct cost from virtual balance
+        state.virtual_balance = max(0.0, state.virtual_balance - size_usdc)
     else:
         existing = state.positions.pop(key, None)
         if existing:
             entry  = existing["entry_price"]
             exit_p = trade.price
             pnl    = (exit_p - entry) * (existing["size"] / entry) if entry else 0.0
+
+            # Credit virtual balance: return original cost + profit/loss
+            proceeds = existing["size"] + pnl
+            state.virtual_balance = round(state.virtual_balance + proceeds, 2)
+
             state.total_pnl += pnl
             state.pnl_history.append((int(time.time()), round(state.total_pnl, 2)))
 
@@ -450,6 +476,24 @@ async def process_trade(client: httpx.AsyncClient, trade: PolyTrade) -> None:
     # market_question and market_slug already populated by parse_trade from the Data API response
     if not trade.market_question:
         trade.market_question = trade.market_id[:20] + "…"
+
+    # ── BUY guards ────────────────────────────────────────────────────────────
+    if trade.side == "BUY":
+        if len(state.positions) >= MAX_POSITIONS:
+            logger.info(
+                "Position cap reached (%d/%d) — skipping BUY %s",
+                len(state.positions), MAX_POSITIONS, trade.market_question,
+            )
+            state.total_skipped += 1
+            return
+        min_needed = config.MIN_ORDER_USDC
+        if state.virtual_balance < min_needed:
+            logger.warning(
+                "Insufficient virtual balance ($%.2f < $%.2f min) — skipping BUY %s",
+                state.virtual_balance, min_needed, trade.market_question,
+            )
+            state.total_skipped += 1
+            return
 
     # Fetch current order book
     book = await fetch_order_book(client, trade.token_id)
@@ -513,14 +557,34 @@ async def monitor_loop() -> None:
         "Monitor started. Watching: %s",
         ", ".join(f"{lbl} ({addr[:8]}…)" for lbl, addr in config.SOURCE_WALLETS.items()),
     )
-    last_poll = int(time.time()) - config.POLL_INTERVAL_SEC
+
+    # ── Seed balances on startup ──────────────────────────────────────────────
+    real = await asyncio.get_event_loop().run_in_executor(None, fetch_wallet_usdc_balance)
+    state.real_balance    = round(real, 2)
+    state.virtual_balance = round(real, 2)
+    state.balance_seeded  = True
+    logger.info(
+        "Balances seeded — real: $%.2f  virtual: $%.2f",
+        state.real_balance, state.virtual_balance,
+    )
+
+    last_poll         = int(time.time()) - config.POLL_INTERVAL_SEC
+    last_balance_poll = 0   # force immediate real-balance refresh on first loop
 
     async with httpx.AsyncClient() as client:
-        # Start TTL watchdog as a sibling task
         asyncio.create_task(ttl_watchdog(client))
 
         while state.running:
             now = int(time.time())
+
+            # Refresh real balance every 5 minutes (non-blocking)
+            if now - last_balance_poll >= 300:
+                real = await asyncio.get_event_loop().run_in_executor(
+                    None, fetch_wallet_usdc_balance
+                )
+                state.real_balance = round(real, 2)
+                last_balance_poll  = now
+                logger.debug("Real balance refreshed: $%.2f", state.real_balance)
 
             for lbl, wallet in config.SOURCE_WALLETS.items():
                 raw_trades = await fetch_wallet_trades(client, wallet, last_poll)
