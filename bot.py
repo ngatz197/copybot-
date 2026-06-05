@@ -143,8 +143,7 @@ async def main() -> None:
     logger.info("Watching %d wallets:", len(config.SOURCE_WALLETS))
     for lbl, addr in config.SOURCE_WALLETS.items():
         logger.info("  %-8s %s", lbl, addr)
-    logger.info("Trade size : 1%% of wallet balance ($%.0f–$%.0f guardrails)",
-                config.MIN_ORDER_USDC, config.MAX_ORDER_USDC)
+    logger.info("Trade size : 1%% of wallet balance (no floor/ceiling)",)
     logger.info("Order type : GTC limit  |  tick offset: %.4f  |  TTL: %ds",
                 config.LIMIT_TICK_OFFSET, config.LIMIT_ORDER_TTL_SEC)
     logger.info("Poll       : every %ds", config.POLL_INTERVAL_SEC)
