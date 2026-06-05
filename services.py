@@ -98,14 +98,18 @@ async def fetch_wallet_trades(
     wallet: str,
     since_ts: int,
 ) -> list[dict]:
-    # CLOB API: GET /trades?user=<address>&after=<ts>
-    url = f"{config.POLYMARKET_CLOB_API}/trades"
-    params = {"user": wallet, "after": since_ts, "limit": 50}
+    # Gamma API: public, no auth required.
+    # GET /trades?maker_address=<address>&after=<iso-ts>&limit=50
+    url = f"{config.POLYMARKET_GAMMA_API}/trades"
+    params = {
+        "maker_address": wallet,
+        "after":         since_ts,
+        "limit":         50,
+    }
     try:
         r = await client.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        # CLOB returns either a list directly or {"data": [...]}
         return data if isinstance(data, list) else data.get("data", [])
     except Exception as e:
         logger.warning("fetch_wallet_trades(%s): %s", label(wallet), e)
