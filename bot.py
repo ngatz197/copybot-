@@ -43,20 +43,16 @@ async def index():
 
 @app.get("/data")
 async def data():
-    """
-    Returns data in the exact shape expected by the dashboard JS:
+    positions_payload = services.get_positions_payload()
+    unrealised_pnl    = round(sum(p["unrealised_pnl"] for p in positions_payload), 4)
+    realised_pnl      = round(state.realised_pnl, 4)
+    total_pnl         = round(realised_pnl + unrealised_pnl, 4)
 
-    {
-      "real_balance":    float,   # on-chain USDC (refreshed every 5 min)
-      "virtual_balance": float,   # simulated balance tracking buys/sells
-      "total_pnl":       float,
-      "win_rate":        float,   # 0–100
-      "open_count":      int,
-      "max_positions":   int,
-      "pnl_history":     [[ts, cumulative_pnl], ...],
-      "wallets": { ... }
-    }
-    """
+    # Drawdown: (peak - current_total) / peak * 100
+    current_total = state.virtual_balance + sum(p["size"] for p in state.positions.values())
+    peak          = state.peak_balance if state.peak_balance > 0 else current_total
+    drawdown      = round((peak - current_total) / peak * 100, 1) if peak > 0 else 0.0
+
     total_wins   = sum(ws.wins   for ws in state.wallet_stats.values())
     total_losses = sum(ws.losses for ws in state.wallet_stats.values())
     total_closed = total_wins + total_losses
@@ -84,14 +80,21 @@ async def data():
         }
 
     return JSONResponse({
+        "dry_run":         config.DRY_RUN,
         "real_balance":    state.real_balance,
         "virtual_balance": round(state.virtual_balance, 2),
-        "total_pnl":       round(state.total_pnl, 2),
+        "peak_balance":    round(state.peak_balance, 2),
+        "total_pnl":       total_pnl,
+        "unrealised_pnl":  unrealised_pnl,
+        "realised_pnl":    realised_pnl,
+        "drawdown":        drawdown,
         "win_rate":        win_rate,
         "open_count":      len(state.positions),
         "max_positions":   services.MAX_POSITIONS,
         "pnl_history":     state.pnl_history[-100:],
+        "positions":       positions_payload,
         "wallets":         wallets_payload,
+        "total_closed":    total_closed,
     })
 
 
