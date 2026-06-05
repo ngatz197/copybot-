@@ -162,7 +162,7 @@ async def neon_heartbeat() -> None:
             )
             await conn.commit()
             await conn.close()
-            logger.debug("Neon heartbeat ✓")
+            logger.info("Neon heartbeat 🟢 inserted.")
         except Exception as e:
             logger.warning("Neon heartbeat failed: %s", e)
         await asyncio.sleep(180)  # 3 minutes
