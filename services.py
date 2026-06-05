@@ -513,5 +513,5 @@ def get_status_text() -> str:
     if state.positions:
         lines.append("Positions:")
         for k, v in state.positions.items():
-            lines.append(f"  {k}  ${v:.2f}")
+            lines.append(f"  {k}  ${v['size']:.2f} @ {v['entry_price']:.4f} [{v['wallet_label']}]")
     return "\n".join(lines)
