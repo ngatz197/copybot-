@@ -16,6 +16,7 @@ SOURCE_WALLETS = {
     "RN":    "0x2005d16a84ceefa912d4e380cd32e7ff827875ea",
     "Kruto": "0xe8ca3f758c93f44f3ec210542ab78afb7c0bcccb",
     "Viser": "0xf903c4cd098184e67a06a04f9b8fdb36e7bbe028",
+    "Flip":  "0x50c80ae7a66e49701dc9388bd13574ba03e0caa2",
 }
 
 # ── Your trading wallet (Polygon) ────────────────────────────────────────────
