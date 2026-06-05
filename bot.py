@@ -14,6 +14,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
+import psycopg
 
 import config
 import services
@@ -127,6 +128,46 @@ async def run_webserver() -> None:
     await server.serve()
 
 
+# ── Neon heartbeat ────────────────────────────────────────────────────────────
+
+async def neon_heartbeat() -> None:
+    """Insert a 🟢 heartbeat row into Neon every 3 minutes."""
+    if not config.DATABASE_URL:
+        logger.warning("DATABASE_URL not set — Neon heartbeat disabled.")
+        return
+
+    # Create table if it doesn't exist yet
+    try:
+        conn = await psycopg.AsyncConnection.connect(config.DATABASE_URL)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_heartbeat (
+                id        SERIAL PRIMARY KEY,
+                status    TEXT        NOT NULL DEFAULT '🟢',
+                ts        TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        await conn.commit()
+        await conn.close()
+        logger.info("Neon heartbeat table ready.")
+    except Exception as e:
+        logger.error("Neon heartbeat setup failed: %s", e)
+        return
+
+    while state.running:
+        try:
+            conn = await psycopg.AsyncConnection.connect(config.DATABASE_URL)
+            await conn.execute(
+                "INSERT INTO bot_heartbeat (status, ts) VALUES (%s, now())",
+                ("🟢",),
+            )
+            await conn.commit()
+            await conn.close()
+            logger.debug("Neon heartbeat ✓")
+        except Exception as e:
+            logger.warning("Neon heartbeat failed: %s", e)
+        await asyncio.sleep(180)  # 3 minutes
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -161,6 +202,7 @@ async def main() -> None:
         services.monitor_loop(),
         status_printer(),
         run_webserver(),
+        neon_heartbeat(),
     )
 
     logger.info("Bot stopped cleanly.")
