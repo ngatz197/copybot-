@@ -278,17 +278,17 @@ class PolymarketUserChannelListener:
                     
                     timestamp = str(int(time.time()))
                     
-                    # 1. Compute L2 HMAC Signature Protocol mapping for WebSockets
+                    # 1. Compute L2 HMAC Signature Protocol using standard text bytes encoding
                     sig_payload = f"{timestamp}GET/ws/user"
-                    secret_bytes = base64.b64decode(POLY_SECRET) if isinstance(POLY_SECRET, str) else POLY_SECRET
+                    secret_bytes = POLY_SECRET.encode('utf-8') if isinstance(POLY_SECRET, str) else POLY_SECRET
                     
                     try:
                         signature = hmac.new(
                             secret_bytes, 
-                            sig_payload.encode(), 
+                            sig_payload.encode('utf-8'), 
                             hashlib.sha256
                         ).digest()
-                        encoded_sig = base64.b64encode(signature).decode()
+                        encoded_sig = base64.b64encode(signature).decode('utf-8')
                     except Exception as sig_err:
                         logging.error(f"Failed to sign user stream credentials cryptographically: {sig_err}")
                         await asyncio.sleep(10)
