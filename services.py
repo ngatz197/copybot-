@@ -99,13 +99,12 @@ async def fetch_wallet_trades(
     since_ts: int,
 ) -> list[dict]:
     # Data API: fully public, no auth required.
-    # GET /activity?user=<address>&type=TRADE&start=<ts_seconds>&limit=50
-    url = "https://data-api.polymarket.com/activity"
+    # GET /trades?user=<address>&tAfter=<ts_seconds>&limit=50
+    url = "https://data-api.polymarket.com/trades"
     params = {
-        "user":  wallet,
-        "type":  "TRADE",
-        "start": since_ts,
-        "limit": 50,
+        "user":   wallet,
+        "tAfter": since_ts,
+        "limit":  50,
     }
     try:
         r = await client.get(url, params=params, timeout=10)
@@ -118,11 +117,16 @@ async def fetch_wallet_trades(
 
 
 async def fetch_market_info(client: httpx.AsyncClient, market_id: str) -> dict:
-    url = f"{config.POLYMARKET_GAMMA_API}/markets/{market_id}"
+    # Gamma API expects condition_id as a query param, not a path segment
+    url = f"{config.POLYMARKET_GAMMA_API}/markets"
     try:
-        r = await client.get(url, timeout=10)
+        r = await client.get(url, params={"condition_id": market_id}, timeout=10)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        # Returns a list; grab the first match
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data
     except Exception as e:
         logger.warning("fetch_market_info(%s): %s", market_id, e)
         return {}
@@ -189,13 +193,14 @@ def fetch_wallet_usdc_balance() -> float:
 
 def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
     try:
-        # Data API field names (data-api.polymarket.com/activity)
-        # side: "BUY" or "SELL"
+        # Data API field names (data-api.polymarket.com/trades)
+        # title: market question (included in trade record — no extra API call needed)
+        # slug:  market slug
         # asset: outcome token ID
         # conditionId: market/condition ID
-        # size: USDC size
+        # size: USDC notional
         # price: fill price (0–1)
-        # outcome: "Yes" / "No"
+        # outcome: "Yes" / "No" / team name etc.
         # transactionHash: on-chain tx
         # timestamp: unix seconds
         side      = raw.get("side", "").upper()
@@ -206,6 +211,8 @@ def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
         outcome   = raw.get("outcome", "")
         tx_hash   = raw.get("transactionHash", raw.get("transaction_hash", ""))
         timestamp = int(raw.get("timestamp", 0))
+        title     = raw.get("title", "")
+        slug      = raw.get("slug", raw.get("eventSlug", ""))
 
         if size < config.MIN_SOURCE_TRADE_USDC:
             return None
@@ -223,6 +230,8 @@ def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
             size_usdc=size,
             price=price,
             outcome=outcome,
+            market_question=title,
+            market_slug=slug,
             tx_hash=tx_hash,
             timestamp=timestamp,
         )
@@ -410,10 +419,9 @@ async def process_trade(client: httpx.AsyncClient, trade: PolyTrade) -> None:
         return
     state.seen_txs.add(trade.tx_hash)
 
-    # Enrich market metadata
-    market = await fetch_market_info(client, trade.market_id)
-    trade.market_question = market.get("question", trade.market_id[:20] + "…")
-    trade.market_slug     = market.get("slug", "")
+    # market_question and market_slug already populated by parse_trade from the Data API response
+    if not trade.market_question:
+        trade.market_question = trade.market_id[:20] + "…"
 
     # Fetch current order book
     book = await fetch_order_book(client, trade.token_id)
