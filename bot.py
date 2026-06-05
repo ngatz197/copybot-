@@ -35,12 +35,12 @@ async def status_printer() -> None:
 
 async def main() -> None:
     # Validate config
-    if not config.MY_WALLET_ADDRESS:
-        logger.error("MY_WALLET_ADDRESS is not set. Exiting.")
+    if not config.DEPOSIT_WALLET_ADDRESS:
+        logger.error("DEPOSIT_WALLET_ADDRESS is not set. Exiting.")
         sys.exit(1)
 
-    if not config.MY_WALLET_PRIVATE_KEY and not config.DRY_RUN:
-        logger.error("MY_WALLET_PRIVATE_KEY is not set and DRY_RUN=false. Exiting.")
+    if not config.PRIVATE_KEY and not config.DRY_RUN:
+        logger.error("PRIVATE_KEY is not set and DRY_RUN=false. Exiting.")
         sys.exit(1)
 
     mode = "DRY RUN" if config.DRY_RUN else "*** LIVE TRADING ***"
