@@ -269,10 +269,15 @@ def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
             return None
         if token_id in _dead_tokens:
             return None
-        # Reject trades older than 2× the poll interval — guards against the
-        # Data API returning stale history when tAfter is unreliable.
-        max_age = config.POLL_INTERVAL_SEC * 2
+        # Reject trades older than 4x the poll interval (min 120 s) — guards
+        # against the Data API returning stale history when tAfter is unreliable,
+        # while still tolerating API latency spikes and brief bot restarts.
+        max_age = max(120, config.POLL_INTERVAL_SEC * 4)
         if timestamp and (int(time.time()) - timestamp) > max_age:
+            logger.info(
+                "Skipping stale trade (age %ds > %ds) tx=%s market=%s",
+                int(time.time()) - timestamp, max_age, tx_hash[:10], title or market_id[:20],
+            )
             return None
 
         return PolyTrade(
@@ -582,9 +587,10 @@ async def monitor_loop() -> None:
     last_balance_poll = 0
 
     async with httpx.AsyncClient() as client:
-        asyncio.create_task(ttl_watchdog(client))
+        watchdog_task = asyncio.create_task(ttl_watchdog(client))
 
-        while state.running:
+        try:
+            while state.running:
             now = int(time.time())
 
             # Refresh real balance every 5 minutes (non-blocking)
@@ -616,6 +622,13 @@ async def monitor_loop() -> None:
 
             last_poll = now
             await asyncio.sleep(config.POLL_INTERVAL_SEC)
+
+        finally:
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
 
     logger.info("Monitor stopped.")
 
