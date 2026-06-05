@@ -1,16 +1,23 @@
 """
 bot.py — Polymarket Copy Trading Bot entry point
-No Telegram. Starts the monitor loop and prints status to stdout/logs.
+Runs the trade monitor loop AND the FastAPI dashboard server concurrently.
 """
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+import time
+from pathlib import Path
+
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
 
 import config
 import services
-from services import state
+from services import state, _wallet_stats
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -19,6 +26,91 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Dashboard server port — Render sets PORT automatically
+PORT = int(os.getenv("PORT", "8080"))
+
+DASHBOARD_PATH = Path(__file__).parent / "dashboard.html"
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Polymarket CopyTrader")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return DASHBOARD_PATH.read_text()
+
+
+@app.get("/data")
+async def data():
+    """
+    Returns data in the exact shape expected by the dashboard JS:
+
+    {
+      "bankroll":      float,
+      "total_pnl":     float,
+      "win_rate":      float,        # 0–100
+      "open_count":    int,
+      "max_positions": int,
+      "pnl_history":   [[ts, cumulative_pnl], ...],
+      "wallets": {
+        "<label>": {
+          "total_pnl":     float,
+          "win_rate":      float,
+          "wins":          int,
+          "losses":        int,
+          "open":          int,
+          "closed_trades": [
+            {"outcome": str, "entry_price": float, "exit_price": float, "pnl": float},
+            ...
+          ]
+        }
+      }
+    }
+    """
+    try:
+        bankroll = services.fetch_wallet_usdc_balance()
+    except Exception:
+        bankroll = 0.0
+
+    total_wins   = sum(ws.wins   for ws in state.wallet_stats.values())
+    total_losses = sum(ws.losses for ws in state.wallet_stats.values())
+    total_closed = total_wins + total_losses
+    win_rate     = round(total_wins / total_closed * 100, 1) if total_closed else 0.0
+
+    wallets_payload = {}
+    for label in config.SOURCE_WALLETS:
+        ws     = _wallet_stats(label)
+        closed = ws.wins + ws.losses
+        wallets_payload[label] = {
+            "total_pnl": ws.total_pnl,
+            "win_rate":  round(ws.wins / closed * 100, 1) if closed else 0.0,
+            "wins":      ws.wins,
+            "losses":    ws.losses,
+            "open":      ws.open,
+            "closed_trades": [
+                {
+                    "outcome":     ct.outcome,
+                    "entry_price": ct.entry_price,
+                    "exit_price":  ct.exit_price,
+                    "pnl":         ct.pnl,
+                }
+                for ct in ws.closed_trades
+            ],
+        }
+
+    return JSONResponse({
+        "bankroll":      round(bankroll, 2),
+        "total_pnl":     round(state.total_pnl, 2),
+        "win_rate":      win_rate,
+        "open_count":    len(state.positions),
+        "max_positions": 8,
+        "pnl_history":   state.pnl_history[-100:],
+        "wallets":       wallets_payload,
+    })
+
+
+# ── Bot coroutines ────────────────────────────────────────────────────────────
 
 def handle_shutdown(sig, frame):
     logger.info("Signal %s received — shutting down…", sig)
@@ -33,8 +125,22 @@ async def status_printer() -> None:
             logger.info("\n%s", services.get_status_text())
 
 
+async def run_webserver() -> None:
+    """Run uvicorn in-process so it shares the same event loop."""
+    cfg = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level=config.LOG_LEVEL.lower(),
+        access_log=False,
+    )
+    server = uvicorn.Server(cfg)
+    await server.serve()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 async def main() -> None:
-    # Validate config
     if not config.DEPOSIT_WALLET_ADDRESS:
         logger.error("DEPOSIT_WALLET_ADDRESS is not set. Exiting.")
         sys.exit(1)
@@ -54,17 +160,18 @@ async def main() -> None:
     logger.info("Order type : GTC limit  |  tick offset: %.4f  |  TTL: %ds",
                 config.LIMIT_TICK_OFFSET, config.LIMIT_ORDER_TTL_SEC)
     logger.info("Poll       : every %ds", config.POLL_INTERVAL_SEC)
+    logger.info("Dashboard  : http://0.0.0.0:%d", PORT)
     logger.info("=" * 60)
 
     state.running = True
 
-    # Register SIGTERM/SIGINT for graceful Render shutdown
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT,  handle_shutdown)
 
     await asyncio.gather(
         services.monitor_loop(),
         status_printer(),
+        run_webserver(),
     )
 
     logger.info("Bot stopped cleanly.")
