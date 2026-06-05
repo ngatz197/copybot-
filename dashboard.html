@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PolyCopyTrader</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg:         #0d0f14;
+            --surface:    #151820;
+            --surface2:   #1c2030;
+            --border:     #252a38;
+            --text:       #e2e8f0;
+            --muted:      #6b7280;
+            --green:      #10b981;
+            --red:        #ef4444;
+            --orange:     #f97316;
+            --blue:       #3b82f6;
+            --purple:     #8b5cf6;
+            --label-size: 11px;
+        }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 14px;
+            min-height: 100vh;
+        }
+
+        /* ── Top bar ── */
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 24px;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+        }
+        .topbar-left { display: flex; align-items: center; gap: 12px; }
+        .logo { font-size: 18px; font-weight: 700; color: var(--text); }
+        .logo span { color: var(--blue); }
+        .meta { font-size: 12px; color: var(--muted); }
+        .badges { display: flex; gap: 8px; }
+        .badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+        }
+        .badge-dry    { background: #1e3a5f; color: #60a5fa; border: 1px solid #2563eb44; }
+        .badge-live   { background: #1a3320; color: #34d399; border: 1px solid #10b98144; }
+        .badge-paused { background: #3b1f1f; color: #f87171; border: 1px solid #ef444444; }
+        .badge-run    { background: #1a3320; color: #34d399; border: 1px solid #10b98144; }
+        .badge-ws     { background: #2d1f4e; color: #a78bfa; border: 1px solid #8b5cf644; }
+
+        /* ── Main layout ── */
+        .main { padding: 20px 24px; }
+
+        /* ── Metric grid ── */
+        .metrics-row {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        .metrics-row-2 {
+            display: grid;
+            grid-template-columns: 1fr 4fr;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px 18px;
+        }
+        .card-label {
+            font-size: var(--label-size);
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            margin-bottom: 8px;
+        }
+        .card-value {
+            font-size: 26px;
+            font-weight: 700;
+            line-height: 1;
+            margin-bottom: 6px;
+        }
+        .card-sub { font-size: 12px; color: var(--muted); }
+        .green  { color: var(--green); }
+        .red    { color: var(--red); }
+        .orange { color: var(--orange); }
+        .white  { color: var(--text); }
+
+        /* ── Chart card ── */
+        .chart-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px 18px;
+        }
+        .chart-card h3 {
+            font-size: 12px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            margin-bottom: 12px;
+        }
+
+        /* ── Section ── */
+        .section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            margin-bottom: 16px;
+            overflow: hidden;
+        }
+        .section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--border);
+        }
+        .section-title {
+            font-size: var(--label-size);
+            font-weight: 700;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+        }
+        .count-badge {
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 2px 10px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        /* ── Table ── */
+        table { width: 100%; border-collapse: collapse; }
+        thead tr { border-bottom: 1px solid var(--border); }
+        th {
+            padding: 10px 18px;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            text-align: left;
+        }
+        td {
+            padding: 12px 18px;
+            font-size: 13px;
+            border-bottom: 1px solid var(--border)44;
+            vertical-align: middle;
+        }
+        tbody tr:last-child td { border-bottom: none; }
+        tbody tr:hover { background: var(--surface2); }
+
+        .source-tag {
+            display: inline-block;
+            background: #2d1f4e;
+            color: #a78bfa;
+            border-radius: 4px;
+            padding: 2px 7px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-right: 4px;
+        }
+        .source-tag.rest {
+            background: #1c2a1c;
+            color: #6ee7b7;
+        }
+        .outcome-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+        }
+        .outcome-yes { background: #10b98122; color: #34d399; border: 1px solid #10b98155; }
+        .outcome-no  { background: #ef444422; color: #f87171; border: 1px solid #ef444455; }
+
+        .empty-row td {
+            text-align: center;
+            color: var(--muted);
+            padding: 28px;
+            font-style: italic;
+        }
+
+        /* ── Wallet cards row ── */
+        .wallet-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .wallet-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px 18px;
+        }
+        .wallet-name {
+            font-size: 14px;
+            font-weight: 700;
+            margin-bottom: 10px;
+            color: var(--text);
+        }
+        .wallet-stats { display: flex; gap: 16px; margin-bottom: 10px; }
+        .wallet-stat-val { font-size: 16px; font-weight: 700; }
+        .wallet-stat-lbl { font-size: 11px; color: var(--muted); }
+    </style>
+</head>
+<body>
+
+<div class="topbar">
+    <div class="topbar-left">
+        <div>
+            <div class="logo">🤖 <span>Poly</span>CopyTrader</div>
+            <div class="meta" id="meta">Connecting…</div>
+        </div>
+    </div>
+    <div class="badges" id="badges"></div>
+</div>
+
+<div class="main">
+
+    <!-- Row 1: 5 metric cards -->
+    <div class="metrics-row" id="metrics-row"></div>
+
+    <!-- Row 2: Drawdown + PnL chart -->
+    <div class="metrics-row-2">
+        <div class="card" id="drawdown-card">
+            <div class="card-label">Drawdown</div>
+            <div class="card-value" id="dd-value">—</div>
+            <div class="card-sub" id="dd-sub">Max 20%</div>
+        </div>
+        <div class="chart-card">
+            <h3>Cumulative PnL</h3>
+            <canvas id="pnlChart" height="70"></canvas>
+        </div>
+    </div>
+
+    <!-- Open Positions -->
+    <div class="section">
+        <div class="section-header">
+            <span class="section-title">Open Positions</span>
+            <span class="count-badge" id="open-count">0</span>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Source</th>
+                    <th>Market</th>
+                    <th>Side</th>
+                    <th>Size</th>
+                    <th>Entry</th>
+                    <th>Current</th>
+                    <th>Unreal PnL</th>
+                </tr>
+            </thead>
+            <tbody id="positions-body"></tbody>
+        </table>
+    </div>
+
+    <!-- Closed Trades -->
+    <div class="section">
+        <div class="section-header">
+            <span class="section-title">Closed Trades</span>
+            <span class="count-badge" id="closed-count">0</span>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Source</th>
+                    <th>Outcome</th>
+                    <th>Entry</th>
+                    <th>Exit</th>
+                    <th>PnL</th>
+                </tr>
+            </thead>
+            <tbody id="closed-body"></tbody>
+        </table>
+    </div>
+
+    <!-- Per-wallet cards -->
+    <div class="wallet-row" id="wallet-row"></div>
+
+</div>
+
+<script>
+    let pnlChart = null;
+
+    function pnlClass(v) { return v >= 0 ? 'green' : 'red'; }
+    function pnlSign(v)  { return v >= 0 ? '+' : ''; }
+    function fmt(v, d=2) { return Number(v).toFixed(d); }
+    function fmtPnl(v)   { return `<span class="${pnlClass(v)}">${pnlSign(v)}$${fmt(v)}</span>`; }
+
+    function renderChart(history) {
+        const labels = history.map(([ts]) =>
+            new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        );
+        const values = history.map(([, v]) => v);
+        const color  = values.length && values[values.length-1] >= 0 ? '#10b981' : '#ef4444';
+
+        if (pnlChart) {
+            pnlChart.data.labels = labels;
+            pnlChart.data.datasets[0].data   = values;
+            pnlChart.data.datasets[0].borderColor     = color;
+            pnlChart.data.datasets[0].backgroundColor = color + '18';
+            pnlChart.update('none');
+        } else {
+            const ctx = document.getElementById('pnlChart').getContext('2d');
+            pnlChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [{
+                        data: values,
+                        borderColor: color,
+                        backgroundColor: color + '18',
+                        borderWidth: 2,
+                        pointRadius: 2,
+                        fill: true,
+                        tension: 0.3,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { callbacks: { label: c => '$' + c.parsed.y.toFixed(4) } }
+                    },
+                    scales: {
+                        x: { ticks: { color: '#6b7280', font: { size: 11 } }, grid: { color: '#252a38' } },
+                        y: { ticks: { color: '#6b7280', font: { size: 11 }, callback: v => '$'+v.toFixed(2) }, grid: { color: '#252a38' } }
+                    }
+                }
+            });
+        }
+    }
+
+    async function fetchData() {
+        try {
+            const res  = await fetch('/data');
+            const data = await res.json();
+
+            // ── Badges ───────────────────────────────────────────────────
+            document.getElementById('badges').innerHTML = `
+                <span class="badge ${data.dry_run ? 'badge-dry' : 'badge-live'}">
+                    ${data.dry_run ? 'DRY RUN' : 'LIVE'}
+                </span>
+                <span class="badge badge-ws">⚡ ${Object.keys(data.wallets||{}).length} WALLETS</span>
+            `;
+
+            // ── Meta line ────────────────────────────────────────────────
+            document.getElementById('meta').textContent =
+                `Updated ${new Date().toISOString().slice(0,19).replace('T',' ')} · Auto-refresh 15s`;
+
+            // ── Metric cards ─────────────────────────────────────────────
+            const vb    = data.virtual_balance;
+            const peak  = data.peak_balance || vb;
+            const tpnl  = data.total_pnl;
+            const upnl  = data.unrealised_pnl;
+            const rpnl  = data.realised_pnl;
+
+            document.getElementById('metrics-row').innerHTML = `
+                <div class="card">
+                    <div class="card-label">Total Balance</div>
+                    <div class="card-value ${pnlClass(vb)}">$${fmt(vb)}</div>
+                    <div class="card-sub">pUSD · Peak $${fmt(peak)}</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Compounding Bankroll</div>
+                    <div class="card-value ${pnlClass(vb)}">$${fmt(vb)}</div>
+                    <div class="card-sub">Sizing base · Rate 1%</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Total PnL</div>
+                    <div class="card-value ${pnlClass(tpnl)}">${pnlSign(tpnl)}$${fmt(tpnl)}</div>
+                    <div class="card-sub">Realised + Unrealised</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Unrealised</div>
+                    <div class="card-value ${pnlClass(upnl)}">${pnlSign(upnl)}$${fmt(upnl)}</div>
+                    <div class="card-sub">${data.open_count} open position(s)</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Realised</div>
+                    <div class="card-value white">$${fmt(rpnl, 4)}</div>
+                    <div class="card-sub">${data.total_closed||0} closed trade(s)</div>
+                </div>
+            `;
+
+            // ── Drawdown ─────────────────────────────────────────────────
+            const dd = data.drawdown || 0;
+            const ddEl = document.getElementById('dd-value');
+            ddEl.textContent = dd.toFixed(1) + '%';
+            ddEl.className   = 'card-value ' + (dd > 15 ? 'red' : dd > 8 ? 'orange' : 'green');
+
+            // ── Chart ────────────────────────────────────────────────────
+            renderChart(data.pnl_history || []);
+
+            // ── Open positions ───────────────────────────────────────────
+            const positions = data.positions || [];
+            document.getElementById('open-count').textContent = positions.length;
+            document.getElementById('positions-body').innerHTML = positions.length
+                ? positions.map(p => {
+                    const oc = p.outcome.toUpperCase() === 'YES' ? 'outcome-yes' : 'outcome-no';
+                    return `<tr>
+                        <td>
+                            <span class="source-tag">${p.wallet_label}</span>
+                            <span class="source-tag rest">rest</span>
+                        </td>
+                        <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                            ${p.market_question}
+                        </td>
+                        <td><span class="outcome-badge ${oc}">${p.outcome.toUpperCase()}</span></td>
+                        <td>$${fmt(p.size)}<br><span style="color:var(--muted);font-size:11px">${fmt(p.shares,4)} shares</span></td>
+                        <td>${fmt(p.entry_price, 3)}</td>
+                        <td>${fmt(p.current_price, 3)}</td>
+                        <td>${fmtPnl(p.unrealised_pnl)}</td>
+                    </tr>`;
+                }).join('')
+                : '<tr class="empty-row"><td colspan="7">No open positions</td></tr>';
+
+            // ── Closed trades ─────────────────────────────────────────────
+            const allClosed = Object.entries(data.wallets || {})
+                .flatMap(([lbl, w]) => (w.closed_trades||[]).map(t => ({...t, wallet_label: lbl})))
+                .sort((a,b) => 0); // preserve order
+
+            document.getElementById('closed-count').textContent = data.total_closed || 0;
+            document.getElementById('closed-body').innerHTML = allClosed.length
+                ? allClosed.map(t => {
+                    const oc = t.outcome.toUpperCase() === 'YES' ? 'outcome-yes' : 'outcome-no';
+                    return `<tr>
+                        <td><span class="source-tag">${t.wallet_label}</span></td>
+                        <td><span class="outcome-badge ${oc}">${t.outcome.toUpperCase()}</span></td>
+                        <td>${fmt(t.entry_price, 3)}</td>
+                        <td>${fmt(t.exit_price, 3)}</td>
+                        <td>${fmtPnl(t.pnl)}</td>
+                    </tr>`;
+                }).join('')
+                : '<tr class="empty-row"><td colspan="5">No closed trades yet</td></tr>';
+
+            // ── Per-wallet cards ─────────────────────────────────────────
+            document.getElementById('wallet-row').innerHTML =
+                Object.entries(data.wallets || {}).map(([name, w]) => `
+                    <div class="wallet-card">
+                        <div class="wallet-name">${name}</div>
+                        <div class="wallet-stats">
+                            <div>
+                                <div class="wallet-stat-val ${pnlClass(w.total_pnl)}">${pnlSign(w.total_pnl)}$${fmt(w.total_pnl)}</div>
+                                <div class="wallet-stat-lbl">PnL</div>
+                            </div>
+                            <div>
+                                <div class="wallet-stat-val">${w.win_rate}%</div>
+                                <div class="wallet-stat-lbl">Win Rate</div>
+                            </div>
+                            <div>
+                                <div class="wallet-stat-val green">${w.wins}W</div>
+                                <div class="wallet-stat-lbl">Wins</div>
+                            </div>
+                            <div>
+                                <div class="wallet-stat-val red">${w.losses}L</div>
+                                <div class="wallet-stat-lbl">Losses</div>
+                            </div>
+                            <div>
+                                <div class="wallet-stat-val">${w.open}</div>
+                                <div class="wallet-stat-lbl">Open</div>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+
+        } catch (e) {
+            console.error('Dashboard fetch error', e);
+        }
+    }
+
+    setInterval(fetchData, 15000);
+    fetchData();
+</script>
+</body>
+</html>
