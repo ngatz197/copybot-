@@ -278,22 +278,26 @@ def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
         market_id = raw.get("conditionId", raw.get("market", raw.get("condition_id", "")))
         outcome   = raw.get("outcome", "")
         tx_hash   = raw.get("transactionHash", raw.get("transaction_hash", ""))
-        timestamp = int(raw.get("timestamp", 0))
+        # Data API returns timestamp in milliseconds — normalise to seconds.
+        raw_ts    = int(raw.get("timestamp", 0))
+        timestamp = raw_ts // 1000 if raw_ts > 1_000_000_000_000 else raw_ts
         title     = raw.get("title", "")
         slug      = raw.get("slug", raw.get("eventSlug", ""))
 
         if size < config.MIN_SOURCE_TRADE_USDC:
             return None
         if not side or not token_id or not market_id:
+            logger.warning("parse_trade: missing field(s) — side=%r token_id=%r market_id=%r", side, token_id, market_id)
             return None
         if not config.COPY_EXITS and side == "SELL":
             return None
         if token_id in _dead_tokens:
             return None
-        # Reject trades older than 2× the poll interval — guards against the
+        # Reject trades older than 2x the poll interval — guards against the
         # Data API returning stale history when tAfter is unreliable.
         max_age = config.POLL_INTERVAL_SEC * 2
         if timestamp and (int(time.time()) - timestamp) > max_age:
+            logger.debug("parse_trade: skipping stale trade age=%ds tx=%s", int(time.time()) - timestamp, tx_hash)
             return None
 
         return PolyTrade(
