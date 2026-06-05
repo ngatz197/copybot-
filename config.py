@@ -19,8 +19,8 @@ SOURCE_WALLETS = {
 }
 
 # ── Your trading wallet (Polygon) ────────────────────────────────────────────
-MY_WALLET_ADDRESS     = os.getenv("MY_WALLET_ADDRESS", "")
-MY_WALLET_PRIVATE_KEY = os.getenv("MY_WALLET_PRIVATE_KEY", "")  # keep secret!
+DEPOSIT_WALLET_ADDRESS     = os.getenv("DEPOSIT_WALLET_ADDRESS", "")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")  # keep secret!
 
 # ── Trade sizing ─────────────────────────────────────────────────────────────
 TRADE_PCT        = 0.01    # 1% of wallet balance per trade — hardcoded
