@@ -59,7 +59,7 @@ class WalletStats:
     open:         int   = 0        # open positions attributed to this wallet
     closed_trades: list = field(default_factory=list)   # list[ClosedTrade] (last 5)
 
-MAX_POSITIONS = 8   # hard cap on concurrent open positions
+MAX_POSITIONS = 20  # hard cap on concurrent open positions
 
 @dataclass
 class BotState:
@@ -77,6 +77,8 @@ class BotState:
     # [(timestamp, cumulative_pnl), ...] for chart
     pnl_history:     list  = field(default_factory=list)
     total_pnl:       float = 0.0
+    realised_pnl:    float = 0.0   # sum of closed trade PnL
+    peak_balance:    float = 0.0   # highest virtual_balance seen, for drawdown calc
     # Real on-chain USDC balance (refreshed every poll cycle)
     real_balance:    float = 0.0
     # Virtual balance: starts equal to real balance at boot, then tracks
@@ -418,22 +420,30 @@ def update_position(trade: PolyTrade, size_usdc: float) -> None:
 
     if trade.side == "BUY":
         existing = state.positions.get(key)
+        shares = round(size_usdc / trade.price, 4) if trade.price else 0
         if existing is None:
             state.positions[key] = {
-                "size": size_usdc,
-                "entry_price": trade.price,
-                "wallet_label": trade.wallet_label,
+                "size":            size_usdc,
+                "entry_price":     trade.price,
+                "wallet_label":    trade.wallet_label,
+                "outcome":         trade.outcome,
+                "market_question": trade.market_question,
+                "shares":          shares,
+                "token_id":        trade.token_id,
             }
             ws.open += 1
         else:
-            # Average into existing position
             total = existing["size"] + size_usdc
             existing["entry_price"] = (
                 existing["entry_price"] * existing["size"] + trade.price * size_usdc
             ) / total
-            existing["size"] = total
+            existing["size"]   = total
+            existing["shares"] = existing.get("shares", 0) + shares
         # Deduct cost from virtual balance
         state.virtual_balance = max(0.0, state.virtual_balance - size_usdc)
+        # Update peak
+        total_value = state.virtual_balance + sum(p["size"] for p in state.positions.values())
+        state.peak_balance = max(state.peak_balance, total_value)
     else:
         existing = state.positions.pop(key, None)
         if existing:
@@ -445,7 +455,8 @@ def update_position(trade: PolyTrade, size_usdc: float) -> None:
             proceeds = existing["size"] + pnl
             state.virtual_balance = round(state.virtual_balance + proceeds, 2)
 
-            state.total_pnl += pnl
+            state.total_pnl      += pnl
+            state.realised_pnl   += pnl
             state.pnl_history.append((int(time.time()), round(state.total_pnl, 2)))
 
             ct = ClosedTrade(
@@ -553,6 +564,7 @@ async def monitor_loop() -> None:
     real = await asyncio.get_event_loop().run_in_executor(None, fetch_wallet_usdc_balance)
     state.real_balance    = round(real, 2)
     state.virtual_balance = round(real, 2)
+    state.peak_balance    = round(real, 2)
     state.balance_seeded  = True
     logger.info(
         "Balances seeded — real: $%.2f  virtual: $%.2f",
@@ -584,13 +596,51 @@ async def monitor_loop() -> None:
                     if trade:
                         await process_trade(client, trade)
 
+            # Refresh current prices for open positions (unrealised PnL)
+            for key, pos in list(state.positions.items()):
+                token_id = key.split(":")[0] if ":" in key else ""
+                # token_id is stored in the position if available
+                tid = pos.get("token_id", "")
+                if tid and tid not in _dead_tokens:
+                    book = await fetch_order_book(client, tid)
+                    mid  = best_ask(book) or best_bid(book)
+                    if mid:
+                        pos["current_price"] = mid
+
             last_poll = now
             await asyncio.sleep(config.POLL_INTERVAL_SEC)
 
     logger.info("Monitor stopped.")
 
 
-# ── Status summary ────────────────────────────────────────────────────────────
+# ── Dashboard helpers ─────────────────────────────────────────────────────────
+
+def get_positions_payload() -> list[dict]:
+    """
+    Return open positions enriched with unrealised PnL.
+    Uses last known entry price as proxy for current value when no live price available.
+    Live prices are fetched asynchronously by the monitor loop and stored in the position.
+    """
+    rows = []
+    for key, pos in state.positions.items():
+        entry   = pos["entry_price"]
+        current = pos.get("current_price", entry)   # falls back to entry if not yet refreshed
+        shares  = pos.get("shares", round(pos["size"] / entry, 4) if entry else 0)
+        unreal  = round((current - entry) * shares, 4)
+        rows.append({
+            "key":              key,
+            "market_question":  pos.get("market_question", key),
+            "outcome":          pos.get("outcome", ""),
+            "wallet_label":     pos.get("wallet_label", ""),
+            "size":             round(pos["size"], 4),
+            "shares":           shares,
+            "entry_price":      round(entry, 4),
+            "current_price":    round(current, 4),
+            "unrealised_pnl":   unreal,
+        })
+    return rows
+
+
 
 def get_status_text() -> str:
     mode   = "DRY RUN" if config.DRY_RUN else "LIVE"
