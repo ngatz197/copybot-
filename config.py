@@ -45,7 +45,7 @@ COPY_EXITS            = os.getenv("COPY_EXITS", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 # ── Polygon RPC ───────────────────────────────────────────────────────────────
-POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://rpc.ankr.com/polygon")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
