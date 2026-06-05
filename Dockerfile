@@ -12,5 +12,8 @@ COPY . .
 # Expose the health check port
 ENV PORT=8080
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/data')"
+
 # Run the bot
 CMD ["python", "bot.py"]
