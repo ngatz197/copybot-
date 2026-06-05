@@ -148,7 +148,7 @@ async def main() -> None:
             sys.exit(1)
         if not _have_explicit_creds:
             logger.info(
-                "CLOB_API_KEY / CLOB_SECRET / CLOB_PASSPHRASE not set — "
+                "POLY_API_KEY / POLY_SECRET / POLY_PASSPHRASE not set — "
                 "L2 credentials will be derived from PRIVATE_KEY at startup."
             )
 
@@ -159,7 +159,7 @@ async def main() -> None:
         config.CLOB_PASSPHRASE,
     ])
     auth_mode = (
-        "L2 via env vars (CLOB_API_KEY)" if _have_explicit_creds
+        "L2 via env vars (POLY_API_KEY)" if _have_explicit_creds
         else "L2 derived from PRIVATE_KEY"
     )
     logger.info("=" * 60)
