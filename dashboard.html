@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Wallet CopyTrader Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg: #f8f7f4;
+            --card: #ffffff;
+            --text: #1f1f1f;
+            --accent: #3b82f6;
+        }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+        .topbar {
+            background: white;
+            padding: 15px 25px;
+            border-bottom: 1px solid #e5e5e5;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 15px;
+            padding: 20px;
+        }
+        .metric-card {
+            background: var(--card);
+            border-radius: 12px;
+            padding: 18px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        .metric-label {
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .metric-value {
+            font-size: 28px;
+            font-weight: 600;
+            margin-top: 8px;
+        }
+        .positive { color: #10b981; }
+        .negative { color: #ef4444; }
+        .wallet-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+            gap: 20px;
+            padding: 0 20px 20px;
+        }
+        .wallet-card {
+            background: var(--card);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        .wallet-card h3 {
+            margin: 0 0 12px 0;
+            font-size: 16px;
+        }
+        .wallet-card ul {
+            padding-left: 16px;
+            margin: 8px 0 0 0;
+            font-size: 13px;
+        }
+        .wallet-card li {
+            margin-bottom: 4px;
+            color: #444;
+        }
+        .chart-container {
+            background: var(--card);
+            border-radius: 12px;
+            padding: 20px;
+            margin: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        h1 { margin: 0; font-size: 20px; }
+        h2 { margin: 0 0 16px 0; font-size: 16px; }
+        h4 { margin: 12px 0 4px 0; font-size: 13px; color: #555; }
+        .last-updated { font-size: 13px; color: #888; }
+        .no-trades { font-size: 13px; color: #aaa; font-style: italic; }
+    </style>
+</head>
+<body>
+    <div class="topbar">
+        <h1>Multi-Wallet CopyTrader Dashboard</h1>
+        <div class="last-updated" id="last-updated">Last updated: just now</div>
+    </div>
+
+    <div class="metrics" id="metrics">
+        <!-- Populated by JS -->
+    </div>
+
+    <div class="chart-container">
+        <h2>Cumulative PnL</h2>
+        <canvas id="pnlChart" height="120"></canvas>
+    </div>
+
+    <div class="wallet-grid" id="wallet-grid">
+        <!-- Populated by JS -->
+    </div>
+
+    <script>
+        let pnlChart = null;
+
+        function formatPrice(p) {
+            return (p * 100).toFixed(1) + '¢';
+        }
+
+        function renderChart(pnlHistory) {
+            const labels = pnlHistory.map(([ts]) =>
+                new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            );
+            const values = pnlHistory.map(([, v]) => v);
+
+            if (pnlChart) {
+                pnlChart.data.labels = labels;
+                pnlChart.data.datasets[0].data = values;
+                pnlChart.update();
+            } else {
+                const ctx = document.getElementById('pnlChart').getContext('2d');
+                pnlChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels,
+                        datasets: [{
+                            label: 'Cumulative PnL ($)',
+                            data: values,
+                            borderColor: '#3b82f6',
+                            backgroundColor: 'rgba(59,130,246,0.08)',
+                            borderWidth: 2,
+                            pointRadius: 3,
+                            fill: true,
+                            tension: 0.3,
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: {
+                                callbacks: {
+                                    label: ctx => '$' + ctx.parsed.y.toFixed(2)
+                                }
+                            }
+                        },
+                        scales: {
+                            y: {
+                                ticks: {
+                                    callback: v => '$' + v.toFixed(2)
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        async function fetchData() {
+            try {
+                const res = await fetch('/data');
+                const data = await res.json();
+
+                // ── Main metrics ──────────────────────────────────────────
+                document.getElementById('metrics').innerHTML = `
+                    <div class="metric-card">
+                        <div class="metric-label">Balance</div>
+                        <div class="metric-value">$${data.bankroll.toFixed(2)}</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Total PnL</div>
+                        <div class="metric-value ${data.total_pnl >= 0 ? 'positive' : 'negative'}">
+                            ${data.total_pnl >= 0 ? '+' : ''}$${data.total_pnl.toFixed(2)}
+                        </div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Win Rate</div>
+                        <div class="metric-value">${data.win_rate}%</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Open Positions</div>
+                        <div class="metric-value">${data.open_count}/${data.max_positions || 8}</div>
+                    </div>
+                `;
+
+                // ── PnL chart ─────────────────────────────────────────────
+                renderChart(data.pnl_history || []);
+
+                // ── Per-wallet cards ──────────────────────────────────────
+                const wallets = data.wallets || {};
+                document.getElementById('wallet-grid').innerHTML =
+                    Object.entries(wallets).map(([name, w]) => {
+                        const trades = w.closed_trades || [];
+                        const tradeRows = trades.length
+                            ? trades.map(t => {
+                                const pnlClass = t.pnl >= 0 ? 'positive' : 'negative';
+                                const sign = t.pnl >= 0 ? '+' : '';
+                                return `<li>
+                                    ${t.outcome}
+                                    &nbsp;|&nbsp; ${formatPrice(t.entry_price)} → ${formatPrice(t.exit_price)}
+                                    &nbsp;|&nbsp; <strong class="${pnlClass}">${sign}$${t.pnl.toFixed(2)}</strong>
+                                </li>`;
+                            }).join('')
+                            : '<li class="no-trades">No closed trades yet</li>';
+
+                        const pnlClass = w.total_pnl >= 0 ? 'positive' : 'negative';
+                        const pnlSign  = w.total_pnl >= 0 ? '+' : '';
+
+                        return `
+                        <div class="wallet-card">
+                            <h3>${name}</h3>
+                            <p>
+                                <strong>PnL:</strong>
+                                <span class="${pnlClass}">${pnlSign}$${Number(w.total_pnl).toFixed(2)}</span>
+                            </p>
+                            <p><strong>Win Rate:</strong> ${w.win_rate}% (${w.wins}W / ${w.losses}L)</p>
+                            <p><strong>Open positions:</strong> ${w.open}</p>
+                            <h4>Last Closed Trades</h4>
+                            <ul>${tradeRows}</ul>
+                        </div>`;
+                    }).join('');
+
+                // ── Timestamp ─────────────────────────────────────────────
+                document.getElementById('last-updated').textContent =
+                    'Last updated: ' + new Date().toLocaleTimeString();
+
+            } catch (e) {
+                console.error('Failed to fetch dashboard data', e);
+            }
+        }
+
+        // Auto-refresh every 30 seconds
+        setInterval(fetchData, 30000);
+        fetchData(); // Initial load
+    </script>
+</body>
+</html>
