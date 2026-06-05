@@ -269,15 +269,10 @@ def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
             return None
         if token_id in _dead_tokens:
             return None
-        # Reject trades older than 4x the poll interval (min 120 s) — guards
-        # against the Data API returning stale history when tAfter is unreliable,
-        # while still tolerating API latency spikes and brief bot restarts.
-        max_age = max(120, config.POLL_INTERVAL_SEC * 4)
+        # Reject trades older than 2× the poll interval — guards against the
+        # Data API returning stale history when tAfter is unreliable.
+        max_age = config.POLL_INTERVAL_SEC * 2
         if timestamp and (int(time.time()) - timestamp) > max_age:
-            logger.info(
-                "Skipping stale trade (age %ds > %ds) tx=%s market=%s",
-                int(time.time()) - timestamp, max_age, tx_hash[:10], title or market_id[:20],
-            )
             return None
 
         return PolyTrade(
@@ -360,27 +355,25 @@ async def place_limit_order(
         )
         return {"status": "dry_run", "order_id": order_id, "price": limit_price, "shares": shares}
 
-    # ── LIVE (uncomment when DRY_RUN=false) ──────────────────────────────────
-    # from py_clob_client_v2.client import ClobClient
-    # from py_clob_client_v2.clob_types import OrderArgs, OrderType
-    #
-    # clob = ClobClient(
-    #     host=config.POLYMARKET_CLOB_API,
-    #     key=config.PRIVATE_KEY,
-    #     chain_id=137,
-    # )
-    # order_args = OrderArgs(
-    #     token_id=trade.token_id,
-    #     price=limit_price,
-    #     size=shares,
-    #     side=trade.side,
-    #     order_type=OrderType.GTC,   # Good-Till-Cancelled limit order
-    # )
-    # resp = clob.create_and_post_order(order_args)
-    # return resp
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── LIVE ─────────────────────────────────────────────────────────────────
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType
 
-    raise RuntimeError("Set DRY_RUN=false and uncomment py-clob-client to go live.")
+    clob = ClobClient(
+        host=config.POLYMARKET_CLOB_API,
+        key=config.PRIVATE_KEY,
+        chain_id=137,
+    )
+    order_args = OrderArgs(
+        token_id=trade.token_id,
+        price=limit_price,
+        size=shares,
+        side=trade.side,
+        order_type=OrderType.GTC,   # Good-Till-Cancelled limit order
+    )
+    resp = clob.create_and_post_order(order_args)
+    return resp
+    # ─────────────────────────────────────────────────────────────────────────
 
 
 async def cancel_order(client: httpx.AsyncClient, order_id: str) -> None:
@@ -587,48 +580,40 @@ async def monitor_loop() -> None:
     last_balance_poll = 0
 
     async with httpx.AsyncClient() as client:
-        watchdog_task = asyncio.create_task(ttl_watchdog(client))
+        asyncio.create_task(ttl_watchdog(client))
 
-        try:
-            while state.running:
-                now = int(time.time())
+        while state.running:
+            now = int(time.time())
 
-                # Refresh real balance every 5 minutes (non-blocking)
-                if now - last_balance_poll >= 300:
-                    real = await asyncio.get_event_loop().run_in_executor(
-                        None, fetch_wallet_usdc_balance
-                    )
-                    state.real_balance = round(real, 2)
-                    last_balance_poll  = now
-                    logger.debug("Real balance refreshed: $%.2f", state.real_balance)
+            # Refresh real balance every 5 minutes (non-blocking)
+            if now - last_balance_poll >= 300:
+                real = await asyncio.get_event_loop().run_in_executor(
+                    None, fetch_wallet_usdc_balance
+                )
+                state.real_balance = round(real, 2)
+                last_balance_poll  = now
+                logger.debug("Real balance refreshed: $%.2f", state.real_balance)
 
-                for lbl, wallet in config.SOURCE_WALLETS.items():
-                    raw_trades = await fetch_wallet_trades(client, wallet, last_poll)
-                    for raw in raw_trades:
-                        trade = parse_trade(raw, wallet)
-                        if trade:
-                            await process_trade(client, trade)
+            for lbl, wallet in config.SOURCE_WALLETS.items():
+                raw_trades = await fetch_wallet_trades(client, wallet, last_poll)
+                for raw in raw_trades:
+                    trade = parse_trade(raw, wallet)
+                    if trade:
+                        await process_trade(client, trade)
 
-                # Refresh current prices for open positions (unrealised PnL)
-                for key, pos in list(state.positions.items()):
-                    token_id = key.split(":")[0] if ":" in key else ""
-                    # token_id is stored in the position if available
-                    tid = pos.get("token_id", "")
-                    if tid and tid not in _dead_tokens:
-                        book = await fetch_order_book(client, tid)
-                        mid  = best_ask(book) or best_bid(book)
-                        if mid:
-                            pos["current_price"] = mid
+            # Refresh current prices for open positions (unrealised PnL)
+            for key, pos in list(state.positions.items()):
+                token_id = key.split(":")[0] if ":" in key else ""
+                # token_id is stored in the position if available
+                tid = pos.get("token_id", "")
+                if tid and tid not in _dead_tokens:
+                    book = await fetch_order_book(client, tid)
+                    mid  = best_ask(book) or best_bid(book)
+                    if mid:
+                        pos["current_price"] = mid
 
-                last_poll = now
-                await asyncio.sleep(config.POLL_INTERVAL_SEC)
-
-        finally:
-            watchdog_task.cancel()
-            try:
-                await watchdog_task
-            except asyncio.CancelledError:
-                pass
+            last_poll = now
+            await asyncio.sleep(config.POLL_INTERVAL_SEC)
 
     logger.info("Monitor stopped.")
 
