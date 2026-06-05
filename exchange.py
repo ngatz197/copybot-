@@ -2,10 +2,13 @@
 import os
 import time
 import json
+import hmac
+import hashlib
+import base64
 import logging
 import asyncio
 import requests
-from typing import Tuple, Optional, Set, Callable, Awaitable
+from typing import Tuple, Optional, Set, Callable
 import config as cfg
 
 # ==================== OPTIONAL DEPENDENCIES ====================
@@ -53,7 +56,6 @@ class RobustBalanceManager:
         if self.dry_run:
             return self.cached_balance
 
-        # Fallback query pattern utilizing network-safe Polygon RPC endpoints
         url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
         payload = {
             "jsonrpc": "2.0",
@@ -176,7 +178,6 @@ class PolymarketWSListener:
         self.ws_price_queue = ws_price_queue
         self.on_trade_callback = on_trade_callback
         self.on_order_placed_callback = on_order_placed_callback
-        # FIXED: Relocated handshake address from standard API sub-domains to dedicated subscription stream URL
         self.uri = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
         self._ws = None
 
@@ -191,16 +192,13 @@ class PolymarketWSListener:
                 async with websockets.connect(self.uri) as ws:
                     self._ws = ws
                     
-                    # Authenticated network handshake subscription configuration mapping
-                    initial_subs = ["trades"]
                     sub_payload = {
                         "type": "subscribe",
-                        "channels": initial_subs
+                        "channels": ["trades"]
                     }
                     await ws.send(json.dumps(sub_payload))
-                    logging.info(f"WebSocket interface handshakes complete. Base channels globally subscribed: {initial_subs}")
+                    logging.info("WebSocket interface handshakes complete. Base market channels globally subscribed.")
 
-                    # Automatically re-subscribe to any tokens tracked across active runtime
                     for token in list(self.token_ids):
                         await self.subscribe_token(token)
 
@@ -233,7 +231,6 @@ class PolymarketWSListener:
         except json.JSONDecodeError:
             return
 
-        # Distribute messages sequentially to parser hooks depending on message type context
         if isinstance(data, list):
             events = data
         else:
@@ -242,11 +239,8 @@ class PolymarketWSListener:
         for ev in events:
             ev_type = (ev.get("event_type") or ev.get("type") or "").lower()
             
-            # 1. Process active market order events
             if ev_type in ("trade", "trades"):
                 await self._process_trade_event(ev)
-            
-            # 2. Process real-time price updates inside internal queues
             elif ev_type in ("book", "price_change"):
                 token_id = ev.get("token_id") or ev.get("asset_id") or ""
                 if token_id:
@@ -268,12 +262,11 @@ class PolymarketWSListener:
 class PolymarketUserChannelListener:
     def __init__(self, on_fill_callback: Callable):
         self.on_fill_callback = on_fill_callback
-        # FIXED: Relocated private account update listener address to dedicated user stream channel URL
         self.uri = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
         self._ws = None
 
     async def run(self):
-        if not WEBSOCKETS_AVAILABLE or not POLY_API_KEY:
+        if not WEBSOCKETS_AVAILABLE or not POLY_API_KEY or not POLY_SECRET:
             logging.info("Private operational key configurations not initialized. User Channel listener going dormant.")
             return
 
@@ -283,22 +276,44 @@ class PolymarketUserChannelListener:
                 async with websockets.connect(self.uri) as ws:
                     self._ws = ws
                     
-                    # Private account endpoints require an authenticated challenge payload frame
                     timestamp = str(int(time.time()))
+                    
+                    # 1. Compute L2 HMAC Signature Protocol mapping for WebSockets
+                    sig_payload = f"{timestamp}GET/ws/user"
+                    secret_bytes = base64.b64decode(POLY_SECRET) if isinstance(POLY_SECRET, str) else POLY_SECRET
+                    
+                    try:
+                        signature = hmac.new(
+                            secret_bytes, 
+                            sig_payload.encode(), 
+                            hashlib.sha256
+                        ).digest()
+                        encoded_sig = base64.b64encode(signature).decode()
+                    except Exception as sig_err:
+                        logging.error(f"Failed to sign user stream credentials cryptographically: {sig_err}")
+                        await asyncio.sleep(10)
+                        continue
+
+                    # 2. Strict Object structure framing with nested 'auth' context mapping
                     auth_payload = {
                         "type": "subscribe",
-                        "channels": ["orders", "user"],
-                        "apiKey": POLY_API_KEY,
-                        "passphrase": POLY_PASSPHRASE,
-                        "timestamp": timestamp,
+                        "channels": ["user"],
+                        "auth": {
+                            "apiKey": POLY_API_KEY,
+                            "passphrase": POLY_PASSPHRASE,
+                            "timestamp": int(timestamp),
+                            "signature": encoded_sig
+                        }
                     }
+                    
                     await ws.send(json.dumps(auth_payload))
-                    logging.info("Private workspace authorization context transmitted securely to user endpoint.")
+                    logging.info("Private workspace authorization context transmitted securely via nested auth matrix structure.")
 
                     async for message in ws:
                         await self._handle_message(message)
+                        
             except Exception as err:
-                logging.debug(f"[USER-WS] Infrastructure drop encountered: {err}. Attempting reconnection in 10 seconds...")
+                logging.error(f"[USER-WS] Connection dropped or authentication rejected: {err}. Reconnecting in 10 seconds...")
                 self._ws = None
                 await asyncio.sleep(10)
 
