@@ -78,6 +78,10 @@ class BotState:
 
 state = BotState()
 
+# Token IDs that returned 404 from the CLOB — market resolved/delisted.
+# Skip immediately on future polls instead of making a wasted HTTP call.
+_dead_tokens: set[str] = set()
+
 def _wallet_stats(label: str) -> WalletStats:
     """Return (creating if needed) the WalletStats for a wallet label."""
     if label not in state.wallet_stats:
@@ -136,14 +140,36 @@ async def fetch_order_book(
     client: httpx.AsyncClient,
     token_id: str,
 ) -> dict:
-    """Return raw order book dict with 'bids' and 'asks' lists."""
+    """Return raw order book dict with 'bids' and 'asks' lists.
+
+    Returns an empty dict on any error.  404 responses are treated as
+    permanently dead markets: the token_id is added to ``_dead_tokens``
+    so subsequent polls skip the HTTP call entirely.
+    """
+    if token_id in _dead_tokens:
+        return {}
+
     url = f"{config.POLYMARKET_CLOB_API}/book"
     try:
         r = await client.get(url, params={"token_id": token_id}, timeout=10)
+        if r.status_code == 404:
+            _dead_tokens.add(token_id)
+            logger.info(
+                "Order book 404 — market resolved/delisted, token cached as dead: …%s",
+                token_id[-12:],
+            )
+            return {}
         r.raise_for_status()
         return r.json()
+    except httpx.HTTPStatusError:
+        # Already handled 404 above; other 4xx/5xx — log and move on
+        logger.warning(
+            "fetch_order_book HTTP error for token …%s: %s %s",
+            token_id[-12:], r.status_code, r.reason_phrase,
+        )
+        return {}
     except Exception as e:
-        logger.warning("fetch_order_book(%s): %s", token_id, e)
+        logger.warning("fetch_order_book(…%s): %s", token_id[-12:], e)
         return {}
 
 
@@ -219,6 +245,8 @@ def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
         if not side or not token_id or not market_id:
             return None
         if not config.COPY_EXITS and side == "SELL":
+            return None
+        if token_id in _dead_tokens:
             return None
 
         return PolyTrade(
@@ -426,7 +454,18 @@ async def process_trade(client: httpx.AsyncClient, trade: PolyTrade) -> None:
     # Fetch current order book
     book = await fetch_order_book(client, trade.token_id)
     if not book:
-        logger.warning("Empty order book for token %s — skipping", trade.token_id)
+        if trade.token_id in _dead_tokens:
+            logger.debug(
+                "Skipping %s — market resolved/delisted (token …%s)",
+                trade.market_question or trade.market_id[:20],
+                trade.token_id[-12:],
+            )
+        else:
+            logger.warning(
+                "Empty order book for token …%s — skipping %s",
+                trade.token_id[-12:],
+                trade.market_question or trade.market_id[:20],
+            )
         state.total_skipped += 1
         return
 
