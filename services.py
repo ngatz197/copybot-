@@ -98,13 +98,14 @@ async def fetch_wallet_trades(
     wallet: str,
     since_ts: int,
 ) -> list[dict]:
-    # Gamma API: public, no auth required.
-    # GET /trades?maker_address=<address>&after=<iso-ts>&limit=50
-    url = f"{config.POLYMARKET_GAMMA_API}/trades"
+    # Data API: fully public, no auth required.
+    # GET /activity?user=<address>&type=TRADE&start=<ts_seconds>&limit=50
+    url = "https://data-api.polymarket.com/activity"
     params = {
-        "maker_address": wallet,
-        "after":         since_ts,
-        "limit":         50,
+        "user":  wallet,
+        "type":  "TRADE",
+        "start": since_ts,
+        "limit": 50,
     }
     try:
         r = await client.get(url, params=params, timeout=10)
@@ -188,14 +189,22 @@ def fetch_wallet_usdc_balance() -> float:
 
 def parse_trade(raw: dict, wallet: str) -> Optional[PolyTrade]:
     try:
-        # CLOB API field names
-        side      = raw.get("side", "").upper()                          # BUY / SELL
-        size      = float(raw.get("size", raw.get("usdcSize", 0)))       # shares or usdc
-        price     = float(raw.get("price", 0))
-        token_id  = raw.get("asset_id", raw.get("asset", ""))            # outcome token ID
-        market_id = raw.get("market", raw.get("condition_id", ""))
+        # Data API field names (data-api.polymarket.com/activity)
+        # side: "BUY" or "SELL"
+        # asset: outcome token ID
+        # conditionId: market/condition ID
+        # size: USDC size
+        # price: fill price (0–1)
+        # outcome: "Yes" / "No"
+        # transactionHash: on-chain tx
+        # timestamp: unix seconds
+        side      = raw.get("side", "").upper()
+        size      = float(raw.get("size", raw.get("usdcSize", 0)))
+        price     = float(raw.get("price", raw.get("avgPrice", 0)))
+        token_id  = raw.get("asset", raw.get("asset_id", ""))
+        market_id = raw.get("conditionId", raw.get("market", raw.get("condition_id", "")))
         outcome   = raw.get("outcome", "")
-        tx_hash   = raw.get("transaction_hash", raw.get("transactionHash", ""))
+        tx_hash   = raw.get("transactionHash", raw.get("transaction_hash", ""))
         timestamp = int(raw.get("timestamp", 0))
 
         if size < config.MIN_SOURCE_TRADE_USDC:
