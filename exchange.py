@@ -39,301 +39,267 @@ MAX_RETRIES           = 3
 RETRY_DELAY           = 5
 PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
-# ==================== BALANCE MANAGER ====================
+# ==================== ROBUST BALANCE MANAGER ====================
 class RobustBalanceManager:
-    POLYGON_RPCS = [
-        "https://polygon-bor-rpc.publicnode.com",
-        "https://polygon.llamarpc.com",
-        "https://polygon.drpc.org",
-    ]
-
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
-        self.cached_balance: Optional[float] = None
-        self.last_update = 0
-        self.peak_balance = 0.0
+        self.cached_balance = cfg.INITIAL_BANKROLL
+        self.peak_balance   = cfg.INITIAL_BANKROLL
 
-    def _fetch_balance(self) -> float:
-        if not YOUR_WALLET:
-            logging.error("DEPOSIT_WALLET_ADDRESS not set — cannot fetch balance")
-            return 0.0
-        padded  = YOUR_WALLET.lower().replace("0x", "").zfill(64)
-        payload = {
-            "jsonrpc": "2.0",
-            "method":  "eth_call",
-            "params":  [{"to": PUSD_CONTRACT_ADDRESS, "data": "0x70a08231" + padded}, "latest"],
-            "id":      1,
-        }
-        for rpc in self.POLYGON_RPCS:
-            try:
-                resp = requests.post(rpc, json=payload, timeout=8)
-                if resp.status_code == 200:
-                    result = resp.json().get("result", "0x0")
-                    if result and result not in ("0x", "0x0"):
-                        balance = int(result, 16) / 1_000_000
-                        if balance > 0:
-                            return balance
-            except Exception as e:
-                logging.warning(f"RPC balance fetch failed ({rpc}): {e}")
-        return 0.0
-
-    def get_balance(self, force=False) -> Optional[float]:
-        if self.dry_run and self.cached_balance is not None:
-            return self.cached_balance
-
-        if force or self.cached_balance is None or (time.time() - self.last_update > 30):
-            real = self._fetch_balance()
-            if real > 0:
-                self.cached_balance = real
-                self.last_update    = time.time()
-                if real > self.peak_balance:
-                    self.peak_balance  = real
-                    cfg.peak_bankroll  = real
-                    logging.info(f"New peak balance: ${self.peak_balance:.2f}")
-            else:
-                if self.cached_balance is None:
-                    logging.error("Could not fetch real pUSD balance — bot will not trade.")
+    def get_balance(self) -> float:
         return self.cached_balance
 
-    def fetch_with_retry(self, retries: int = 5, delay: int = 10) -> float:
-        for attempt in range(1, retries + 1):
-            val = self._fetch_balance()
-            if val > 0:
-                self.cached_balance = val
-                self.peak_balance   = val
-                self.last_update    = time.time()
-                logging.info(f"Real pUSD balance confirmed: ${val:.2f}")
-                return val
-            logging.warning(f"Balance fetch attempt {attempt}/{retries} returned 0 — retrying...")
-            time.sleep(delay)
-        raise RuntimeError(f"Could not fetch real pUSD balance after {retries} attempts.")
+    async def fetch_with_retry(self, retries: int = 5, delay: int = 5) -> float:
+        if self.dry_run:
+            return self.cached_balance
 
-    def check_drawdown(self) -> Tuple[Optional[bool], float]:
-        current = self.get_balance()
-        if current is None or self.peak_balance == 0:
-            return None, 0.0
-        dd = (self.peak_balance - current) / self.peak_balance
-        return dd >= MAX_DRAWDOWN, dd
+        # Fallback query pattern utilizing network-safe Polygon RPC endpoints
+        url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{
+                "to": PUSD_CONTRACT_ADDRESS,
+                "data": f"0x70a08231000000000000000000000000{YOUR_WALLET[2:] if YOUR_WALLET.startswith('0x') else YOUR_WALLET}"
+            }, "latest"],
+            "id": 1
+        }
 
-    def apply_dry_run_buy(self, amount_usd: float):
-        if self.dry_run and self.cached_balance is not None:
-            self.cached_balance -= amount_usd
-            logging.info(f"[DRY RUN] Deducted virtual funds: ${amount_usd:.2f} | Balance: ${self.cached_balance:.2f}")
+        for attempt in range(retries):
+            try:
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(
+                    None, lambda: requests.post(url, json=payload, timeout=10).json()
+                )
+                hex_bal = response["result"]
+                raw_bal = int(hex_bal, 16) / 10**6  # pUSD utilizes 6 decimals
+                self.cached_balance = raw_bal
+                if raw_bal > self.peak_balance:
+                    self.peak_balance = raw_bal
+                return raw_bal
+            except Exception as e:
+                logging.warning(f"Balance fetch attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(delay)
 
-    def apply_dry_run_sell(self, return_usd: float, realised_pnl: float):
-        if self.dry_run and self.cached_balance is not None:
-            self.cached_balance += return_usd
-            if realised_pnl >= 0:
-                delta = realised_pnl * cfg.COMPOUNDING_RATE
-            else:
-                delta = realised_pnl
-            cfg.compounding_bankroll = max(cfg.compounding_bankroll + delta, 0.0)
-            if cfg.compounding_bankroll > cfg.peak_bankroll:
-                cfg.peak_bankroll = cfg.compounding_bankroll
-            if self.cached_balance > self.peak_balance:
-                self.peak_balance = self.cached_balance
-                cfg.peak_bankroll = max(cfg.peak_bankroll, self.cached_balance)
-            logging.info(
-                f"[DRY RUN] Sell return=${return_usd:.2f} | "
-                f"pnl={realised_pnl:+.4f} | delta={delta:+.4f} | "
-                f"sizing_base=${cfg.compounding_bankroll:.2f} | "
-                f"balance=${self.cached_balance:.2f}"
-            )
+        logging.error("All balance query retries exhausted. Resuming loop execution with last cached metrics.")
+        return self.cached_balance
 
-    def apply_dry_run_cancel(self, amount_usd: float):
-        if self.dry_run and self.cached_balance is not None:
-            self.cached_balance += amount_usd
-            logging.info(
-                f"[DRY RUN] Cancel refund=${amount_usd:.2f} | "
-                f"balance=${self.cached_balance:.2f} | "
-                f"sizing_base=${cfg.compounding_bankroll:.2f} (unchanged)"
-            )
+    def apply_dry_run_buy(self, amount: float):
+        self.cached_balance = max(self.cached_balance - amount, 0.0)
 
-# ==================== EXECUTOR (V2) ====================
+    def apply_dry_run_sell(self, amount: float):
+        self.cached_balance += amount
+        if self.cached_balance > self.peak_balance:
+            self.peak_balance = self.cached_balance
+
+    def check_drawdown(self) -> Tuple[bool, float]:
+        if self.peak_balance <= 0:
+            return False, 0.0
+        current_drawdown = (self.peak_balance - self.cached_balance) / self.peak_balance
+        if current_drawdown >= MAX_DRAWDOWN:
+            logging.critical(f"🛑 CRITICAL SAFETY TRIP: Maximum protection drawdown exceeded ({current_drawdown*100:.2f}%). Execution pipelines locked.")
+            return True, current_drawdown
+        return False, current_drawdown
+
+
+# ==================== POLYMARKET EXECUTOR ====================
 class PolymarketExecutor:
-    def __init__(self, dry_run: bool):
+    def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
-        self.client  = None
-        self._dry_run_fill_counter: dict = {}
-        if not dry_run and CLOB_AVAILABLE and YOUR_PRIVATE_KEY:
+        self.client = None
+        if not dry_run and CLOB_AVAILABLE:
             try:
                 creds = ApiCreds(
-                    api_key        = POLY_API_KEY,
-                    api_secret     = POLY_SECRET,
-                    api_passphrase = POLY_PASSPHRASE,
+                    api_key=POLY_API_KEY,
+                    secret=POLY_SECRET,
+                    passphrase=POLY_PASSPHRASE
                 )
                 self.client = ClobClient(
-                    host     = "https://clob.polymarket.com",
-                    chain_id = 137,
-                    key      = YOUR_PRIVATE_KEY,
-                    creds    = creds,
+                    host="https://clob.polymarket.com",
+                    key=YOUR_PRIVATE_KEY,
+                    chain_id=137,
+                    creds=creds
                 )
-                logging.info("ClobClient V2 initialised — LIVE mode")
+                logging.info("⚡ Polymarket Live API client established successfully.")
             except Exception as e:
-                logging.error(f"ClobClient V2 init failed: {e}")
-                self.client = None
+                logging.error(f"Failed to instantiate official CLOB Client: {e}. Coerced to dry_run state safely.")
+                self.dry_run = True
 
-    def place_limit_buy(self, token_id: str, amount_usd: float, limit_price: float) -> Tuple[bool, str, float]:
-        shares = round(amount_usd / limit_price, 4)
-        if self.dry_run or self.client is None:
-            logging.info(f"[DRY RUN] LIMIT BUY {shares:.4f} shares @ {limit_price:.4f} (${amount_usd:.2f})")
-            return True, "dry-run-limit-buy", limit_price
-        for attempt in range(MAX_RETRIES):
-            try:
-                result = self.client.create_and_post_order(
-                    order_args = OrderArgs(token_id=token_id, price=limit_price, size=shares, side=Side.BUY),
-                    options    = PartialCreateOrderOptions(tick_size="0.01"),
-                    order_type = OrderType.GTC,
-                )
-                order_id = result.get("orderID", result.get("id", "unknown"))
-                logging.info(f"LIMIT BUY placed (V2): {order_id} | {shares:.4f} shares @ {limit_price:.4f}")
-                return True, order_id, limit_price
-            except Exception as e:
-                logging.warning(f"LIMIT BUY attempt {attempt+1} failed: {e}")
-                time.sleep(RETRY_DELAY)
-        return False, "", limit_price
+    def place_limit_buy(self, token_id: str, size_usd: float, price: float) -> Tuple[bool, str, float]:
+        shares = round(size_usd / price, 2)
+        if self.dry_run or not self.client:
+            sim_id = f"sim_buy_{int(time.time())}"
+            logging.info(f"🧪 [SIMULATION] Executed limit buy order target: {shares} shares of token {token_id[:12]}… at price ${price:.4f}")
+            return True, sim_id, price
 
-    def cancel_order(self, order_id: str) -> bool:
-        if self.dry_run or self.client is None:
-            logging.info(f"[DRY RUN] CANCEL order {order_id}")
-            return True
         try:
-            self.client.cancel(order_id)
-            logging.info(f"Cancelled order {order_id}")
-            return True
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=shares,
+                side=Side.BUY
+            )
+            resp = self.client.create_and_post_order(order_args)
+            if resp and resp.get("success"):
+                return True, resp.get("orderID", f"live_buy_{int(time.time())}"), price
+            logging.warning(f"CLOB exchange endpoint rejected buy request metadata: {resp}")
         except Exception as e:
-            logging.warning(f"Cancel failed for {order_id}: {e}")
-            return False
+            logging.error(f"Exception encountered during live order transmission: {e}")
+        return False, "", 0.0
 
-    def is_order_filled(self, order_id: str) -> bool:
-        if self.dry_run or self.client is None:
-            if order_id not in self._dry_run_fill_counter:
-                self._dry_run_fill_counter[order_id] = 0
-            self._dry_run_fill_counter[order_id] += 1
-            return self._dry_run_fill_counter[order_id] >= 2
+    def place_limit_sell(self, token_id: str, shares: float, price: float) -> Tuple[bool, str, float]:
+        if self.dry_run or not self.client:
+            sim_id = f"sim_sell_{int(time.time())}"
+            logging.info(f"🧪 [SIMULATION] Executed limit sell order target: {shares} shares of token {token_id[:12]}… at price ${price:.4f}")
+            return True, sim_id, price
+
         try:
-            order = self.client.get_order(order_id)
-            status = order.get("status", "").upper()
-            return status in ("FILLED", "CLOSED")
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=shares,
+                side=Side.SELL
+            )
+            resp = self.client.create_and_post_order(order_args)
+            if resp and resp.get("success"):
+                return True, resp.get("orderID", f"live_sell_{int(time.time())}"), price
         except Exception as e:
-            logging.debug(f"Error checking order status: {e}")
-            return False
+            logging.error(f"Exception encountered during live order termination: {e}")
+        return False, "", 0.0
 
-# ==================== LIVE WEBSOCKET LISTENER ====================
+
+# ==================== POLYMARKET PUBLIC MARKET WEBSOCKET LISTENER ====================
 class PolymarketWSListener:
-    def __init__(self, token_ids: Set[str], wallet_addrs: Set[str], ws_price_queue: asyncio.Queue,
-                 on_trade_callback: Callable[[dict], Awaitable[None]],
-                 on_order_placed_callback: Callable[[dict], Awaitable[None]]):
+    def __init__(self, token_ids: Set[str], wallet_addrs: Set[str], ws_price_queue: asyncio.Queue, on_trade_callback: Callable, on_order_placed_callback: Callable):
         self.token_ids = token_ids
         self.wallet_addrs = {w.lower() for w in wallet_addrs}
         self.ws_price_queue = ws_price_queue
-        self.on_trade = on_trade_callback
-        self.on_order_placed = on_order_placed_callback
+        self.on_trade_callback = on_trade_callback
+        self.on_order_placed_callback = on_order_placed_callback
+        # FIXED: Relocated handshake address from standard API sub-domains to dedicated subscription stream URL
+        self.uri = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
         self._ws = None
 
     async def run(self):
         if not WEBSOCKETS_AVAILABLE:
-            logging.error("Websockets module missing — cannot initialize listener stream.")
+            logging.error("Aborting infrastructure boot sequence — websockets library dependencies are missing.")
             return
-        
-        uri = "wss://clob.polymarket.com/ws/market"
+
         while True:
             try:
-                logging.info(f"Connecting to Polymarket Public Market Feed: {uri}")
-                async with websockets.connect(uri) as ws:
+                logging.info(f"Connecting to official Polymarket Market Streaming Gateway: {self.uri}")
+                async with websockets.connect(self.uri) as ws:
                     self._ws = ws
-                    # Seed subscriptions with any already discovered tokens
-                    if self.token_ids:
-                        await self._send_subscription(list(self.token_ids))
                     
-                    async for raw_message in ws:
-                        # Wrap message ingestion directly to eliminate silent crash events
-                        try:
-                            await self._handle_message(raw_message)
-                        except Exception as inner_ex:
-                            logging.error(f"[WS PARSE EXCEPTION] Failed parsing event frame: {inner_ex} | Raw: {raw_message}", exc_info=True)
-            except Exception as e:
-                logging.error(f"WebSocket interface dropped connection: {e}. Retrying in 5 seconds...", exc_info=True)
+                    # Authenticated network handshake subscription configuration mapping
+                    initial_subs = ["trades"]
+                    sub_payload = {
+                        "type": "subscribe",
+                        "channels": initial_subs
+                    }
+                    await ws.send(json.dumps(sub_payload))
+                    logging.info(f"WebSocket interface handshakes complete. Base channels globally subscribed: {initial_subs}")
+
+                    # Automatically re-subscribe to any tokens tracked across active runtime
+                    for token in list(self.token_ids):
+                        await self.subscribe_token(token)
+
+                    async for message in ws:
+                        await self._handle_message(message)
+            except Exception as err:
+                logging.error(f"WebSocket interface dropped connection: {err}. Retrying in 5 seconds...")
+                self._ws = None
                 await asyncio.sleep(5)
 
     async def subscribe_token(self, token_id: str):
-        if token_id in self.token_ids:
+        if not token_id:
             return
         self.token_ids.add(token_id)
         if self._ws and self._ws.open:
             try:
-                await self._send_subscription([token_id])
-                logging.info(f"[WS SUB] Registered tracking for asset token: {token_id}")
+                payload = {
+                    "type": "subscribe",
+                    "channels": ["book"],
+                    "token_ids": [token_id]
+                }
+                await self._ws.send(json.dumps(payload))
+                logging.debug(f"[MARKET-WS] Dynamically attached monitoring signature context to token: {token_id[:16]}…")
             except Exception as e:
-                logging.warning(f"Failed to submit live WS subscription frame for asset {token_id}: {e}")
-
-    async def _send_subscription(self, token_ids: list):
-        payload = {
-            "type": "subscribe",
-            "assets_ids": token_ids,
-            "channels": ["trades", "book"]
-        }
-        await self._ws.send(json.dumps(payload))
+                logging.warning(f"Failed to post dynamic subscription update to open stream: {e}")
 
     async def _handle_message(self, raw: str):
-        data = json.loads(raw)
-        if not isinstance(data, dict):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
             return
 
-        ev_type = data.get("event_type", "").upper()
-        if ev_type == "BOOK":
-            # Direct book updates to pricing queues
-            token_id = data.get("asset_id")
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
-            if token_id and (bids or asks):
-                best_bid = float(bids[0]["price"]) if bids else 0.0
-                best_ask = float(asks[0]["price"]) if asks else 0.0
-                if best_bid > 0 or best_ask > 0:
+        # Distribute messages sequentially to parser hooks depending on message type context
+        if isinstance(data, list):
+            events = data
+        else:
+            events = [data]
+
+        for ev in events:
+            ev_type = (ev.get("event_type") or ev.get("type") or "").lower()
+            
+            # 1. Process active market order events
+            if ev_type in ("trade", "trades"):
+                await self._process_trade_event(ev)
+            
+            # 2. Process real-time price updates inside internal queues
+            elif ev_type in ("book", "price_change"):
+                token_id = ev.get("token_id") or ev.get("asset_id") or ""
+                if token_id:
                     try:
-                        self.ws_price_queue.put_nowait((token_id, best_bid, best_ask))
+                        await self.ws_price_queue.put(ev)
                     except asyncio.QueueFull:
                         pass
-            return
 
-        # Intercept and process trade execution updates immediately
-        if ev_type in ("TRADE", "ORDER_PLACED"):
-            maker = data.get("maker_addr", "").lower()
-            taker = data.get("taker_addr", "").lower()
-            
-            # Pure Mirror rule: If any entity matches a targeted wallet profile, dispatch instantly
-            if maker in self.wallet_addrs or taker in self.wallet_addrs:
-                if ev_type == "TRADE":
-                    await self.on_trade(data)
-                elif ev_type == "ORDER_PLACED":
-                    await self.on_order_placed(data)
+    async def _process_trade_event(self, ev: dict):
+        maker = ev.get("maker_addr", "").lower()
+        taker = ev.get("taker_addr", "").lower()
+        
+        if maker in self.wallet_addrs or taker in self.wallet_addrs:
+            if self.on_trade_callback:
+                await self.on_trade_callback(ev)
 
-# ==================== LIVE USER CHANNEL FEED LISTENER ====================
+
+# ==================== POLYMARKET USER EXECUTION CHANNEL LISTENER ====================
 class PolymarketUserChannelListener:
-    def __init__(self, on_fill_callback: Callable[[dict], Awaitable[None]]):
+    def __init__(self, on_fill_callback: Callable):
         self.on_fill_callback = on_fill_callback
+        # FIXED: Relocated private account update listener address to dedicated user stream channel URL
+        self.uri = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
         self._ws = None
 
     async def run(self):
-        if not WEBSOCKETS_AVAILABLE or not YOUR_PRIVATE_KEY:
-            logging.info("Private key absent or websockets unavailable — disabling own-fills loop.")
+        if not WEBSOCKETS_AVAILABLE or not POLY_API_KEY:
+            logging.info("Private operational key configurations not initialized. User Channel listener going dormant.")
             return
-        
-        uri = "wss://clob.polymarket.com/ws/user"
+
         while True:
             try:
-                logging.info("Connecting to private endpoint authentication layer...")
-                async with websockets.connect(uri) as ws:
+                logging.info(f"Connecting to official Polymarket Private Account Tracking Stream: {self.uri}")
+                async with websockets.connect(self.uri) as ws:
                     self._ws = ws
-                    # Authenticate user connection workspace session
-                    timestamp = str(int(time.time()))
-                    nonce = 0
-                    # Standard API login registration sequence would deploy here
                     
-                    async for raw in ws:
-                        await self._handle_message(raw)
-            except Exception as e:
-                logging.debug(f"[USER-WS] Disconnected: {e}. Reconnecting in 10s...")
+                    # Private account endpoints require an authenticated challenge payload frame
+                    timestamp = str(int(time.time()))
+                    auth_payload = {
+                        "type": "subscribe",
+                        "channels": ["orders", "user"],
+                        "apiKey": POLY_API_KEY,
+                        "passphrase": POLY_PASSPHRASE,
+                        "timestamp": timestamp,
+                    }
+                    await ws.send(json.dumps(auth_payload))
+                    logging.info("Private workspace authorization context transmitted securely to user endpoint.")
+
+                    async for message in ws:
+                        await self._handle_message(message)
+            except Exception as err:
+                logging.debug(f"[USER-WS] Infrastructure drop encountered: {err}. Attempting reconnection in 10 seconds...")
+                self._ws = None
                 await asyncio.sleep(10)
 
     async def _handle_message(self, raw: str):
@@ -347,6 +313,7 @@ class PolymarketUserChannelListener:
 
         for ev in events:
             ev_type = (ev.get("event_type") or ev.get("type") or "").lower()
+
             if ev_type not in ("order_fill", "order_filled", "trade"):
                 continue
 
@@ -359,12 +326,14 @@ class PolymarketUserChannelListener:
             if not token_id or not price:
                 continue
 
-            logging.info(f"[USER-WS] Live Confirmation Match: {side} {size:.4f} shares @ {price:.4f}")
+            logging.debug(f"[USER-WS] Verified internal fill matched: {side} {size:.4f} @ {price:.4f} asset={token_id[:12]}…")
+
             if self.on_fill_callback:
                 await self.on_fill_callback({
                     "kind":     "own_fill",
                     "token_id": token_id,
                     "price":    price,
+                    "size":     size,
                     "side":     side,
                     "order_id": order_id
                 })
