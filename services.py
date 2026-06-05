@@ -128,9 +128,9 @@ USDC_ABI = [{
 }]
 
 def fetch_wallet_usdc_balance() -> float:
-    """Read USDC balance of MY_WALLET_ADDRESS from Polygon. Falls back to MIN_ORDER_USDC."""
-    if not config.MY_WALLET_ADDRESS:
-        logger.warning("MY_WALLET_ADDRESS not set — using MIN_ORDER_USDC fallback")
+    """Read USDC balance of DEPOSIT_WALLET_ADDRESS from Polygon. Falls back to MIN_ORDER_USDC."""
+    if not config.DEPOSIT_WALLET_ADDRESS:
+        logger.warning("DEPOSIT_WALLET_ADDRESS not set — using MIN_ORDER_USDC fallback")
         return config.MIN_ORDER_USDC
     try:
         w3 = Web3(Web3.HTTPProvider(config.POLYGON_RPC_URL))
@@ -139,7 +139,7 @@ def fetch_wallet_usdc_balance() -> float:
             abi=USDC_ABI,
         )
         raw = contract.functions.balanceOf(
-            Web3.to_checksum_address(config.MY_WALLET_ADDRESS)
+            Web3.to_checksum_address(config.DEPOSIT_WALLET_ADDRESS)
         ).call()
         balance = raw / 1e6
         logger.debug("Wallet USDC balance: $%.2f", balance)
