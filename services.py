@@ -591,37 +591,37 @@ async def monitor_loop() -> None:
 
         try:
             while state.running:
-            now = int(time.time())
+                now = int(time.time())
 
-            # Refresh real balance every 5 minutes (non-blocking)
-            if now - last_balance_poll >= 300:
-                real = await asyncio.get_event_loop().run_in_executor(
-                    None, fetch_wallet_usdc_balance
-                )
-                state.real_balance = round(real, 2)
-                last_balance_poll  = now
-                logger.debug("Real balance refreshed: $%.2f", state.real_balance)
+                # Refresh real balance every 5 minutes (non-blocking)
+                if now - last_balance_poll >= 300:
+                    real = await asyncio.get_event_loop().run_in_executor(
+                        None, fetch_wallet_usdc_balance
+                    )
+                    state.real_balance = round(real, 2)
+                    last_balance_poll  = now
+                    logger.debug("Real balance refreshed: $%.2f", state.real_balance)
 
-            for lbl, wallet in config.SOURCE_WALLETS.items():
-                raw_trades = await fetch_wallet_trades(client, wallet, last_poll)
-                for raw in raw_trades:
-                    trade = parse_trade(raw, wallet)
-                    if trade:
-                        await process_trade(client, trade)
+                for lbl, wallet in config.SOURCE_WALLETS.items():
+                    raw_trades = await fetch_wallet_trades(client, wallet, last_poll)
+                    for raw in raw_trades:
+                        trade = parse_trade(raw, wallet)
+                        if trade:
+                            await process_trade(client, trade)
 
-            # Refresh current prices for open positions (unrealised PnL)
-            for key, pos in list(state.positions.items()):
-                token_id = key.split(":")[0] if ":" in key else ""
-                # token_id is stored in the position if available
-                tid = pos.get("token_id", "")
-                if tid and tid not in _dead_tokens:
-                    book = await fetch_order_book(client, tid)
-                    mid  = best_ask(book) or best_bid(book)
-                    if mid:
-                        pos["current_price"] = mid
+                # Refresh current prices for open positions (unrealised PnL)
+                for key, pos in list(state.positions.items()):
+                    token_id = key.split(":")[0] if ":" in key else ""
+                    # token_id is stored in the position if available
+                    tid = pos.get("token_id", "")
+                    if tid and tid not in _dead_tokens:
+                        book = await fetch_order_book(client, tid)
+                        mid  = best_ask(book) or best_bid(book)
+                        if mid:
+                            pos["current_price"] = mid
 
-            last_poll = now
-            await asyncio.sleep(config.POLL_INTERVAL_SEC)
+                last_poll = now
+                await asyncio.sleep(config.POLL_INTERVAL_SEC)
 
         finally:
             watchdog_task.cancel()
