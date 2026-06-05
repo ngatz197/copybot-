@@ -15,6 +15,29 @@ import config
 
 logger = logging.getLogger(__name__)
 
+
+def _log_task_exception(task: "asyncio.Task") -> None:
+    """
+    Done-callback attached to every create_task() call.
+
+    asyncio silently discards exceptions in fire-and-forget tasks unless
+    something calls task.result().  This callback ensures that any crash
+    is at least visible as an ERROR in the logs so Render's log drain
+    (and the operator) can spot it.
+    """
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        logger.error(
+            "Background task '%s' died with an unhandled exception — "
+            "this should not happen; please investigate.",
+            task.get_name(),
+            exc_info=exc,
+        )
+
+
 # ── Singleton CLOB client (live mode only) ────────────────────────────────────
 
 _clob_client = None
@@ -26,28 +49,60 @@ def get_clob_client():
     prevents nonce collisions when orders are placed in quick succession.
 
     Two-level auth required by Polymarket:
-      L1 — wallet (EIP-712) signature, supplied via ``key``.
-      L2 — HMAC API credentials (key/secret/passphrase), derived from the
-           wallet on first use via create_or_derive_api_creds().  Without L2
-           the CLOB rejects every order with a 401/403.
+      L1 — wallet (EIP-712) signature, supplied via PRIVATE_KEY.
+      L2 — HMAC API credentials (key/secret/passphrase).
+
+    L2 credential resolution (in priority order):
+      1. Explicit env vars: CLOB_API_KEY + CLOB_SECRET + CLOB_PASSPHRASE
+         — used as-is; no network call required.  PRIVATE_KEY is still
+         needed for L1 signing of order payloads, but *not* for auth.
+      2. Auto-derive from PRIVATE_KEY via create_or_derive_api_creds()
+         — original behaviour when the explicit vars are absent.
     """
     global _clob_client
     if _clob_client is None:
         from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+
         client = ClobClient(
             host=config.POLYMARKET_CLOB_API,
             key=config.PRIVATE_KEY,
             chain_id=137,
         )
-        # Derive (or retrieve cached) L2 HMAC credentials and attach them.
-        # This makes one authenticated call to the CLOB; subsequent order
-        # placements reuse the cached creds without hitting the auth endpoint.
+
+        _have_explicit_creds = all([
+            config.CLOB_API_KEY,
+            config.CLOB_SECRET,
+            config.CLOB_PASSPHRASE,
+        ])
+
         try:
-            client.set_api_creds(client.create_or_derive_api_creds())
-            logger.info("ClobClient initialised (singleton) — L1+L2 auth OK")
+            if _have_explicit_creds:
+                # Use pre-supplied L2 credentials directly — no round-trip to
+                # the CLOB auth endpoint needed.
+                creds = ApiCreds(
+                    api_key=config.CLOB_API_KEY,
+                    api_secret=config.CLOB_SECRET,
+                    api_passphrase=config.CLOB_PASSPHRASE,
+                )
+                client.set_api_creds(creds)
+                logger.info(
+                    "ClobClient initialised (singleton) — L2 creds supplied "
+                    "via env vars (CLOB_API_KEY / CLOB_SECRET / CLOB_PASSPHRASE)"
+                )
+            else:
+                # Fall back to deriving L2 credentials from the private key.
+                # Makes one authenticated call to the CLOB; subsequent order
+                # placements reuse the cached creds.
+                client.set_api_creds(client.create_or_derive_api_creds())
+                logger.info(
+                    "ClobClient initialised (singleton) — L2 creds derived "
+                    "from PRIVATE_KEY"
+                )
         except Exception as e:
             logger.error("ClobClient L2 auth failed: %s", e)
             raise
+
         _clob_client = client
     return _clob_client
 
@@ -97,6 +152,39 @@ class WalletStats:
 
 MAX_POSITIONS = 20  # hard cap on concurrent open positions
 
+# ── Bounded dedup set ─────────────────────────────────────────────────────────
+
+class BoundedSet:
+    """
+    A set that evicts the oldest entries once it reaches *maxsize*.
+
+    Prevents seen_txs from growing without bound on long-running Render
+    deployments where 512 MB RAM is the hard limit.  At ~64 bytes per
+    tx-hash string, 10 000 entries ≈ 640 KB — negligible.
+    """
+
+    def __init__(self, maxsize: int = 10_000):
+        from collections import deque
+        self._maxsize = maxsize
+        self._data: set[str]       = set()
+        self._order: deque[str]    = deque()
+
+    def __contains__(self, item: str) -> bool:
+        return item in self._data
+
+    def add(self, item: str) -> None:
+        if item in self._data:
+            return
+        if len(self._data) >= self._maxsize:
+            oldest = self._order.popleft()
+            self._data.discard(oldest)
+        self._data.add(item)
+        self._order.append(item)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
 @dataclass
 class BotState:
     running:         bool  = False
@@ -104,8 +192,8 @@ class BotState:
     total_skipped:   int   = 0
     # market_id:outcome → {"size": usdc, "entry_price": float, "wallet_label": str}
     positions:       dict  = field(default_factory=dict)
-    # tx_hash dedup
-    seen_txs:        set   = field(default_factory=set)
+    # tx_hash dedup — capped at 10 000 entries to avoid OOM on Render free tier
+    seen_txs:        BoundedSet = field(default_factory=BoundedSet)
     # order_id → OpenOrder  (for TTL cancellation)
     open_orders:     dict  = field(default_factory=dict)
     # wallet_label → WalletStats
@@ -415,7 +503,7 @@ async def place_limit_order(
         side=clob_side,
         # order_type does NOT belong in OrderArgs — passed to post_order() below
     )
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     # Step 1: sign locally (no network).
     signed = await loop.run_in_executor(None, clob.create_order, order_args)
     # Step 2: submit to CLOB with GTC order type.
@@ -445,7 +533,7 @@ async def cancel_order(client: httpx.AsyncClient, order_id: str) -> None:
     # ── LIVE ─────────────────────────────────────────────────────────────────
     # Offload to executor — same reasoning as place_limit_order.
     clob = get_clob_client()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, clob.cancel, order_id)
     logger.info("Cancelled order %s", order_id)
     # ─────────────────────────────────────────────────────────────────────────
@@ -462,18 +550,24 @@ async def ttl_watchdog(client: httpx.AsyncClient) -> None:
         return
     while state.running:
         await asyncio.sleep(10)
-        now = int(time.time())
-        expired = [
-            oid for oid, o in list(state.open_orders.items())
-            if now - o.placed_at >= config.LIMIT_ORDER_TTL_SEC
-        ]
-        for oid in expired:
-            o = state.open_orders.pop(oid)
-            logger.info(
-                "TTL expired — cancelling order %s (%s %s on %s)",
-                oid, o.trade.side, o.trade.outcome, o.trade.market_question or o.trade.market_id,
+        try:
+            now = int(time.time())
+            expired = [
+                oid for oid, o in list(state.open_orders.items())
+                if now - o.placed_at >= config.LIMIT_ORDER_TTL_SEC
+            ]
+            for oid in expired:
+                o = state.open_orders.pop(oid)
+                logger.info(
+                    "TTL expired — cancelling order %s (%s %s on %s)",
+                    oid, o.trade.side, o.trade.outcome,
+                    o.trade.market_question or o.trade.market_id,
+                )
+                await cancel_order(client, oid)
+        except Exception as exc:
+            logger.exception(
+                "Unhandled error in ttl_watchdog — will retry next cycle: %s", exc
             )
-            await cancel_order(client, oid)
 
 
 # ── Position tracking ─────────────────────────────────────────────────────────
@@ -625,7 +719,7 @@ async def monitor_loop() -> None:
     )
 
     # ── Seed balances on startup ──────────────────────────────────────────────
-    real = await asyncio.get_event_loop().run_in_executor(None, fetch_wallet_usdc_balance)
+    real = await asyncio.get_running_loop().run_in_executor(None, fetch_wallet_usdc_balance)
     state.real_balance    = round(real, 2)
     state.virtual_balance = round(real, 2)
     state.peak_balance    = round(real, 2)
@@ -641,39 +735,55 @@ async def monitor_loop() -> None:
     last_balance_poll = 0
 
     async with httpx.AsyncClient() as client:
-        asyncio.create_task(ttl_watchdog(client))
+        watchdog_task = asyncio.create_task(ttl_watchdog(client))
+        watchdog_task.add_done_callback(_log_task_exception)
+
+        _consecutive_errors = 0
 
         while state.running:
-            now = int(time.time())
+            try:
+                now = int(time.time())
 
-            # Refresh real balance every 5 minutes (non-blocking)
-            if now - last_balance_poll >= 300:
-                real = await asyncio.get_event_loop().run_in_executor(
-                    None, fetch_wallet_usdc_balance
+                # Refresh real balance every 5 minutes (non-blocking)
+                if now - last_balance_poll >= 300:
+                    real = await asyncio.get_running_loop().run_in_executor(
+                        None, fetch_wallet_usdc_balance
+                    )
+                    state.real_balance = round(real, 2)
+                    last_balance_poll  = now
+                    logger.debug("Real balance refreshed: $%.2f", state.real_balance)
+
+                for lbl, wallet in config.SOURCE_WALLETS.items():
+                    raw_trades = await fetch_wallet_trades(client, wallet, last_poll)
+                    for raw in raw_trades:
+                        trade = parse_trade(raw, wallet)
+                        if trade:
+                            await process_trade(client, trade)
+
+                # Refresh current prices for open positions (unrealised PnL)
+                for key, pos in list(state.positions.items()):
+                    tid = pos.get("token_id", "")
+                    if tid and tid not in _dead_tokens:
+                        book = await fetch_order_book(client, tid)
+                        mid  = best_ask(book) or best_bid(book)
+                        if mid:
+                            pos["current_price"] = mid
+
+                last_poll = now
+                _consecutive_errors = 0          # reset on clean poll
+
+            except Exception as exc:             # noqa: BLE001
+                _consecutive_errors += 1
+                # Exponential back-off: 15 s, 30 s, 60 s, 120 s … capped at 5 min
+                backoff = min(300, config.POLL_INTERVAL_SEC * (2 ** min(_consecutive_errors - 1, 4)))
+                logger.exception(
+                    "Unhandled error in monitor_loop poll body "
+                    "(consecutive=%d) — backing off %ds: %s",
+                    _consecutive_errors, backoff, exc,
                 )
-                state.real_balance = round(real, 2)
-                last_balance_poll  = now
-                logger.debug("Real balance refreshed: $%.2f", state.real_balance)
+                await asyncio.sleep(backoff)
+                continue
 
-            for lbl, wallet in config.SOURCE_WALLETS.items():
-                raw_trades = await fetch_wallet_trades(client, wallet, last_poll)
-                for raw in raw_trades:
-                    trade = parse_trade(raw, wallet)
-                    if trade:
-                        await process_trade(client, trade)
-
-            # Refresh current prices for open positions (unrealised PnL)
-            for key, pos in list(state.positions.items()):
-                token_id = key.split(":")[0] if ":" in key else ""
-                # token_id is stored in the position if available
-                tid = pos.get("token_id", "")
-                if tid and tid not in _dead_tokens:
-                    book = await fetch_order_book(client, tid)
-                    mid  = best_ask(book) or best_bid(book)
-                    if mid:
-                        pos["current_price"] = mid
-
-            last_poll = now
             await asyncio.sleep(config.POLL_INTERVAL_SEC)
 
     logger.info("Monitor stopped.")
