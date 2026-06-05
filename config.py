@@ -23,6 +23,13 @@ SOURCE_WALLETS = {
 DEPOSIT_WALLET_ADDRESS     = os.getenv("DEPOSIT_WALLET_ADDRESS", "")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")  # keep secret!
 
+# ── Polymarket CLOB L2 API credentials (optional) ────────────────────────────
+# Accepts both POLY_* (current) and CLOB_* (legacy) names so deployments
+# keep working during any env-var rename rollover.  POLY_* takes priority.
+CLOB_API_KEY    = os.getenv("POLY_API_KEY")    or os.getenv("CLOB_API_KEY",    "")
+CLOB_SECRET     = os.getenv("POLY_SECRET")     or os.getenv("CLOB_SECRET",     "")
+CLOB_PASSPHRASE = os.getenv("POLY_PASSPHRASE") or os.getenv("CLOB_PASSPHRASE", "")
+
 # ── Trade sizing ─────────────────────────────────────────────────────────────
 TRADE_PCT        = 0.01    # 1% of wallet balance per trade — hardcoded
 
