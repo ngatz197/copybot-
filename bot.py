@@ -29,12 +29,16 @@ def keep_neon_alive():
         time.sleep(180)
 
 def handle_task_exception(task: asyncio.Task):
+    """
+    Enhanced Safety Boundary Tracker. Prevents unhandled async exceptions 
+    from causing silent tracking failures.
+    """
     try:
         task.result()
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        logging.critical(f"💥 Background task worker loop failed: {task.get_name()} -> {e}", exc_info=True)
+        logging.critical(f"💥 CRITICAL: Background worker loop crashed unexpectedly: {task.get_name()} -> {e}", exc_info=True)
 
 
 
@@ -50,7 +54,7 @@ async def main():
     neon_thread = threading.Thread(target=keep_neon_alive, daemon=True)
     neon_thread.start()
 
-    # 3. Instantiate Core Engine
+    # 3. Instantiate Core Engine Configuration
     bot = CopyTrader()
     cfg._bot_ref = bot
 
@@ -71,15 +75,19 @@ async def main():
         )
         ws_user_task.add_done_callback(handle_task_exception)
 
-    # 6. Passive Reconciliation Engine Poller
+    # 6. Passive Reconciliation Engine Poller (Failsafe Stream Tracker)
+    logging.info(f"🚀 Mirror engine activated. Ingestion loop cycle speed configured at {cfg.POLL_INTERVAL}s intervals.")
     while True:
         try:
+            # Executes sweeping verification queries to catch gap executions seamlessly
             await bot.scan_and_copy()
         except (OSError, asyncio.TimeoutError) as transient_err:
-            logging.warning(f"Transient polling error in validation handler: {transient_err}")
-        except Exception:
-            logging.critical("Fatal breakdown in validation engine polling layer.", exc_info=True)
-            raise
+            logging.warning(f"Transient polling error encountered in validation handler: {transient_err}")
+        except Exception as err:
+            logging.critical(f"Fatal breakdown in validation engine polling layer: {err}", exc_info=True)
+            # Retain system survival over network variance instead of executing hard-stop crashes
+            await asyncio.sleep(10)
+            continue
 
         await asyncio.sleep(cfg.POLL_INTERVAL)
 
