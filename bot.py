@@ -24,6 +24,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     stream=sys.stdout,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Dashboard server port — Render sets PORT automatically
@@ -133,13 +134,37 @@ async def main() -> None:
         logger.error("DEPOSIT_WALLET_ADDRESS is not set. Exiting.")
         sys.exit(1)
 
-    if not config.PRIVATE_KEY and not config.DRY_RUN:
-        logger.error("PRIVATE_KEY is not set and DRY_RUN=false. Exiting.")
-        sys.exit(1)
+    _have_explicit_creds = all([
+        config.CLOB_API_KEY,
+        config.CLOB_SECRET,
+        config.CLOB_PASSPHRASE,
+    ])
+    if not config.DRY_RUN:
+        if not config.PRIVATE_KEY:
+            logger.error(
+                "PRIVATE_KEY is not set and DRY_RUN=false. "
+                "PRIVATE_KEY is required for L1 order signing. Exiting."
+            )
+            sys.exit(1)
+        if not _have_explicit_creds:
+            logger.info(
+                "CLOB_API_KEY / CLOB_SECRET / CLOB_PASSPHRASE not set — "
+                "L2 credentials will be derived from PRIVATE_KEY at startup."
+            )
 
     mode = "DRY RUN" if config.DRY_RUN else "*** LIVE TRADING ***"
+    _have_explicit_creds = all([
+        config.CLOB_API_KEY,
+        config.CLOB_SECRET,
+        config.CLOB_PASSPHRASE,
+    ])
+    auth_mode = (
+        "L2 via env vars (CLOB_API_KEY)" if _have_explicit_creds
+        else "L2 derived from PRIVATE_KEY"
+    )
     logger.info("=" * 60)
     logger.info("Polymarket Copy Bot starting — %s", mode)
+    logger.info("Auth       : %s", auth_mode)
     logger.info("Watching %d wallets:", len(config.SOURCE_WALLETS))
     for lbl, addr in config.SOURCE_WALLETS.items():
         logger.info("  %-8s %s", lbl, addr)
@@ -157,9 +182,13 @@ async def main() -> None:
 
     # Schedule bot tasks as background tasks so uvicorn binds the port
     # immediately — this ensures Render's health check passes on startup.
-    loop = asyncio.get_event_loop()
-    loop.create_task(services.monitor_loop())
-    loop.create_task(status_printer())
+    # Done-callbacks log any unhandled exception so a silent crash is visible
+    # in Render's log drain even though the health-check endpoint stays up.
+    loop = asyncio.get_running_loop()
+    monitor_task = loop.create_task(services.monitor_loop(), name="monitor_loop")
+    monitor_task.add_done_callback(services._log_task_exception)
+    printer_task = loop.create_task(status_printer(), name="status_printer")
+    printer_task.add_done_callback(services._log_task_exception)
 
     await run_webserver()  # blocks; bot tasks run concurrently
 
