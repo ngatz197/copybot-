@@ -25,8 +25,6 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")  # keep secret!
 
 # ── Trade sizing ─────────────────────────────────────────────────────────────
 TRADE_PCT        = 0.01    # 1% of wallet balance per trade — hardcoded
-MIN_ORDER_USDC   = float(os.getenv("MIN_ORDER_USDC", "5"))
-MAX_ORDER_USDC   = float(os.getenv("MAX_ORDER_USDC", "500"))
 
 # ── Limit order settings ─────────────────────────────────────────────────────
 # Price offset applied to limit orders to ensure fast fills while avoiding
